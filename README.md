@@ -126,6 +126,8 @@ The same themes as Lestrix: Xylonic Dark and Light, Graphite, Nord, Gruvbox, Sol
 | Ctrl+K Ctrl+T | Color theme picker |
 | Ctrl+K Ctrl+O, Ctrl+K Ctrl+W, Ctrl+K Ctrl+S | Open folder, close all tabs without unsaved edits, save all |
 | Alt+1 .. Alt+9, Alt+0 | Go to tab N, to the last tab |
+| Ctrl+K B | Show or hide the faint blame text after the cursor line |
+| F7, Shift+F7 | Next / previous change in a diff tab |
 | Ctrl+Shift+T | Reopen the last closed tab |
 | Ctrl+Shift+PgUp, Ctrl+Shift+PgDn | Move the tab left / right |
 | Ctrl+G | Go to line (also `:42` in Ctrl+P) |

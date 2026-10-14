@@ -3657,6 +3657,7 @@ void key_down(const SDL_KeyboardEvent &k) {
         else if (sym == SDLK_o && ctrl) do_action(A_OPEN_FOLDER);
         else if (sym == SDLK_w && ctrl) do_action(A_CLOSE_ALL);
         else if (sym == SDLK_m) do_action(A_LANG);
+        else if (sym == SDLK_b) { E.g.blame_inline = !E.g.blame_inline; E.status_msg = E.g.blame_inline ? "inline blame on" : "inline blame off"; }
         else if (sym == SDLK_s && ctrl) { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); after_save(); }
         touch();
         return;
