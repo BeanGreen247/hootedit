@@ -4884,6 +4884,7 @@ void diff_hunk_apply(DiffView &v, int op) {   /* 4 stage, 5 revert, 6 unstage */
     DiffHunk h = v.m.hunks[(size_t)v.cur_change];
     std::string root = v.root, path = v.path;
     if (op == 4 && v.left_rev.empty()) { git_do(git_stage(root, path), "stage"); return; }
+    if (op == 4 && v.right_rev == "WORK") { struct stat st0; if (stat((root + "/" + path).c_str(), &st0) != 0) { git_do(git_stage(root, path), "stage"); return; } }   /* the file is gone: staging the change stages the deletion */
     std::string lt = v.left_rev.empty() ? std::string() : git_show(root, v.left_rev, path);
     std::string rt;
     if (v.right_rev == "WORK") { FILE *f = fopen((root + "/" + path).c_str(), "rb"); if (f) { char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) rt.append(buf, n); fclose(f); } }
