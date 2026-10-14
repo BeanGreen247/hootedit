@@ -205,7 +205,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -215,7 +215,7 @@ enum View { V_EXPLORER, V_SEARCH, V_GIT, V_REMOTE };
 
 struct GitUi {
     std::string msg;                                   /* the commit message being typed */
-    bool open_staged = true, open_changes = true, open_graph = true, open_tl = true;
+    bool open_staged = true, open_changes = true, open_graph = true, open_tl = true, open_merge = true;
     std::vector<GitCommit> log;                        /* the branch history, newest first */
     int log_sel = -1;                                  /* the expanded commit, or -1 */
     std::vector<GitFile> sel_files;                    /* its files, or the files that differ between two commits */
@@ -409,9 +409,13 @@ struct GutterCache {
     bool blame_tried = false, blame_ok = false;
 };
 std::unordered_map<const Doc *, GutterCache> g_gutter;
+/* merge conflict blocks of the open files (see conflicts_for) */
+struct Conflict { long a = -1, base = -1, mid = -1, b = -1; };   /* line numbers of the four marker lines (base: the ||||||| line of diff3 style, else -1) */
+struct ConflictCache { uint64_t rev = ~0ull; bool listed = false; std::vector<Conflict> v; };
+std::unordered_map<const Doc *, ConflictCache> g_conf;
 struct Peek { const Doc *doc = nullptr; int b0 = -1; } g_peek;   /* the inline diff of one change under its lines, opened from a change bar */
 
-void gutter_invalidate() { for (auto &kv : g_gutter) { kv.second.base_stale = true; kv.second.computed = false; kv.second.blame_tried = false; kv.second.blame_ok = false; } }
+void gutter_invalidate() { g_conf.clear(); for (auto &kv : g_gutter) { kv.second.base_stale = true; kv.second.computed = false; kv.second.blame_tried = false; kv.second.blame_ok = false; } }
 /* no file and nothing typed: the start screen shows, with no tab strip */
 bool splash() { return E.docs.size() == 1 && D().pristine() && !E.blank_tab; }
 Ed::Term *cur_term();
@@ -2338,12 +2342,12 @@ void draw_dot(float cx, float cy, int size, uint32_t rgba) { draw_icon(IC_DOT, c
 struct GEnt { int idx; bool staged; char st; };
 std::vector<std::string> g_gitdirs;   /* tree view folder keys of the current frame, indexed by the hit id */
 
-void git_entries(std::vector<GEnt> &staged, std::vector<GEnt> &other) {
+void git_entries(std::vector<GEnt> &staged, std::vector<GEnt> &other, std::vector<GEnt> &merge) {
     for (size_t i = 0; i < E.git.changes.size(); i++) {
         const GitChange &c = E.git.changes[i];
         bool conflict = (c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D'));
         if (c.x == '?' && c.y == '?') other.push_back({(int)i, false, '?'});
-        else if (conflict) other.push_back({(int)i, false, 'C'});
+        else if (conflict) merge.push_back({(int)i, false, 'C'});
         else {
             if (c.x != ' ') staged.push_back({(int)i, true, c.x});
             if (c.y != ' ') other.push_back({(int)i, false, c.y});
@@ -2411,8 +2415,8 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
     g_gitdirs.clear();
     const float rowh = (float)S(26), full_x = rail + 1, full_w = sw - rail - 2, right = sw - (float)S(10);
     auto visible = [&](float h) { return ry + h >= list_top && ry <= bot; };
-    std::vector<GEnt> staged, other;
-    git_entries(staged, other);
+    std::vector<GEnt> staged, other, merge;
+    git_entries(staged, other, merge);
     int n_mod = 0, n_add = 0, n_del = 0, n_unt = 0;
     for (const GitChange &c : E.git.changes) {
         if (c.x == '?') n_unt++;
@@ -2514,13 +2518,13 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
         if (!g.err.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, (float)S(20)), g.err.c_str(), C_RED, cw); ry += (float)S(22); }
         float bth = (float)S(30);
         if (visible(bth)) {
-            bool clean = E.git.changes.empty();
+            bool clean = E.git.changes.empty() || (staged.empty() && other.empty());
             bool sync = clean && !E.git.upstream.empty() && (E.git.ahead || E.git.behind);
             bool publish = clean && E.git.upstream.empty() && E.git.has_remote && E.git.branch.compare(0, 4, "HEAD") != 0;
             int mode = sync ? 1 : publish ? 2 : 0;
             bool can = !clean || mode != 0;
             std::string lab = mode == 1 ? sfmt("Sync Changes  %s%s%s", E.git.behind ? sfmt("%d down", E.git.behind).c_str() : "", E.git.behind && E.git.ahead ? "  " : "", E.git.ahead ? sfmt("%d up", E.git.ahead).c_str() : "")
-                              : mode == 2 ? "Publish Branch" : clean ? "Nothing to commit" : !staged.empty() ? sfmt("Commit  (%zu staged)", staged.size()) : sfmt("Commit All  (%zu)", other.size());
+                              : mode == 2 ? "Publish Branch" : clean ? (merge.empty() ? "Nothing to commit" : "Resolve the conflicts first") : !staged.empty() ? sfmt("Commit  (%zu staged)", staged.size()) : sfmt("Commit All  (%zu)", other.size());
             float ddw = mode == 0 && can ? (float)S(26) : 0.f;
             uint32_t bg = !can ? C_FIELD : hovered(H_GITCOMMIT, mode) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT;
             uint32_t fg = can ? C_ON_ACCENT : C_UI_FAINT;
@@ -2615,7 +2619,8 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
                 uint32_t col = status_color(en.st);
                 float ix = cx + (float)depth * (float)S(12);
                 draw_dot(ix + (float)S(8), ry + rowh / 2, S(8), file_color(base));
-                int nb = en.staged ? 2 : 3;   /* open, (discard), stage / unstage */
+                const bool conf = en.st == 'C';
+                int nb = en.staged || conf ? 2 : 3;   /* open, (discard), stage / unstage */
                 float lim = right - (float)S(18) - (hv ? (float)(nb * 22) * E.scale : 0.f);
                 float pen = draw_text(E.ui, ix + (float)S(20), ui_base(ry, rowh), base.c_str(), en.st == 'D' ? C_UI_FAINT : C_UI, lim - ix - (float)S(20));
                 if (!g.tree_view && !dir.empty() && pen + (float)S(30) < lim) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir.c_str(), C_UI_FAINT, lim - pen - (float)S(8));
@@ -2625,8 +2630,8 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
                 if (hv) {
                     float bx = right - (float)S(22) * (float)nb - (float)S(2);
                     for (int b = 0; b < nb; b++) {
-                        int kind = b == 0 ? H_GITOPEN : (b == 1 && !en.staged) ? H_GITDISC : H_GITSTG;
-                        Icon ic = b == 0 ? IC_OPEN_FILE : (b == 1 && !en.staged) ? IC_UNDO : en.staged ? IC_MINUS : IC_PLUS;
+                        int kind = b == 0 ? H_GITOPEN : (b == 1 && !en.staged && !conf) ? H_GITDISC : H_GITSTG;
+                        Icon ic = b == 0 ? IC_OPEN_FILE : (b == 1 && !en.staged && !conf) ? IC_UNDO : en.staged ? IC_MINUS : IC_PLUS;
                         if (hovered(kind, id)) r_rect(E.r, bx - (float)S(1), ry + (float)S(3), (float)S(20), rowh - (float)S(6), C_SELROW);
                         draw_icon(ic, bx + (float)S(1), ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
                         hit(bx - (float)S(1), ry + (float)S(3), (float)S(20), rowh - (float)S(6), kind, id);
@@ -2639,6 +2644,7 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
     };
 
     if (E.git.changes.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "No changes. The working tree matches HEAD.", C_UI_FAINT, cw); ry += rowh; }
+    if (!merge.empty()) { section(4, "Merge Changes", g.open_merge, (int)merge.size(), -1); if (g.open_merge) file_rows(merge, 4); }
     if (!staged.empty()) { section(0, "Staged Changes", g.open_staged, (int)staged.size(), 1); if (g.open_staged) file_rows(staged, 0); }
     if (!other.empty()) { section(1, "Changes", g.open_changes, (int)other.size(), 0); if (g.open_changes) file_rows(other, 1); }
     ry += (float)S(6);
@@ -3410,6 +3416,94 @@ void sb_to_pointer() {
     redraw();
 }
 
+/* ---- merge conflicts in the editor: the <<<<<<< ======= >>>>>>> blocks of a file git lists as conflicted ---- */
+
+const std::vector<Conflict> *conflicts_for(Doc &d) {
+    if (d.dv || !E.git.repo || d.path.empty() || d.buf.size() > (size_t)8 << 20) return nullptr;
+    ConflictCache &c = g_conf[&d];
+    if (c.rev == d.buf.revision() && c.listed) return &c.v;
+    std::string rel = rel_to_root(d.path);
+    bool conflicted = false;
+    for (const GitChange &g : E.git.changes) if (g.path == rel && (g.x == 'U' || g.y == 'U' || (g.x == 'A' && g.y == 'A') || (g.x == 'D' && g.y == 'D'))) { conflicted = true; break; }
+    if (!conflicted) { c.v.clear(); c.rev = d.buf.revision(); c.listed = true; return nullptr; }
+    c.v.clear();
+    std::string t;
+    Conflict cur;
+    for (size_t i = 0, n = d.buf.lines(); i < n; i++) {
+        if (d.buf.line_len(i) < 7) continue;
+        d.buf.line_text(i, t);
+        if (t.compare(0, 7, "<<<<<<<") == 0 && (t.size() == 7 || t[7] == ' ')) { cur = Conflict(); cur.a = (long)i; }
+        else if (cur.a >= 0 && t.compare(0, 7, "|||||||") == 0 && cur.mid < 0) cur.base = (long)i;
+        else if (cur.a >= 0 && t == "=======") cur.mid = (long)i;
+        else if (cur.a >= 0 && cur.mid >= 0 && t.compare(0, 7, ">>>>>>>") == 0 && (t.size() == 7 || t[7] == ' ')) { cur.b = (long)i; c.v.push_back(cur); cur = Conflict(); }
+    }
+    c.rev = d.buf.revision(); c.listed = true;
+    return c.v.empty() ? nullptr : &c.v;
+}
+
+/* 0 none, 1 "<<<<<<<" line, 2 current (ours), 3 "|||||||" line, 4 base, 5 "=======" line, 6 incoming (theirs), 7 ">>>>>>>" line */
+int conflict_kind(const std::vector<Conflict> &v, long line, size_t *idx) {
+    size_t lo = 0, hi = v.size();
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (v[m].b < line) lo = m + 1; else hi = m; }
+    if (lo >= v.size() || line < v[lo].a) return 0;
+    const Conflict &c = v[lo];
+    *idx = lo;
+    if (line == c.a) return 1;
+    if (line == c.b) return 7;
+    if (line == c.mid) return 5;
+    if (c.base >= 0 && line == c.base) return 3;
+    if (line < (c.base >= 0 ? c.base : c.mid)) return 2;
+    if (c.base >= 0 && line < c.mid) return 4;
+    return 6;
+}
+
+void conflict_accept(Doc &d, size_t idx, int op) {   /* 0 current, 1 incoming, 2 both */
+    const std::vector<Conflict> *vp = conflicts_for(d);
+    if (!vp || idx >= vp->size()) return;
+    Conflict c = (*vp)[idx];
+    std::string t, text;
+    auto take = [&](long from, long to) { for (long i = from; i < to; i++) { d.buf.line_text((size_t)i, t); text += t + "\n"; } };
+    long ours_end = c.base >= 0 ? c.base : c.mid;
+    if (op == 0 || op == 2) take(c.a + 1, ours_end);
+    if (op == 1 || op == 2) take(c.mid + 1, c.b);
+    size_t nl = d.buf.lines(), size = d.buf.size();
+    size_t pos = d.buf.line_start((size_t)c.a);
+    size_t end = (size_t)(c.b + 1) < nl ? d.buf.line_start((size_t)(c.b + 1)) : size;
+    if (end == size && size) { std::string last; d.buf.copy(size - 1, 1, last); if (last != "\n" && !text.empty()) text.pop_back(); }
+    d.break_group();
+    d.replace(pos, end - pos, text.data(), text.size());
+    d.break_group();
+    E.status_msg = op == 0 ? "kept the current change" : op == 1 ? "kept the incoming change" : "kept both changes";
+}
+
+/* Accept Current | Accept Incoming | Accept Both on the "<<<<<<<" line, like VS Code's merge conflict actions */
+void draw_conflict_actions(const Layout &L, Doc &d) {
+    if (E.mode != M_EDIT) return;
+    const std::vector<Conflict> *vp = conflicts_for(d);
+    if (!vp) return;
+    static const char *names[3] = {"Accept Current", "Accept Incoming", "Accept Both"};
+    float total = 0;
+    for (int k = 0; k < 3; k++) total += text_width(E.ui, names[k]) + (float)S(20);
+    float rx = (float)E.W - (float)S(16);
+    for (size_t i = 0; i < vp->size(); i++) {
+        const Conflict &c = (*vp)[i];
+        long row = c.a - (long)d.top;
+        if (row < 0 || row >= L.rows) continue;
+        float y = (float)(L.text_y + row * E.rowh);
+        float x = rx - total;
+        if (x < (float)L.text_x + (float)(20 * E.cw)) continue;   /* too narrow to show the actions next to the marker text */
+        r_rect(E.r, x - (float)S(6), y, total + (float)S(6), (float)E.rowh, ui_mix(C_EDITOR, C_FG, 0.10));
+        for (int k = 0; k < 3; k++) {
+            float w = text_width(E.ui, names[k]) + (float)S(20);
+            int id = (int)i * 4 + k;
+            if (hovered(H_CONFLICT, id)) r_rect(E.r, x, y + 1, w, (float)E.rowh - 2, C_HOVER);
+            draw_text(E.ui, x + (float)S(10), ui_base(y, (float)E.rowh), names[k], k == 2 ? C_UI_DIM : C_ACCENT, w);
+            hit(x, y, w, (float)E.rowh, H_CONFLICT, id);
+            x += w;
+        }
+    }
+}
+
 /* The peek: the HEAD lines of a change (red) and the lines now in the buffer (green) in a panel under the changed lines, with Revert, Open Diff and next / previous change */
 void draw_peek(const Layout &L, Doc &d) {
     if (g_peek.doc != &d || E.mode != M_EDIT) return;
@@ -3632,6 +3726,7 @@ void build_frame() {
         }
         std::unique_ptr<Matcher> find_mp;
         if (use_find) find_mp.reset(new Matcher(find_re));
+        const std::vector<Conflict> *cfl = conflicts_for(d);
         long bra = -1, brb = -1;
         bracket_pair(d, &bra, &brb);
         long bla = bra >= 0 ? (long)d.buf.line_of((size_t)bra) : -1, blb = brb >= 0 ? (long)d.buf.line_of((size_t)brb) : -1;
@@ -3640,6 +3735,14 @@ void build_frame() {
             size_t line = d.top + (size_t)row;
             const std::string &tt = texts[(size_t)row];
             float ry = (float)(L.text_y + row * E.rowh);
+            if (cfl) {
+                size_t ci_ = 0;
+                int ck = conflict_kind(*cfl, (long)line, &ci_);
+                if (ck) {
+                    uint32_t bg = ck == 1 ? ui_mix(C_EDITOR, C_GIT_ADD, 0.34) : ck == 2 ? ui_mix(C_EDITOR, C_GIT_ADD, 0.14) : ck == 7 ? ui_mix(C_EDITOR, C_ACCENT, 0.36) : ck == 6 ? ui_mix(C_EDITOR, C_ACCENT, 0.16) : ui_mix(C_EDITOR, C_FG, 0.10);
+                    r_rect(E.r, (float)L.text_x, ry, (float)(E.W - L.text_x), (float)E.rowh, bg);
+                }
+            }
             if (line == cl) r_rect(E.r, (float)L.text_x, ry, (float)(E.W - L.text_x), (float)E.rowh, C_CURLINE);
             auto mark = [&](size_t b0, size_t b1, uint32_t col) {
                 int c0 = col_of(tt, b0) - d.left, c1 = col_of(tt, b1) - d.left;
@@ -3733,6 +3836,7 @@ void build_frame() {
             if (c >= 0 && c <= L.cols) r_rect(E.r, (float)(L.text_x + c * E.cw), (float)(L.text_y + (long)(cl - d.top) * E.rowh), std::max(1.f, 1.5f * E.scale), (float)E.rowh, C_CURSOR);
         }
         draw_peek(L, d);
+        draw_conflict_actions(L, d);
     }
     double tm3 = E.timing ? now_s() : 0;
 
@@ -5339,12 +5443,13 @@ void click_hit(const Hit &h) {
         E.mode = M_EDIT;
         if (h.kind == H_GITSTG) { begin_op(staged ? "git unstage" : "git stage"); git_do(staged ? git_unstage(E.git.root, c.path) : git_stage(E.git.root, c.path), staged ? "unstage" : "stage"); break; }
         if (!E.pinned) open_side(false);
-        if (h.kind == H_GITOPEN || (SDL_GetModState() & KMOD_CTRL)) open_path(E.git.root + "/" + c.path); else open_change_diff(c, staged);
+        bool conflict = c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D');
+        if (h.kind == H_GITOPEN || conflict || (SDL_GetModState() & KMOD_CTRL)) open_path(E.git.root + "/" + c.path); else open_change_diff(c, staged);
         break;
     }
     case H_GITSEC: {
-        bool *f[4] = {&E.g.open_staged, &E.g.open_changes, &E.g.open_graph, &E.g.open_tl};
-        if (h.id >= 0 && h.id < 4) *f[h.id] = !*f[h.id];
+        bool *f[5] = {&E.g.open_staged, &E.g.open_changes, &E.g.open_graph, &E.g.open_tl, &E.g.open_merge};
+        if (h.id >= 0 && h.id < 5) *f[h.id] = !*f[h.id];
         break;
     }
     case H_BLAME: {
@@ -5406,6 +5511,7 @@ void click_hit(const Hit &h) {
         break;
     }
     case H_GITOP: git_op_do(h.id); break;
+    case H_CONFLICT: conflict_accept(D(), (size_t)(h.id / 4), h.id % 4); break;
     case H_GITREFRESH: begin_op("git refresh"); git_refresh(); break;
     case H_GITALL: {
         begin_op(h.id == 0 ? "git stage all" : "git unstage all");
