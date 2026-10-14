@@ -142,6 +142,7 @@ The same themes as Lestrix: Xylonic Dark and Light, Graphite, Nord, Gruvbox, Sol
 | F7, Shift+F7 | Next / previous change in a diff tab |
 | Ctrl+Shift+T | Reopen the last closed tab |
 | Ctrl+Shift+PgUp, Ctrl+Shift+PgDn | Move the tab left / right |
+| Ctrl+H | Replace: opens a Replace box under the find box (Tab switches boxes; Enter in it replaces the match and moves on; **All** or Ctrl+Alt+Enter replaces everything in one undo step; the replacement is plain text) |
 | Ctrl+G | Go to line (also `:42` in Ctrl+P) |
 | Ctrl+Left / Right, Ctrl+Backspace / Delete | Move by word, delete a word |
 | Alt+Up / Down, Shift+Alt+Up / Down | Move the line(s), copy the line(s) |

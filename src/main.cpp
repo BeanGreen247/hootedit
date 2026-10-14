@@ -181,14 +181,14 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
@@ -196,7 +196,7 @@ const std::vector<Menu> MENUS = {
     {"File", {{"New File", "Ctrl+N", A_NEW}, {"Open File...", "Ctrl+O", A_OPEN_FILE}, {"Open Folder...", "Ctrl+K Ctrl+O", A_OPEN_FOLDER}, {"Quick Open...", "Ctrl+P", A_QUICK}, {"", "", A_NONE},
               {"Save", "Ctrl+S", A_SAVE}, {"Save As...", "Ctrl+Shift+S", A_SAVEAS}, {"", "", A_NONE}, {"Close Tab", "Ctrl+W", A_CLOSE}, {"Exit", "Ctrl+Q", A_QUIT}}},
     {"Edit", {{"Undo", "Ctrl+Z", A_UNDO}, {"Redo", "Ctrl+Y", A_REDO}, {"", "", A_NONE}, {"Cut", "Ctrl+X", A_CUT}, {"Copy", "Ctrl+C", A_COPY}, {"Paste", "Ctrl+V", A_PASTE},
-              {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
+              {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
               {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
@@ -206,7 +206,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -284,6 +284,8 @@ struct Ed {
     PromptKind prompt_kind = PK_SAVEAS;
     int confirm_idx = 0;
     std::string find_q, find_msg, prompt_q, quick_q;
+    std::string repl_q;                                  /* the replacement typed in the Replace box */
+    bool repl_on = false, repl_focus = false;            /* the Replace box is open; the keyboard goes to it */
     struct PItem { std::string label; int id; bool current; };
     PickKind pick_kind = PICK_LANG;
     std::string pick_filter;
@@ -941,6 +943,70 @@ bool find_from(size_t start) {
     }
     E.find_msg = "No results";
     return false;
+}
+
+/* Replace: the selection when it is a match of the find text, then on to the next one; Replace All is one undo step */
+bool find_matcher(Regex &re) {
+    if (E.find_q.empty()) return false;
+    bool icase = !E.find_case;
+    if (icase) for (unsigned char c : E.find_q) if (c >= 'A' && c <= 'Z') icase = false;
+    std::string err;
+    if (!re.compile(E.find_regex ? E.find_q : Searcher::escape_literal(E.find_q), icase, &err)) { E.find_msg = "invalid: " + err; return false; }
+    return true;
+}
+
+void replace_one() {
+    Doc &d = D();
+    Regex re;
+    if (!find_matcher(re)) return;
+    if (d.has_sel()) {   /* is what is selected one whole match? */
+        std::string sel = d.selection();
+        Matcher m(re);
+        size_t ms, me;
+        if (sel.find('\n') == std::string::npos && m.find(sel.data(), sel.size(), 0, &ms, &me) && ms == 0 && me == sel.size()) {
+            size_t lo = d.sel_lo();
+            d.break_group();
+            d.replace(lo, sel.size(), E.repl_q.data(), E.repl_q.size());
+            d.break_group();
+            find_from(lo + E.repl_q.size());
+            return;
+        }
+    }
+    find_from(d.sel_lo());   /* nothing matching selected yet: select the next match first */
+}
+
+void replace_all() {
+    Doc &d = D();
+    Regex re;
+    if (!find_matcher(re)) return;
+    Matcher m(re);
+    std::string out, t;
+    size_t nl = d.buf.lines(), count = 0;
+    for (size_t line = 0; line < nl; line++) {
+        d.buf.line_text(line, t);
+        size_t from = 0;
+        std::string o;
+        while (from <= t.size()) {
+            size_t ms, me;
+            if (!m.find(t.data(), t.size(), from, &ms, &me) || me == ms) { if (me == ms && ms < t.size() && from <= ms) { /* an empty match: skip a character */ o.append(t, from, ms + 1 - from); from = ms + 1; continue; } break; }
+            o.append(t, from, ms - from);
+            o += E.repl_q;
+            from = me;
+            count++;
+        }
+        if (from <= t.size()) o.append(t, from, std::string::npos);
+        out += o;
+        if (line + 1 < nl) out += '\n';
+    }
+    if (!count) { E.find_msg = "No results"; return; }
+    size_t keep = d.cur, top = d.top;
+    d.break_group();
+    d.replace(0, d.buf.size(), out.data(), out.size());
+    d.break_group();
+    d.move_to(std::min(keep, d.buf.size()), false, false);
+    d.top = std::min(top, d.buf.lines() - 1);
+    E.status_msg = sfmt("replaced %zu occurrence%s", count, count == 1 ? "" : "s");
+    E.find_msg.clear();
 }
 
 /* ---- workspace search (sidebar SEARCH tab) ---- */
@@ -4297,6 +4363,30 @@ void build_frame() {
             std::string wn = E.tree.root_name();
             draw_text(E.ui, tx0, ui_base(by, bhh), wn.empty() ? "Hootedit" : wn.c_str(), C_UI_DIM, bw - (float)S(20));
         }
+        if (E.mode == M_FIND && E.repl_on) {   /* the Replace box hangs under the find box */
+            float ry2 = mh, rh2 = (float)S(34);
+            r_rect(E.r, bx, ry2, bw, rh2, C_BOX_LINE);
+            r_rect(E.r, bx + 1, ry2, bw - 2, rh2 - 1, C_BOX);
+            r_rect(E.r, bx, ry2 + rh2 - 1, bw, 1, C_ACCENT);
+            hit(bx, ry2, bw, rh2, H_REPL, 3);
+            const char *bl[2] = {"Replace", "All"};
+            float bxr = bx + bw - (float)S(6);
+            for (int k2 = 1; k2 >= 0; k2--) {
+                float w = text_width(E.ui, bl[k2]) + (float)S(16), hh = rh2 - (float)S(10);
+                bxr -= w;
+                r_rect(E.r, bxr, ry2 + (float)S(5), w, hh, hovered(H_REPL, k2) ? C_SELROW : C_FIELD);
+                draw_text(E.ui, bxr + (float)S(8), ui_base(ry2 + (float)S(5), hh), bl[k2], C_UI, w);
+                hit(bxr, ry2 + (float)S(5), w, hh, H_REPL, k2);
+                bxr -= (float)S(4);
+            }
+            float fx = bx + (float)S(10), fw = bxr - fx;
+            r_rect(E.r, fx - (float)S(6), ry2 + (float)S(5), fw + (float)S(8), rh2 - (float)S(10), E.repl_focus ? C_ACCENT : C_BOX_LINE);
+            r_rect(E.r, fx - (float)S(5), ry2 + (float)S(6), fw + (float)S(6), rh2 - (float)S(12), C_FIELD);
+            hit(fx - (float)S(6), ry2 + (float)S(5), fw + (float)S(8), rh2 - (float)S(10), H_REPL, 2);
+            float pen2 = draw_text(E.ui, fx, ui_base(ry2, rh2 - (float)S(1)), E.repl_q.c_str(), C_UI, fw - (float)S(4));
+            if (E.repl_q.empty()) draw_text(E.ui, fx, ui_base(ry2, rh2 - (float)S(1)), "Replace with", C_UI_FAINT, fw);
+            if (E.repl_focus && E.blink_on) r_rect(E.r, pen2, ry2 + (float)S(9), std::max(1.f, E.scale), rh2 - (float)S(19), C_CURSOR);
+        }
         float lx2 = bx + bw + (float)S(12);
         bool lopen = E.mode == M_PICK && E.pick_kind == PICK_LANG;
         if (lopen || hovered(H_ACT, A_LANG)) r_rect(E.r, lx2, by, lw, bhh, lopen ? C_MENU_SEL : C_HOVER);
@@ -5338,7 +5428,7 @@ void do_action(int act) {
     case A_COPY: { std::string s = d.selection(); if (!s.empty()) SDL_SetClipboardText(s.c_str()); break; }
     case A_PASTE: { char *c = SDL_GetClipboardText(); if (c && *c) { d.break_group(); d.insert_text(c, strlen(c)); d.break_group(); } if (c) SDL_free(c); break; }
     case A_SELALL: d.break_group(); d.select_all(); break;
-    case A_FIND: E.mode = M_FIND; E.find_msg.clear(); break;
+    case A_FIND: E.mode = M_FIND; E.find_msg.clear(); E.repl_on = false; E.repl_focus = false; break;
     case A_QUICK: E.mode = M_QUICK; E.quick_q.clear(); E.quick_sel = 0; quick_update(); break;
     case A_TOGGLE_SIDEBAR: open_side(!E.side_open); break;
     case A_PIN:
@@ -5369,6 +5459,7 @@ void do_action(int act) {
     case A_NEXT_TAB: set_active((E.active + 1) % (int)E.docs.size()); break;
     case A_PREV_TAB: set_active((E.active + (int)E.docs.size() - 1) % (int)E.docs.size()); break;
     case A_PALETTE: command_palette(); break;
+    case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
     case A_REOPEN: reopen_closed_tab(); break;
     case A_CLOSE_ALL: close_all_tabs(); break;
@@ -5565,8 +5656,15 @@ void key_down(const SDL_KeyboardEvent &k) {
         return;
     }
     if (E.mode == M_FIND) {
-        if (sym == SDLK_ESCAPE) E.mode = M_EDIT;
+        bool alt2 = k.keysym.mod & KMOD_ALT;
+        if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; E.repl_on = false; E.repl_focus = false; }
+        else if (sym == SDLK_h && ctrl) { E.repl_on = true; E.repl_focus = !E.repl_focus; }
+        else if (sym == SDLK_TAB && E.repl_on) E.repl_focus = !E.repl_focus;
+        else if ((sym == SDLK_RETURN || sym == SDLK_KP_ENTER) && E.repl_on && ctrl && alt2) replace_all();
+        else if ((sym == SDLK_RETURN || sym == SDLK_KP_ENTER) && E.repl_on && E.repl_focus) replace_one();
         else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) find_from(d.sel_hi());
+        else if (sym == SDLK_BACKSPACE && E.repl_focus) pop_utf8(E.repl_q);
+        else if (sym == SDLK_v && ctrl && E.repl_focus) { char *c = SDL_GetClipboardText(); if (c) { E.repl_q += c; SDL_free(c); } }
         else if (sym == SDLK_BACKSPACE) { pop_utf8(E.find_q); find_from(d.sel_lo()); }
         else if (sym == SDLK_f && ctrl) { E.find_q.clear(); E.find_msg.clear(); }
         else if (sym == SDLK_v && ctrl) { char *c = SDL_GetClipboardText(); if (c) { E.find_q += c; SDL_free(c); find_from(d.sel_lo()); } }
@@ -5690,6 +5788,7 @@ void key_down(const SDL_KeyboardEvent &k) {
     case SDLK_w: if (ctrl) do_action(A_CLOSE); else return; return;
     case SDLK_q: if (ctrl) do_action(A_QUIT); else return; return;
     case SDLK_f: if (ctrl) do_action(shift ? A_SEARCH : A_FIND); else return; return;
+    case SDLK_h: if (ctrl && !shift) { do_action(A_REPLACE); touch(); } else return; return;
     case SDLK_p: if (ctrl && shift) do_action(A_PALETTE); else if (ctrl) do_action(A_QUICK); else return; return;
     case SDLK_F1: do_action(A_PALETTE); return;
     case SDLK_b: if (ctrl) do_action(A_TOGGLE_SIDEBAR); else return; return;
@@ -5916,6 +6015,7 @@ void click_hit(const Hit &h) {
     case H_GITOP: git_op_do(h.id); break;
     case H_CONFLICT: if (h.id % 4 == 3) { merge_open(rel_to_root(D().path)); break; } conflict_accept(D(), (size_t)(h.id / 4), h.id % 4); break;
     case H_MERGE: merge_op(h.id); break;
+    case H_REPL: if (h.id == 0) replace_one(); else if (h.id == 1) replace_all(); else if (h.id == 2) E.repl_focus = true; else if (h.id == 3) E.repl_focus = false; break;
     case H_GITREFRESH: begin_op("git refresh"); git_refresh(); break;
     case H_GITALL: {
         begin_op(h.id == 0 ? "git stage all" : "git unstage all");
@@ -6019,7 +6119,7 @@ void text_input(const char *s) {
     if (E.mode == M_EDIT) begin_op("keystroke");
     else if (E.mode == M_QUICK) begin_op("quick-open filter", std::to_string(E.quick_files.size()) + " files");
     else if (E.mode == M_SIDE && E.view == V_EXPLORER) begin_op("file filter", std::to_string(E.quick_files.size()) + " files");
-    if (E.mode == M_FIND) { E.find_q += s; find_from(D().sel_lo()); touch(); return; }
+    if (E.mode == M_FIND) { if (E.repl_focus) { E.repl_q += s; touch(); return; } E.find_q += s; find_from(D().sel_lo()); touch(); return; }
     if (E.mode == M_FILEDLG) {
         if (E.fd.kind == FD_SAVE && E.fd.name_focus) { E.fd.name += s; E.fd.overwrite_armed = false; }
         else {
