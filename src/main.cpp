@@ -2886,6 +2886,14 @@ void draw_diff(const Layout &L, float ex, float ew) {
     };
 
     if (!v.vinline) r_rect(E.r, ex + half, body_y, 1, (float)(rows * E.rowh), C_BORDER);   /* under the rows, so a fold bar covers it */
+    /* the change under the mouse gets stage / revert (or unstage) buttons on its first visible row, like VS Code */
+    int hov_hunk = -1;
+    const bool can_wt = v.right_rev == "WORK" && (v.left_rev == ":" || v.left_rev.empty()), can_unstage = v.left_rev == "HEAD" && v.right_rev == ":";
+    if ((can_wt || can_unstage) && E.mx >= ex && E.mx < ex + ew && E.my >= body_y && E.my < body_y + (float)(nrows * E.rowh) && (E.mode == M_EDIT || E.mode == M_FIND)) {
+        const DiffView::VRow &mv = v.vrows[(size_t)(v.top + (int)((E.my - body_y) / (float)E.rowh))];
+        if (mv.sub != 3 && m.rows[(size_t)mv.row].kind != DK_SAME) hov_hunk = m.rows[(size_t)mv.row].hunk;
+    }
+    bool hov_drawn = false;
     for (int r = 0; r < nrows; r++) {
         const DiffView::VRow &vr = v.vrows[(size_t)(v.top + r)];
         float y = body_y + (float)(r * E.rowh);
@@ -2904,6 +2912,25 @@ void draw_diff(const Layout &L, float ex, float ew) {
         bool changed = row.kind != DK_SAME;
         const std::string *ta = row.a >= 0 ? &m.a[(size_t)row.a] : nullptr, *tb = row.b >= 0 ? &m.b[(size_t)row.b] : nullptr;
         bool cur = changed && v.cur_change >= 0 && row.hunk == v.cur_change;
+        auto hunk_buttons = [&]() {
+            if (hov_drawn || !changed || row.hunk != hov_hunk) return;
+            hov_drawn = true;
+            const float bs = (float)E.rowh, gap = (float)S(2);
+            const int nb = can_wt ? 2 : 1;
+            float bx = ex + ew - (float)S(16) - (float)nb * (bs + gap);
+            r_rect(E.r, bx - gap, y, (float)nb * (bs + gap) + gap, bs, C_CHROME);
+            r_rect(E.r, bx - gap, y, (float)nb * (bs + gap) + gap, 1, C_BORDER);
+            r_rect(E.r, bx - gap, y + bs - 1, (float)nb * (bs + gap) + gap, 1, C_BORDER);
+            const int ops[2] = {can_wt ? 4 : 6, 5};
+            const Icon ics[2] = {can_wt ? IC_PLUS : IC_MINUS, IC_UNDO};
+            for (int k = 0; k < nb; k++) {
+                int id = row.hunk * 8 + ops[k];
+                float x = bx + (float)k * (bs + gap);
+                if (hovered(H_DIFFHUNK, id)) r_rect(E.r, x, y, bs, bs, C_HOVER);
+                draw_icon(ics[k], x + (bs - (float)S(16)) / 2, y + (bs - (float)S(16)) / 2, S(16), C_UI);
+                hit(x, y, bs, bs, H_DIFFHUNK, id);
+            }
+        };
         if (v.vinline) {
             bool del = vr.sub == 1, add = vr.sub == 2;
             const std::string *t = del ? ta : add ? tb : tb;
@@ -2918,6 +2945,7 @@ void draw_diff(const Layout &L, float ex, float ew) {
             r_clip(E.r, (int)itx, (int)y, (int)(ex + ew - itx), E.rowh);
             if (t) emit_code(itx, y, *t, v.left, cols, v.lang, del ? v.sa[(size_t)ln] : v.sb[(size_t)ln]);
             r_clip_off(E.r);
+            hunk_buttons();
             continue;
         }
         /* side by side: left column (old), divider, right column (new) */
@@ -2936,6 +2964,7 @@ void draw_diff(const Layout &L, float ex, float ew) {
         r_clip(E.r, (int)tx_b, (int)y, (int)(ex + ew - tx_b), E.rowh);
         if (tb) emit_code(tx_b, y, *tb, v.left, cols, v.lang, v.sb[(size_t)row.b]);
         r_clip_off(E.r);
+        hunk_buttons();
     }
 
     /* scrollbar with the changes marked on the track, like VS Code's overview ruler */
@@ -4927,6 +4956,14 @@ void diff_hunk_apply(DiffView &v, int op) {   /* 4 stage, 5 revert, 6 unstage */
     else git_error(op == 4 ? "stage change" : "unstage change", o);
 }
 
+void diff_change_op(const std::shared_ptr<DiffView> &dv, int op) {   /* 4 stage, 5 revert (asks first), 6 unstage: the current change */
+    DiffView &v = *dv;
+    if (op != 5) { diff_hunk_apply(v, op); return; }
+    if (v.cur_change < 0) { E.status_msg = "Select a change first (F7)"; return; }
+    std::shared_ptr<DiffView> keep = dv;
+    dlg_show("Are you sure you want to revert this change in '" + base_name(v.path) + "'?", "The change is removed from the file on disk. This action is irreversible!", {"Revert Change", "Cancel"}, [keep](int i, const std::string &) { if (i == 0) diff_hunk_apply(*keep, 5); });
+}
+
 void click_hit(const Hit &h) {
     bool term_hit = h.kind == H_TERMTAB || h.kind == H_SPLIT || (h.kind == H_ACT && (h.id == A_TERM_NEW || h.id == A_TERM_KILL || h.id == A_TERM_TOGGLE));
     E.term_focus = term_hit && E.term_open;
@@ -4990,6 +5027,13 @@ void click_hit(const Hit &h) {
         d.dv->vdirty = true;
         break;
     }
+    case H_DIFFHUNK: {   /* the buttons that appear on the change under the mouse: id = change * 8 + operation */
+        Doc &d = D();
+        if (!d.dv || (size_t)(h.id / 8) >= d.dv->m.hunks.size()) break;
+        d.dv->cur_change = h.id / 8;
+        diff_change_op(d.dv, h.id % 8);
+        break;
+    }
     case H_DIFFBTN: {
         Doc &d = D();
         if (!d.dv) break;
@@ -4998,12 +5042,7 @@ void click_hit(const Hit &h) {
         if (h.id == 0) diff_step(v, -1, L);
         else if (h.id == 1) diff_step(v, 1, L);
         else if (h.id == 2) { v.mode = v.vinline ? 1 : 2; v.vdirty = true; }
-        else if (h.id == 4 || h.id == 6) diff_hunk_apply(v, h.id);
-        else if (h.id == 5) {
-            if (v.cur_change < 0) { E.status_msg = "Select a change first (F7)"; break; }
-            std::shared_ptr<DiffView> keep = d.dv;
-            dlg_show("Are you sure you want to revert this change in '" + base_name(v.path) + "'?", "The change is removed from the file on disk. This action is irreversible!", {"Revert Change", "Cancel"}, [keep](int i, const std::string &) { if (i == 0) diff_hunk_apply(*keep, 5); });
-        }
+        else if (h.id == 4 || h.id == 5 || h.id == 6) diff_change_op(d.dv, h.id);
         else if (h.id == 3) { std::string p = v.root + "/" + v.path; struct stat st; if (stat(p.c_str(), &st) == 0) open_path(p); else E.status_msg = "the file is not on disk any more"; }
         break;
     }
