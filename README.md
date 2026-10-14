@@ -35,7 +35,7 @@ A narrow rail on the left holds the **pin** button and three rotated tabs. Pinne
 
 ## Tabs
 
-With no file open and nothing typed, the window shows the Hootedit start screen and no tab strip. A double click on the start screen, or on the strip, opens an empty tab. Once tabs exist, a double click on the empty space to the right of the last one opens another empty tab, and Ctrl+N does the same. Closing the last tab brings the start screen back. Line numbers are centered in the gutter, and nothing under the status bar can be clicked.
+With no file open and nothing typed, the window shows the Hootedit start screen and no tab strip. The start screen has the owl logo as a faint watermark above the name, tinted from the active theme. It is drawn from vector shapes at run time (`src/icons.cpp`, about 6 ms at 1x and 28 ms on a 2x display, once per size), with no image file. A double click on the start screen, or on the strip, opens an empty tab. Once tabs exist, a double click on the empty space to the right of the last one opens another empty tab, and Ctrl+N does the same. Closing the last tab brings the start screen back. Line numbers are centered in the gutter, and nothing under the status bar can be clicked.
 
 `hootedit FOLDER` opens a folder; `hootedit FILE` uses the file's repository (or its folder) as the workspace.
 

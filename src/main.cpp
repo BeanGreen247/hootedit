@@ -1366,12 +1366,20 @@ void build_frame() {
 
     /* ---- editor area ---- */
     if (splash()) {
+        /* the owl in its tag as a faint watermark, then the name and a hint, centred in the editor area like the empty VS Code window */
         const char *name = "Hootedit";
-        float cxm = ex + ew / 2;
-        float w = text_width(E.big, name);
-        draw_text(E.big, cxm - w / 2, (float)E.H / 2, name, C_BORDER, (float)E.W);
         const char *hint = "Double click or Ctrl+N: new tab   Ctrl+P: open   Ctrl+B: sidebar";
-        draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, (float)E.H / 2 + (float)S(34), hint, C_UI_FAINT, ew);
+        float cxm = ex + ew / 2, areah = (float)(L.ed_bottom - L.text_y);
+        int ls = (int)std::max((float)S(96), std::min((float)S(200), std::min(ew, areah) * 0.34f)) / 16 * 16;   /* multiples of 16 px: a resize makes a few sizes, not hundreds */
+        float gap1 = (float)S(24), gap2 = (float)S(16), nameh = (float)S(36), hinth = (float)S(18);
+        float total = (float)ls + gap1 + nameh + gap2 + hinth;
+        float y0 = (float)L.text_y + std::max(0.f, (areah - total) / 2) - (float)S(10);
+        uint32_t wm = ui_mix(C_EDITOR, C_UI, 0.09f), wm_eyes = ui_mix(C_EDITOR, C_ACCENT, 0.34f);
+        draw_icon(IC_LOGO_BODY, cxm - (float)ls / 2, y0, ls, wm);
+        draw_icon(IC_LOGO_EYES, cxm - (float)ls / 2, y0, ls, wm_eyes);
+        float w = text_width(E.big, name);
+        draw_text(E.big, cxm - w / 2, y0 + (float)ls + gap1 + nameh - (float)S(8), name, wm, (float)E.W);
+        draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, y0 + (float)ls + gap1 + nameh + gap2 + (float)S(13), hint, C_UI_FAINT, ew);
     } else {
         /* the faint band behind the cursor line also covers the gutter */
         if (cl >= d.top && cl < d.top + (size_t)L.rows) r_rect(E.r, (float)L.ed_x, (float)(L.text_y + (long)(cl - d.top) * E.rowh), (float)(L.text_x - L.ed_x), (float)E.rowh, C_CURLINE);

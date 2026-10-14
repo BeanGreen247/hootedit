@@ -55,9 +55,54 @@ bool inside(Icon ic, float x, float y) {
     }
 }
 
+/* ---- the logo, in the 256-unit space of the app icon: the owl head scaled by 0.84 and shifted down 6, between a < and a > ---- */
+
+bool in_poly(float x, float y, const float (*p)[2], int n) {
+    bool in = false;
+    for (int i = 0, j = n - 1; i < n; j = i++)
+        if (((p[i][1] > y) != (p[j][1] > y)) && (x < (p[j][0] - p[i][0]) * (y - p[i][1]) / (p[j][1] - p[i][1]) + p[i][0])) in = !in;
+    return in;
+}
+
+const float HEAD[10][2] = {{56, 36}, {106, 66}, {128, 60}, {150, 66}, {200, 36}, {210, 118}, {190, 188}, {128, 226}, {66, 188}, {46, 118}};
+const float BEAK[4][2] = {{128, 152}, {115, 128}, {128, 120}, {141, 128}};
+
+bool logo_inside(Icon ic, float x, float y) {
+    const float K = 0.84f;
+    float dx = 128 + (x - 128) / K, dy = 128 + (y - 134) / K;   /* back into the unscaled head's coordinates */
+    bool eye_disc = circ(dx, dy, 97, 108, 31) || circ(dx, dy, 159, 108, 31);
+    if (ic == IC_LOGO_BODY) {
+        if (in_poly(dx, dy, HEAD, 10) && !eye_disc) return true;
+        for (int s = -1; s <= 1; s += 2) {
+            float arm = 128 + (float)s * 80, tip = 128 + (float)s * 108;
+            if (seg_d(x, y, arm, 86, tip, 128) <= 7.5f || seg_d(x, y, tip, 128, arm, 170) <= 7.5f) return true;
+        }
+        return false;
+    }
+    /* eyes: a ring (iris) around a small pupil, and the beak */
+    for (float cx : {97.f, 159.f}) if (circ(dx, dy, cx, 108, 20) && !circ(dx, dy, cx, 108, 9)) return true;
+    return in_poly(dx, dy, BEAK, 4);
+}
+
 }  // namespace
 
+static std::vector<uint8_t> logo_bitmap(Icon ic, int size) {
+    std::vector<uint8_t> out((size_t)size * (size_t)size);
+    const int N = 2;   /* 4 samples a pixel: the logo is a faint watermark and this keeps its one-time cost to a few ms */
+    float k = 256.f / (float)size;
+    for (int py = 0; py < size; py++)
+        for (int px = 0; px < size; px++) {
+            int n = 0;
+            for (int sy = 0; sy < N; sy++)
+                for (int sx = 0; sx < N; sx++)
+                    if (logo_inside(ic, ((float)px + ((float)sx + .5f) / N) * k, ((float)py + ((float)sy + .5f) / N) * k)) n++;
+            out[(size_t)py * (size_t)size + (size_t)px] = (uint8_t)(n * 255 / (N * N));
+        }
+    return out;
+}
+
 std::vector<uint8_t> icon_bitmap(Icon ic, int size) {
+    if (ic == IC_LOGO_BODY || ic == IC_LOGO_EYES) return logo_bitmap(ic, size);
     std::vector<uint8_t> out((size_t)size * (size_t)size);
     const int N = 4;
     float k = 16.f / (float)size;
