@@ -124,7 +124,9 @@ The same themes as Lestrix: Xylonic Dark and Light, Graphite, Nord, Gruvbox, Sol
 | Ctrl+P | Quick open (fuzzy) |
 | Ctrl+S, Ctrl+Shift+S | Save, Save As (an untitled file opens the Save As browser) |
 | Ctrl+Q | Quit (asks about every modified tab) |
-| Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+PgDn, Ctrl+PgUp | Next / previous tab |
+| Ctrl+Tab, Ctrl+Shift+Tab | Switch to the previously used tab; keep Ctrl down and press again to walk back through the tabs in order of use |
+| Ctrl+PgDn, Ctrl+PgUp | Next / previous tab in tab order |
+| Ctrl+Shift+P, F1 | Command palette: every menu command and the git and remote actions; every typed word must appear in the name |
 | Ctrl+B | Show or hide the sidebar |
 | Ctrl+Shift+E, Ctrl+Shift+F, Ctrl+Shift+G | Files, Search, Git tab |
 | Ctrl+` , Ctrl+Shift+` | Terminal panel, new terminal |
