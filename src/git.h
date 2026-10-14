@@ -18,6 +18,7 @@ struct GitInfo {
     int ahead = 0, behind = 0;
     std::string upstream;        /* "origin/main", empty when the branch tracks nothing */
     bool has_remote = false;     /* at least one remote is configured */
+    std::string op;              /* "merge", "rebase", "cherry-pick" or "revert" while one is unfinished, else empty */
 };
 
 bool git_installed();

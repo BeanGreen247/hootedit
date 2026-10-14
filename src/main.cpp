@@ -205,7 +205,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -1538,6 +1538,116 @@ void git_branch_ops(int which) {   /* 0 delete, 1 rename, 2 merge */
     });
 }
 
+/* ---- remotes, pull variants and rebase ---- */
+std::vector<std::string> git_remotes() {
+    std::string o;
+    git_exec(E.git.root, "remote", &o);
+    std::vector<std::string> v;
+    size_t pos = 0;
+    while (pos < o.size()) { size_t e = o.find('\n', pos); if (e == std::string::npos) e = o.size(); if (e > pos) v.push_back(o.substr(pos, e - pos)); pos = e + 1; }
+    return v;
+}
+
+void git_pick_remote(const std::string &title, std::function<void(const std::string &)> then) {
+    std::vector<std::string> rs = git_remotes();
+    if (rs.empty()) { dlg_show("Your repository has no remotes configured.", "", {"OK"}, nullptr); return; }
+    if (rs.size() == 1) { then(rs[0]); return; }
+    std::vector<Ed::PItem> items;
+    for (const std::string &r : rs) items.push_back({r, 0, false});
+    pick_custom(title, items, [then](const Ed::PItem &it) { then(it.label); });
+}
+
+void git_pull_rebase() {
+    begin_op("git pull --rebase");
+    git_start("Pulling (rebase)", "pull --rebase", [](int c, const std::string &o) {
+        git_refresh(); reload_open_docs();
+        if (c != 0 && !E.git.op.empty()) E.status_msg = "rebase stopped: resolve the conflicts, stage the files, then Continue";
+        else if (c != 0) git_error("pull --rebase", o); else E.status_msg = "pulled (rebase)";
+    });
+}
+
+void git_pull_from() {
+    git_pick_remote("Select a remote to pull from", [](const std::string &rem) {
+        std::vector<Ed::PItem> items;
+        for (auto &b : branch_items(true, false)) if (b.id == 1 && b.label.compare(0, rem.size() + 1, rem + "/") == 0) items.push_back({b.label.substr(rem.size() + 1), 0, false});
+        if (items.empty()) { dlg_show("No branches known for '" + rem + "'. Fetch first.", "", {"OK"}, nullptr); return; }
+        pick_custom("Select a branch to pull from " + rem, items, [rem](const Ed::PItem &it) {
+            begin_op("git pull");
+            git_start("Pulling", "pull " + git_quote(rem) + " " + git_quote(it.label), [](int c, const std::string &o) { git_refresh(); reload_open_docs(); if (c != 0) git_error("pull", o); else E.status_msg = "pulled"; });
+        });
+    });
+}
+
+void git_push_to() {
+    git_pick_remote("Select a remote to push to", [](const std::string &rem) {
+        begin_op("git push");
+        git_start("Pushing", "push -u " + git_quote(rem) + " " + git_quote(E.git.branch), [](int c, const std::string &o) { git_refresh(); if (c != 0) git_error("push", o); else E.status_msg = "pushed"; });
+    });
+}
+
+void git_rebase_onto() {
+    auto items = branch_items(true, true);
+    if (items.empty()) { E.status_msg = "no other branches"; redraw(); return; }
+    pick_custom("Select a branch to rebase '" + E.git.branch + "' onto", items, [](const Ed::PItem &it) {
+        std::string name = it.label;
+        dlg_show("Rebase '" + E.git.branch + "' onto '" + name + "'?", "Your commits are replayed on top of it. Stop with Abort if it goes wrong.", {"Rebase", "Cancel"}, [name](int i, const std::string &) {
+            if (i != 0) return;
+            begin_op("git rebase");
+            git_start("Rebasing", "rebase " + git_quote(name), [name](int c, const std::string &o) {
+                git_refresh(); reload_open_docs();
+                if (c != 0 && !E.git.op.empty()) E.status_msg = "rebase stopped: resolve the conflicts, stage the files, then Continue";
+                else if (c != 0) git_error("rebase", o); else E.status_msg = "rebased onto " + name;
+            });
+        });
+    });
+}
+
+void git_remote_add() {
+    dlg_show("Add Remote", "Remote name", {"Next", "Cancel"}, [](int i, const std::string &t) {
+        std::string n = trim_nl(t);
+        if (i != 0 || n.empty()) return;
+        if (n.find_first_of(" \t/") != std::string::npos) { dlg_show("Not a valid remote name", "A remote name cannot contain spaces or slashes.", {"OK"}, nullptr); return; }
+        dlg_show("Add Remote", "URL of '" + n + "'", {"Add", "Cancel"}, [n](int i2, const std::string &t2) {
+            std::string u = trim_nl(t2);
+            if (i2 == 0 && !u.empty() && git_sync_run("add remote", "remote add " + git_quote(n) + " " + git_quote(u))) { git_refresh(); E.status_msg = "added remote " + n; }
+        }, true, "", "https://... or git@host:path.git");
+    }, true, "", "origin");
+}
+
+void git_remote_remove() {
+    std::vector<std::string> rs = git_remotes();
+    if (rs.empty()) { dlg_show("Your repository has no remotes configured.", "", {"OK"}, nullptr); return; }
+    std::vector<Ed::PItem> items;
+    for (const std::string &r : rs) items.push_back({r, 0, false});
+    pick_custom("Select a remote to remove", items, [](const Ed::PItem &it) {
+        std::string n = it.label;
+        dlg_show("Remove the remote '" + n + "'?", "Its remote-tracking branches are removed too. Nothing changes on the server.", {"Remove Remote", "Cancel"}, [n](int i, const std::string &) {
+            if (i == 0 && git_sync_run("remove remote", "remote remove " + git_quote(n))) { git_refresh(); E.status_msg = "removed remote " + n; }
+        });
+    });
+}
+
+/* continue, skip or abort an unfinished merge, rebase, cherry-pick or revert: 0 continue, 1 skip, 2 abort */
+void git_op_do(int what) {
+    const std::string op = E.git.op;
+    if (op.empty()) return;
+    std::string args;
+    if (what == 0) args = op == "merge" ? "commit --no-edit" : "-c core.editor=true " + op + " --continue";
+    else if (what == 1) args = op + " --skip";
+    else args = op + " --abort";
+    if (what == 1 && op != "rebase" && op != "cherry-pick") return;
+    auto go = [op, args, what] {
+        begin_op("git " + op);
+        git_start(what == 0 ? "Continuing" : what == 1 ? "Skipping" : "Aborting", args, [op, what](int c, const std::string &o) {
+            git_refresh(); reload_open_docs();
+            if (c != 0) git_error(op + (what == 0 ? " --continue" : what == 1 ? " --skip" : " --abort"), o);
+            else E.status_msg = what == 2 ? op + " aborted" : E.git.op.empty() ? op + " finished" : op + " continues: more conflicts to resolve";
+        });
+    };
+    if (what == 2) dlg_show("Abort the " + op + "?", "Everything done since it started is thrown away.", {"Abort " + op, "Cancel"}, [go](int i, const std::string &) { if (i == 0) go(); });
+    else go();
+}
+
 /* ---- stash and tags ---- */
 void git_stash_push(bool untracked) {
     if (E.git.changes.empty()) { dlg_show("There are no changes to stash.", "", {"OK"}, nullptr); return; }
@@ -1599,15 +1709,18 @@ void git_more_menu(float x, float y) {
                                    ci("Commit and Push", [] { git_commit_flow(3); }), ci("Commit and Sync", [] { git_commit_flow(4); }), ci_sep(), ci("Undo Last Commit", [] { git_undo_last_commit(); })};
     std::vector<CtxItem> changes = {ci("Stage All Changes", [] { git_stage_all(E.git.root); git_refresh(); }, "", ch), ci("Unstage All Changes", [] { git_unstage(E.git.root, "."); git_refresh(); }, "", ch),
                                     ci("Discard All Changes", [] { discard_all_changes(); }, "", ch)};
-    std::vector<CtxItem> branch = {ci("Merge...", [] { git_branch_ops(2); }), ci_sep(), ci("Create Branch...", [] { git_create_branch(""); }), ci("Create Branch From...", [] {
+    std::vector<CtxItem> branch = {ci("Merge...", [] { git_branch_ops(2); }), ci("Rebase Branch...", [] { git_rebase_onto(); }), ci_sep(), ci("Create Branch...", [] { git_create_branch(""); }), ci("Create Branch From...", [] {
                                        pick_custom("Select a ref to create the branch from", [] { std::vector<Ed::PItem> v; for (auto &b : branch_items(true, false)) v.push_back({b.label, b.id, false}); return v; }(), [](const Ed::PItem &r) { git_create_branch(r.label); }); }),
                                    ci_sep(), ci("Rename Branch...", [] { git_branch_ops(1); }), ci("Delete Branch...", [] { git_branch_ops(0); }), ci_sep(), ci("Publish Branch...", [] { git_push_flow(); }, "", E.git.upstream.empty())};
     std::vector<CtxItem> stash = {ci("Stash", [] { git_stash_push(false); }), ci("Stash (Include Untracked)", [] { git_stash_push(true); }), ci_sep(), ci("Apply Latest Stash", [] { git_stash_op("apply", true); }),
                                   ci("Apply Stash...", [] { git_stash_op("apply", false); }), ci_sep(), ci("Pop Latest Stash", [] { git_stash_op("pop", true); }), ci("Pop Stash...", [] { git_stash_op("pop", false); }), ci_sep(),
                                   ci("Drop Stash...", [] { git_stash_op("drop", false); }), ci("Drop All Stashes...", [] { git_stash_drop_all(); })};
     std::vector<CtxItem> tags = {ci("Create Tag...", [] { git_tag_create(""); }), ci("Delete Tag...", [] { git_tag_delete(); })};
-    std::vector<CtxItem> items = {ci("Pull", [] { git_pull_flow(); }), ci("Push", [] { git_push_flow(); }), ci("Fetch", [] { git_fetch_flow(); }), ci("Sync", [] { git_sync_flow(); }), ci_sep(),
-                                  ci("Checkout to...", [] { git_branch_picker(); }), ci_sep(), ci_sub("Commit", commit), ci_sub("Changes", changes), ci_sub("Branch", branch), ci_sub("Stash", stash), ci_sub("Tags", tags), ci_sep(),
+    std::vector<CtxItem> remote = {ci("Add Remote...", [] { git_remote_add(); }), ci("Remove Remote...", [] { git_remote_remove(); }, "", E.git.has_remote), ci_sep(), ci("Fetch From All Remotes", [] { begin_op("git fetch --all"); git_start("Fetching", "fetch --all --prune", [](int c, const std::string &o) { git_refresh(); if (c != 0) git_error("fetch", o); else E.status_msg = "fetched"; }); }, "", E.git.has_remote)};
+    std::vector<CtxItem> pull = {ci("Pull", [] { git_pull_flow(); }), ci("Pull (Rebase)", [] { git_pull_rebase(); }), ci("Pull from...", [] { git_pull_from(); })};
+    std::vector<CtxItem> push = {ci("Push", [] { git_push_flow(); }), ci("Push to...", [] { git_push_to(); })};
+    std::vector<CtxItem> items = {ci_sub("Pull", pull), ci_sub("Push", push), ci("Fetch", [] { git_fetch_flow(); }), ci("Sync", [] { git_sync_flow(); }), ci_sep(),
+                                  ci("Checkout to...", [] { git_branch_picker(); }), ci_sep(), ci_sub("Commit", commit), ci_sub("Changes", changes), ci_sub("Branch", branch), ci_sub("Remote", remote), ci_sub("Stash", stash), ci_sub("Tags", tags), ci_sep(),
                                   ci(g.tree_view ? "View as List" : "View as Tree", [] { E.g.tree_view = !E.g.tree_view; settings_save(); redraw(); })};
     ctx_show(x, y, std::move(items));
 }
@@ -2350,6 +2463,31 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
             }
         }
         ry += (float)S(22);
+    }
+
+    if (!E.git.op.empty()) {   /* an unfinished merge, rebase, cherry-pick or revert: resolve, stage, then Continue (or Skip, or Abort) */
+        std::string lab = E.git.op == "merge" ? "MERGING" : E.git.op == "rebase" ? "REBASING" : E.git.op == "cherry-pick" ? "CHERRY-PICKING" : "REVERTING";
+        if (visible(rowh)) {
+            float lw = draw_text(E.ui, cx, ui_base(ry, rowh), lab.c_str(), C_GIT_MOD, cw, FS_BOLD);
+            draw_text(E.ui, lw + (float)S(8), ui_base(ry, rowh), "resolve, stage, continue", C_UI_FAINT, cx + cw - lw - (float)S(8));
+        }
+        ry += rowh;
+        if (visible(rowh)) {
+            const bool can_skip = E.git.op == "rebase" || E.git.op == "cherry-pick";
+            const char *names[3] = {"Continue", "Skip", "Abort"};
+            int nb = can_skip ? 3 : 2;
+            float bw = (cw - (float)(nb - 1) * (float)S(6)) / (float)nb, x = cx;
+            for (int k = 0; k < 3; k++) {
+                if (k == 1 && !can_skip) continue;
+                bool hv = hovered(H_GITOP, k);
+                r_rect(E.r, x, ry, bw, rowh - (float)S(2), k == 0 ? (hv ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT) : (hv ? C_SELROW : C_FIELD));
+                float tw = text_width(E.ui, names[k]);
+                draw_text(E.ui, x + (bw - tw) / 2, ui_base(ry, rowh - (float)S(2)), names[k], k == 0 ? C_ON_ACCENT : C_UI, bw);
+                hit(x, ry, bw, rowh - (float)S(2), H_GITOP, k);
+                x += bw + (float)S(6);
+            }
+        }
+        ry += rowh + (float)S(4);
     }
 
     /* commit message and button */
@@ -5267,6 +5405,7 @@ void click_hit(const Hit &h) {
         else if (h.id == 3) { std::string p = v.root + "/" + v.path; struct stat st; if (stat(p.c_str(), &st) == 0) open_path(p); else E.status_msg = "the file is not on disk any more"; }
         break;
     }
+    case H_GITOP: git_op_do(h.id); break;
     case H_GITREFRESH: begin_op("git refresh"); git_refresh(); break;
     case H_GITALL: {
         begin_op(h.id == 0 ? "git stage all" : "git unstage all");

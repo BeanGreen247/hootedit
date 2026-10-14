@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <sys/stat.h>
 #include "git.h"
 #include "askpass.h"
 
@@ -86,6 +87,17 @@ GitInfo git_query(const std::string &dir) {
     }
     if (g.upstream.empty()) g.has_remote = !run("git -C " + shq(top) + " remote").empty();
     else g.has_remote = true;
+    std::string gd = run("git -C " + shq(top) + " rev-parse --git-dir");
+    while (!gd.empty() && (gd.back() == '\n' || gd.back() == '\r')) gd.pop_back();
+    if (!gd.empty()) {
+        if (gd[0] != '/') gd = top + "/" + gd;
+        struct stat sb;
+        auto has = [&](const char *n) { return stat((gd + "/" + n).c_str(), &sb) == 0; };
+        if (has("rebase-merge") || has("rebase-apply")) g.op = "rebase";
+        else if (has("MERGE_HEAD")) g.op = "merge";
+        else if (has("CHERRY_PICK_HEAD")) g.op = "cherry-pick";
+        else if (has("REVERT_HEAD")) g.op = "revert";
+    }
     return g;
 }
 
