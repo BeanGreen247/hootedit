@@ -72,6 +72,7 @@ GitInfo git_query(const std::string &dir) {
             if (b.compare(0, 20, "No commits yet on ") == 0) g.branch = b.substr(18);
             if (b.compare(0, 4, "HEAD") == 0) g.branch = "HEAD (detached)";
             size_t a = b.find("ahead "), bh = b.find("behind ");
+            if (dots != std::string::npos) { size_t e = b.find(' ', dots); g.upstream = b.substr(dots + 3, e == std::string::npos ? std::string::npos : e - dots - 3); }
             if (a != std::string::npos) g.ahead = atoi(b.c_str() + a + 6);
             if (bh != std::string::npos) g.behind = atoi(b.c_str() + bh + 7);
         } else if (line.size() > 3) {
@@ -82,6 +83,8 @@ GitInfo git_query(const std::string &dir) {
             g.changes.push_back({line[0], line[1], path});
         }
     }
+    if (g.upstream.empty()) g.has_remote = !run("git -C " + shq(top) + " remote").empty();
+    else g.has_remote = true;
     return g;
 }
 
@@ -227,4 +230,20 @@ std::string git_ago(long t, long now) {
     if (d < 86400 * 30) return f(d / 86400, "day");
     if (d < 86400 * 365) return f(d / (86400 * 30), "month");
     return f(d / (86400 * 365), "year");
+}
+
+std::string git_quote(const std::string &s) { return shq(s); }
+
+int git_exec(const std::string &root, const std::string &args, std::string *out) {
+    int c = -1;
+    std::string o = run_both("GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true git -C " + shq(root) + " " + args + " </dev/null", &c);
+    if (out) *out = o;
+    return c;
+}
+
+std::string git_first_line(const std::string &s) {
+    size_t b = 0;
+    while (b < s.size() && (s[b] == '\n' || s[b] == '\r' || s[b] == ' ')) b++;
+    size_t e = s.find('\n', b);
+    return s.substr(b, e == std::string::npos ? std::string::npos : e - b);
 }

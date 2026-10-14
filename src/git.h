@@ -16,6 +16,8 @@ struct GitInfo {
     std::string root, branch;
     std::vector<GitChange> changes;
     int ahead = 0, behind = 0;
+    std::string upstream;        /* "origin/main", empty when the branch tracks nothing */
+    bool has_remote = false;     /* at least one remote is configured */
 };
 
 bool git_installed();
@@ -37,5 +39,10 @@ bool git_stage(const std::string &root, const std::string &path);
 bool git_unstage(const std::string &root, const std::string &path);
 bool git_stage_all(const std::string &root);
 bool git_commit(const std::string &root, const std::string &message, std::string *err, bool all_if_nothing_staged);
+/* Runs `git -C root <args>` with stdout and stderr together; stdin is closed and terminal prompts are off, so it never hangs on a password.
+ * Safe to call from a worker thread. Returns the exit code. */
+int git_exec(const std::string &root, const std::string &args, std::string *out);
+std::string git_quote(const std::string &s);                 /* a shell-safe single argument */
+std::string git_first_line(const std::string &s);
 std::string git_ago(long t, long now);                        /* "3 days ago" */
 #endif

@@ -67,6 +67,11 @@ bool inside(Icon ic, float x, float y) {
     case IC_OPEN_FILE:   /* a sheet with a small arrow leaving it */
         return seg(x, y, 3.5f, 1.5f, 8.5f, 1.5f, 0.7f) || seg(x, y, 3.5f, 1.5f, 3.5f, 14.5f, 0.7f) || seg(x, y, 3.5f, 14.5f, 12.5f, 14.5f, 0.7f) || seg(x, y, 12.5f, 14.5f, 12.5f, 10, 0.7f) ||
                seg(x, y, 7, 9, 13.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 9.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 13.5f, 6.5f, 0.75f);
+    case IC_UNDO: {   /* an arc swinging back to an arrow head at the left: discard changes */
+        float dx = x - 8.5f, dy = y - 9.5f, a = atan2f(dy, dx);
+        bool gap = a > 1.5f && a < 2.9f;
+        return (ring(x, y, 8.5f, 9.5f, 4.4f, 1.5f) && !gap && y < 13.6f) || seg(x, y, 3.6f, 9.6f, 3.6f, 5.0f, 0.8f) || seg(x, y, 3.6f, 9.6f, 8.2f, 9.6f, 0.8f);
+    }
     default: return false;
     }
 }
