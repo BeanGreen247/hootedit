@@ -38,6 +38,7 @@
 #include "engine/render.h"
 #include "fuzzy.h"
 #include "git.h"
+#include "merge.h"
 #include "icons.h"
 #include "regex.h"
 #include "search.h"
@@ -205,7 +206,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -1311,7 +1312,7 @@ void git_error(const std::string &what, const std::string &out) {
 void reload_open_docs() {
     for (size_t i = 0; i < E.docs.size(); i++) {
         Doc &o = *E.docs[i];
-        if (o.dv || o.path.empty() || o.modified()) continue;
+        if (o.dv || o.mv || o.path.empty() || o.modified()) continue;
         struct stat st;
         if (stat(o.path.c_str(), &st) != 0) continue;
         auto nd = std::make_unique<Doc>();
@@ -2184,7 +2185,7 @@ uint32_t file_color(const std::string &name) { return lang_color(lang_detect(nam
 /* ---- git decorations in the editor: change bars in the gutter and blame for the cursor line ---- */
 
 GutterCache *gutter_for(Doc &d) {
-    if (d.dv || !E.git.repo || d.path.empty() || d.buf.lines() > 50000) return nullptr;
+    if (d.dv || d.mv || !E.git.repo || d.path.empty() || d.buf.lines() > 50000) return nullptr;
     std::string rel = rel_to_root(d.path);
     if (rel.empty()) return nullptr;
     GutterCache &c = g_gutter[&d];
@@ -2220,7 +2221,7 @@ GutterCache *gutter_for(Doc &d) {
 }
 
 const GitBlame *blame_for(Doc &d, size_t line) {
-    if (d.dv || d.modified() || !E.git.repo || d.path.empty()) return nullptr;
+    if (d.dv || d.mv || d.modified() || !E.git.repo || d.path.empty()) return nullptr;
     GutterCache *c = gutter_for(d);
     if (!c) return nullptr;
     if (!c->blame_tried) {
@@ -3498,7 +3499,7 @@ void sb_to_pointer() {
 /* ---- merge conflicts in the editor: the <<<<<<< ======= >>>>>>> blocks of a file git lists as conflicted ---- */
 
 const std::vector<Conflict> *conflicts_for(Doc &d) {
-    if (d.dv || !E.git.repo || d.path.empty() || d.buf.size() > (size_t)8 << 20) return nullptr;
+    if (d.dv || d.mv || !E.git.repo || d.path.empty() || d.buf.size() > (size_t)8 << 20) return nullptr;
     ConflictCache &c = g_conf[&d];
     if (c.rev == d.buf.revision() && c.listed) return &c.v;
     std::string rel = rel_to_root(d.path);
@@ -3560,9 +3561,9 @@ void draw_conflict_actions(const Layout &L, Doc &d) {
     if (E.mode != M_EDIT) return;
     const std::vector<Conflict> *vp = conflicts_for(d);
     if (!vp) return;
-    static const char *names[3] = {"Accept Current", "Accept Incoming", "Accept Both"};
+    static const char *names[4] = {"Accept Current", "Accept Incoming", "Accept Both", "Merge Editor"};
     float total = 0;
-    for (int k = 0; k < 3; k++) total += text_width(E.ui, names[k]) + (float)S(20);
+    for (int k = 0; k < 4; k++) total += text_width(E.ui, names[k]) + (float)S(20);
     float rx = (float)E.W - (float)S(16);
     for (size_t i = 0; i < vp->size(); i++) {
         const Conflict &c = (*vp)[i];
@@ -3572,11 +3573,11 @@ void draw_conflict_actions(const Layout &L, Doc &d) {
         float x = rx - total;
         if (x < (float)L.text_x + (float)(20 * E.cw)) continue;   /* too narrow to show the actions next to the marker text */
         r_rect(E.r, x - (float)S(6), y, total + (float)S(6), (float)E.rowh, ui_mix(C_EDITOR, C_FG, 0.10));
-        for (int k = 0; k < 3; k++) {
+        for (int k = 0; k < 4; k++) {
             float w = text_width(E.ui, names[k]) + (float)S(20);
             int id = (int)i * 4 + k;
             if (hovered(H_CONFLICT, id)) r_rect(E.r, x, y + 1, w, (float)E.rowh - 2, C_HOVER);
-            draw_text(E.ui, x + (float)S(10), ui_base(y, (float)E.rowh), names[k], k == 2 ? C_UI_DIM : C_ACCENT, w);
+            draw_text(E.ui, x + (float)S(10), ui_base(y, (float)E.rowh), names[k], k >= 2 ? C_UI_DIM : C_ACCENT, w);
             hit(x, y, w, (float)E.rowh, H_CONFLICT, id);
             x += w;
         }
@@ -3709,6 +3710,213 @@ void draw_blame_tip(const Layout &L, Doc &d) {
     if (!l3.empty()) draw_text(E.ui, x + (float)S(12), ui_base(y + (float)S(5) + 2 * lh, lh), l3.c_str(), C_UI_FAINT, w - (float)S(24));
 }
 
+/* ---- the merge editor: Incoming | Current on top, the Result below, one set of buttons per conflict ---- */
+const char *const MERGE_OPS[] = {"Reset", "Accept Current", "Accept Incoming", "Accept Both", "", "Accept Base"};
+
+struct MergeGeom { float tb_h, body_y; int top_rows, res_rows; };   /* rows include each pane's title row */
+MergeGeom merge_geom(const Layout &L) {
+    MergeGeom g;
+    g.tb_h = (float)S(30);
+    g.body_y = (float)L.text_y + g.tb_h;
+    int total = std::max(6, (int)(((float)L.ed_bottom - g.body_y) / (float)E.rowh));
+    g.top_rows = std::max(3, total * 55 / 100);
+    g.res_rows = std::max(2, total - g.top_rows);
+    return g;
+}
+
+void merge_clamp(MergeView &v, const MergeGeom &g) {
+    v.top = std::max<long>(0, std::min<long>(v.top, (long)v.rows.size() - (g.top_rows - 1)));
+    v.rtop = std::max<long>(0, std::min<long>(v.rtop, (long)v.res.size() - (g.res_rows - 1)));
+}
+
+void merge_goto(MergeView &v, int k) {
+    if (v.conf_row.empty()) return;
+    v.cur = std::max(0, std::min(k, (int)v.conf_row.size() - 1));
+    v.top = std::max(0, v.conf_row[(size_t)v.cur] - 1);
+}
+
+void merge_open(const std::string &rel) {
+    std::string abs = E.git.root + "/" + rel;
+    for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i]->mv && E.docs[i]->mv->root == E.git.root && E.docs[i]->mv->path == rel) { set_active((int)i); return; }
+    std::string text;
+    FILE *f = fopen(abs.c_str(), "rb");
+    if (f) { char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n); fclose(f); }
+    auto mv = std::make_shared<MergeView>();
+    if (!f || !merge_parse(text, *mv)) { open_path(abs); E.status_msg = "no conflict markers left in " + base_name(rel); return; }
+    mv->root = E.git.root; mv->path = rel;
+    merge_layout(*mv);
+    merge_goto(*mv, 0);
+    bool replace_first = E.docs.size() == 1 && D().pristine() && !E.blank_tab;
+    Doc &d = new_doc(false);
+    d.title = "Merge: " + base_name(rel);
+    d.mv = mv;
+    if (replace_first) E.docs.erase(E.docs.begin());
+    set_active((int)E.docs.size() - 1);
+}
+
+void merge_op(int id) {
+    Doc &d = D();
+    if (!d.mv) return;
+    MergeView &v = *d.mv;
+    if (id < 1000) {
+        size_t k = (size_t)(id / 8);
+        int op = id % 8;
+        if (k >= v.conf_seg.size()) return;
+        v.segs[(size_t)v.conf_seg[k]].choice = op;
+        v.cur = (int)k;
+        v.dirty = true;
+        return;
+    }
+    if (id == 1000) merge_goto(v, v.cur - 1);
+    else if (id == 1001) merge_goto(v, v.cur + 1);
+    else if (id == 1003) open_path(E.git.root + "/" + v.path);
+    else if (id == 1004 || id == 1005) { for (MergeSeg &s : v.segs) if (s.conflict && s.choice == 0) s.choice = id == 1004 ? 1 : 2; v.dirty = true; }
+    else if (id == 1002) {
+        if (v.dirty) merge_layout(v);
+        if (v.unresolved) { E.status_msg = sfmt("%d conflict%s still unresolved", v.unresolved, v.unresolved == 1 ? "" : "s"); return; }
+        std::string out = merge_result_text(v), abs = v.root + "/" + v.path, rel = v.path;
+        FILE *f = fopen(abs.c_str(), "wb");
+        if (!f) { E.status_msg = "cannot write " + rel; return; }
+        fwrite(out.data(), 1, out.size(), f);
+        fclose(f);
+        std::string root = v.root;
+        close_tab(E.active);
+        git_stage(root, rel);
+        git_refresh(); reload_open_docs();
+        E.status_msg = "merged " + base_name(rel) + " and staged it";
+    }
+}
+
+void draw_merge(const Layout &L, float ex, float ew) {
+    Doc &d = D();
+    MergeView &v = *d.mv;
+    if (v.dirty) merge_layout(v);
+    const MergeGeom g = merge_geom(L);
+    merge_clamp(v, g);
+    const float rh = (float)E.rowh, half = (ew - 1) / 2;
+    const uint32_t c_in = ui_mix(C_EDITOR, C_ACCENT, 0.17), c_cur = ui_mix(C_EDITOR, C_GIT_ADD, 0.15), dim = ui_mix(C_EDITOR, C_FG, 0.55);
+
+    /* toolbar */
+    r_rect(E.r, ex, (float)L.text_y, ew, g.tb_h, C_CHROME);
+    r_rect(E.r, ex, (float)L.text_y + g.tb_h - 1, ew, 1, C_BORDER);
+    const float by = (float)L.text_y + (g.tb_h - (float)S(22)) / 2, bh = (float)S(22);
+    float rx = ex + ew - (float)S(10);
+    auto button = [&](int id, const char *label, Icon ic, bool has_icon, bool primary, bool enabled) {
+        float tw = label ? text_width(E.ui, label) : 0.f;
+        float w = (float)S(12) + (has_icon ? (float)S(16) : 0.f) + (label ? tw + (has_icon ? (float)S(4) : 0.f) : 0.f);
+        float x = rx - w;
+        uint32_t bg = primary ? (enabled ? (hovered(H_MERGE, id) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT) : C_FIELD) : (hovered(H_MERGE, id) ? C_HOVER : 0);
+        if (bg) r_rect(E.r, x, by, w, bh, bg);
+        uint32_t fg = primary ? (enabled ? C_ON_ACCENT : C_UI_FAINT) : C_UI_DIM;
+        float px = x + (float)S(6);
+        if (has_icon) { draw_icon(ic, px, by + (bh - (float)S(16)) / 2, S(16), fg); px += (float)S(20); }
+        if (label) draw_text(E.ui, px, ui_base(by, bh), label, fg, tw + 2);
+        hit(x, by, w, bh, H_MERGE, id);
+        rx = x - (float)S(4);
+    };
+    button(1002, "Complete Merge", IC_CHECK, true, true, v.unresolved == 0);
+    button(1003, "Open File", IC_OPEN_FILE, true, false, true);
+    button(1005, "All Incoming", IC_ARROW_D, false, false, true);
+    button(1004, "All Current", IC_ARROW_D, false, false, true);
+    button(1001, nullptr, IC_ARROW_D, true, false, true);
+    button(1000, nullptr, IC_ARROW_U, true, false, true);
+    std::string lab = v.path + sfmt("   %d conflict%s, %d unresolved", v.nconf, v.nconf == 1 ? "" : "s", v.unresolved);
+    draw_text(E.ui, ex + (float)S(12), ui_base(by, bh), lab.c_str(), C_UI, std::max(0.f, rx - ex - (float)S(24)), FS_BOLD);
+
+    /* pane titles */
+    float y = g.body_y;
+    r_rect(E.r, ex, y, ew, rh, ui_mix(C_EDITOR, C_FG, 0.07));
+    draw_text(E.ui, ex + (float)S(12), ui_base(y, rh), ("Incoming  " + v.inc_label).c_str(), C_UI_DIM, half - (float)S(20), FS_BOLD);
+    draw_text(E.ui, ex + half + 1 + (float)S(12), ui_base(y, rh), ("Current  " + v.cur_label).c_str(), C_UI_DIM, half - (float)S(20), FS_BOLD);
+    y += rh;
+    const float top_body = (float)(g.top_rows - 1) * rh;
+    r_rect(E.r, ex + half, y, 1, top_body, C_BORDER);
+    auto code = [&](float x, float yy, const std::string &t, float w, uint32_t col) {
+        r_clip(E.r, (int)x, (int)yy, (int)w, E.rowh);
+        draw_text(E.font, x, yy + (float)E.rowasc, t.c_str(), col, w);
+        r_clip_off(E.r);
+    };
+    for (int r = 0; r < g.top_rows - 1; r++) {
+        long idx = v.top + r;
+        if (idx >= (long)v.rows.size()) break;
+        const MRow &row = v.rows[(size_t)idx];
+        const MergeSeg &s = v.segs[(size_t)row.seg];
+        float yy = y + (float)r * rh;
+        if (row.kind == 0) {
+            code(ex + (float)S(12), yy, s.common[(size_t)row.a], half - (float)S(16), dim);
+            code(ex + half + 1 + (float)S(12), yy, s.common[(size_t)row.a], half - (float)S(16), dim);
+        } else if (row.kind == 3) {
+            r_rect(E.r, ex, yy, ew, rh, C_DIFF_FOLD);
+            std::string t = sfmt("%d unchanged lines", row.a);
+            draw_text(E.ui, ex + (ew - text_width(E.ui, t.c_str())) / 2, ui_base(yy, rh), t.c_str(), C_UI_DIM, ew);
+        } else if (row.kind == 1) {
+            int k = 0;
+            for (size_t q = 0; q < v.conf_seg.size(); q++) if (v.conf_seg[q] == row.seg) k = (int)q;
+            r_rect(E.r, ex, yy, ew, rh, ui_mix(C_EDITOR, C_FG, 0.13));
+            if (v.cur == k) r_rect(E.r, ex, yy, (float)S(3), rh, C_ACCENT);
+            static const char *st[6] = {"unresolved", "taking current", "taking incoming", "taking both", "", "taking base"};
+            std::string head = sfmt("Conflict %d of %d  \xE2\x80\xA2  %s", k + 1, v.nconf, st[s.choice]);
+            draw_text(E.ui, ex + (float)S(12), ui_base(yy, rh), head.c_str(), s.choice ? C_GIT_ADD : C_GIT_MOD, ew * 0.4f, FS_BOLD);
+            float bx = ex + ew - (float)S(10);
+            const int ops[5] = {0, 5, 3, 2, 1};   /* right to left: Reset, Base, Both, Incoming, Current */
+            for (int q = 0; q < 5; q++) {
+                int op = ops[q];
+                if ((op == 5 && !s.has_base) || (op == 0 && !s.choice)) continue;
+                float w = text_width(E.ui, MERGE_OPS[op]) + (float)S(16);
+                bx -= w;
+                int id = k * 8 + op;
+                if (hovered(H_MERGE, id)) r_rect(E.r, bx, yy + 1, w, rh - 2, C_HOVER);
+                draw_text(E.ui, bx + (float)S(8), ui_base(yy, rh), MERGE_OPS[op], op == 0 ? C_UI_DIM : C_ACCENT, w);
+                hit(bx, yy, w, rh, H_MERGE, id);
+            }
+        } else {
+            if (row.b >= 0) { r_rect(E.r, ex, yy, half, rh, c_in); code(ex + (float)S(12), yy, s.theirs[(size_t)row.b], half - (float)S(16), C_FG); }
+            if (row.a >= 0) { r_rect(E.r, ex + half + 1, yy, half, rh, c_cur); code(ex + half + 1 + (float)S(12), yy, s.ours[(size_t)row.a], half - (float)S(16), C_FG); }
+            if (s.choice == 2 || s.choice == 3 || s.choice == 4) r_rect(E.r, ex, yy, (float)S(2), rh, C_ACCENT);
+            if (s.choice == 1 || s.choice == 3 || s.choice == 4) r_rect(E.r, ex + half + 1, yy, (float)S(2), rh, C_ACCENT);
+        }
+    }
+
+    /* the result */
+    float ry = y + top_body;
+    r_rect(E.r, ex, ry, ew, rh, ui_mix(C_EDITOR, C_FG, 0.07));
+    r_rect(E.r, ex, ry, ew, 1, C_BORDER);
+    std::string rt = v.unresolved ? sfmt("Result  \xE2\x80\xA2  %d conflict%s left to resolve", v.unresolved, v.unresolved == 1 ? "" : "s") : std::string("Result  \xE2\x80\xA2  all conflicts resolved, press Complete Merge");
+    draw_text(E.ui, ex + (float)S(12), ui_base(ry, rh), rt.c_str(), v.unresolved ? C_GIT_MOD : C_GIT_ADD, ew - (float)S(24), FS_BOLD);
+    ry += rh;
+    for (int r = 0; r < g.res_rows - 1; r++) {
+        long idx = v.rtop + r;
+        if (idx >= (long)v.res.size()) break;
+        const MRes &m = v.res[(size_t)idx];
+        float yy = ry + (float)r * rh;
+        if (yy + rh > (float)L.ed_bottom) break;
+        if (m.kind == 1) r_rect(E.r, ex, yy, ew, rh, ui_mix(C_EDITOR, C_GIT_MOD, 0.22));
+        else if (m.kind == 2) r_rect(E.r, ex, yy, ew, rh, ui_mix(C_EDITOR, C_GIT_ADD, 0.10));
+        code(ex + (float)S(12), yy, m.text, ew - (float)S(24), m.kind == 1 ? C_GIT_MOD : C_FG);
+    }
+}
+
+bool merge_key(const SDL_KeyboardEvent &k, bool ctrl, bool shift) {
+    MergeView &v = *D().mv;
+    Layout L = layout();
+    const MergeGeom g = merge_geom(L);
+    if (ctrl || (k.keysym.mod & KMOD_ALT)) return false;
+    switch (k.keysym.sym) {
+    case SDLK_UP: v.top -= 1; break;
+    case SDLK_DOWN: v.top += 1; break;
+    case SDLK_PAGEUP: v.top -= g.top_rows - 2; break;
+    case SDLK_PAGEDOWN: v.top += g.top_rows - 2; break;
+    case SDLK_HOME: v.top = 0; break;
+    case SDLK_END: v.top = (long)v.rows.size(); break;
+    case SDLK_F7: merge_goto(v, v.cur + (shift ? -1 : 1)); break;
+    case SDLK_BACKSPACE: case SDLK_DELETE: case SDLK_TAB: return true;
+    default: return false;
+    }
+    merge_clamp(v, g);
+    touch();
+    return true;
+}
+
 void build_frame() {
     Layout L = layout();
     Doc &d = D();
@@ -3793,6 +4001,8 @@ void build_frame() {
         draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, y0 + (float)ls + gap1 + nameh + gap2 + (float)S(13), hint, C_UI_FAINT, ew);
     } else if (d.dv) {
         draw_diff(L, ex, ew);
+    } else if (d.mv) {
+        draw_merge(L, ex, ew);
     } else {
         /* the faint band behind the cursor line also covers the gutter */
         if (cl >= d.top && cl < d.top + (size_t)L.rows) r_rect(E.r, (float)L.ed_x, (float)(L.text_y + (long)(cl - d.top) * E.rowh), (float)(L.text_x - L.ed_x), (float)E.rowh, C_CURLINE);
@@ -3966,6 +4176,7 @@ void build_frame() {
         d.buf.line_text(cl, t);
         std::string items[5] = {lang_name(d.lang), d.eol, "UTF-8", d.indent, sfmt("Ln %zu, Col %d", cl + 1, col_of(t, cb) + 1)};
         if (d.has_sel()) items[4] += sfmt(" (%zu selected)", d.sel_hi() - d.sel_lo());
+        if (d.mv) { items[4] = sfmt("%d unresolved", d.mv->unresolved); items[1] = "merge"; items[3] = "three-way"; }
         if (d.dv) { items[4] = d.dv->m.hunks.empty() ? "no changes" : sfmt("%zu change%s", d.dv->m.hunks.size(), d.dv->m.hunks.size() == 1 ? "" : "s"); items[1] = "diff"; items[3] = d.dv->vinline ? "inline" : "side by side"; }
         for (int i = 0; i < 5; i++) {
             float w = text_width(E.ui, items[(size_t)i].c_str());
@@ -5068,7 +5279,7 @@ void search_step(int dir) {   /* Up/Down in the results list: next or previous m
 }
 
 void do_action(int act) {
-    if (D().dv && (act == A_CUT || act == A_PASTE || act == A_UNDO || act == A_REDO || act == A_SAVE || act == A_SAVEAS)) { E.status_msg = "diff tabs are read only"; redraw(); return; }
+    if ((D().dv || D().mv) && (act == A_CUT || act == A_PASTE || act == A_UNDO || act == A_REDO || act == A_SAVE || act == A_SAVEAS)) { E.status_msg = "diff tabs are read only"; redraw(); return; }
     Doc &d = D();
     if (act > A_NONE && act < A_COUNT) begin_op(ACT_LABEL[act]);
     switch (act) {
@@ -5355,6 +5566,7 @@ void key_down(const SDL_KeyboardEvent &k) {
     }
     if (g_peek.doc == &d && sym == SDLK_ESCAPE) { g_peek.doc = nullptr; touch(); return; }
     if (d.dv && diff_key(k, ctrl, shift)) return;
+    if (d.mv && merge_key(k, ctrl, shift)) return;
     if (ctrl && !alt && (sym == SDLK_LEFT || sym == SDLK_RIGHT)) { d.break_group(); d.move_to(sym == SDLK_LEFT ? word_left(d, d.cur) : word_right(d, d.cur), shift, false); E.follow = true; touch(); return; }
     if (ctrl && !shift && (sym == SDLK_BACKSPACE || sym == SDLK_DELETE)) {
         if (!d.has_sel()) { size_t o = sym == SDLK_BACKSPACE ? word_left(d, d.cur) : word_right(d, d.cur); d.anchor = o; }
@@ -5557,7 +5769,8 @@ void click_hit(const Hit &h) {
         if (h.kind == H_GITSTG) { begin_op(staged ? "git unstage" : "git stage"); git_do(staged ? git_unstage(E.git.root, c.path) : git_stage(E.git.root, c.path), staged ? "unstage" : "stage"); break; }
         if (!E.pinned) open_side(false);
         bool conflict = c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D');
-        if (h.kind == H_GITOPEN || conflict || (SDL_GetModState() & KMOD_CTRL)) open_path(E.git.root + "/" + c.path); else open_change_diff(c, staged);
+        if (conflict && h.kind != H_GITOPEN && !(SDL_GetModState() & KMOD_CTRL)) merge_open(c.path);
+        else if (h.kind == H_GITOPEN || conflict || (SDL_GetModState() & KMOD_CTRL)) open_path(E.git.root + "/" + c.path); else open_change_diff(c, staged);
         break;
     }
     case H_GITSEC: {
@@ -5624,7 +5837,8 @@ void click_hit(const Hit &h) {
         break;
     }
     case H_GITOP: git_op_do(h.id); break;
-    case H_CONFLICT: conflict_accept(D(), (size_t)(h.id / 4), h.id % 4); break;
+    case H_CONFLICT: if (h.id % 4 == 3) { merge_open(rel_to_root(D().path)); break; } conflict_accept(D(), (size_t)(h.id / 4), h.id % 4); break;
+    case H_MERGE: merge_op(h.id); break;
     case H_GITREFRESH: begin_op("git refresh"); git_refresh(); break;
     case H_GITALL: {
         begin_op(h.id == 0 ? "git stage all" : "git unstage all");
@@ -5724,7 +5938,7 @@ void text_input(const char *s) {
     }
     if (E.mode == M_DIALOG) { if (E.dlg.input) { if (E.dlg.fresh) { E.dlg.text.clear(); E.dlg.fresh = false; } E.dlg.text += s; touch(); } return; }
     if (E.mode == M_CTX) return;
-    if (E.mode == M_EDIT && D().dv) return;   /* diff tabs are read only */
+    if (E.mode == M_EDIT && (D().dv || D().mv)) return;   /* diff and merge tabs are read only */
     if (E.mode == M_EDIT) begin_op("keystroke");
     else if (E.mode == M_QUICK) begin_op("quick-open filter", std::to_string(E.quick_files.size()) + " files");
     else if (E.mode == M_SIDE && E.view == V_EXPLORER) begin_op("file filter", std::to_string(E.quick_files.size()) + " files");
@@ -5827,6 +6041,14 @@ void handle_event(const SDL_Event &e) {
             d.dv->top -= (long)e.wheel.y * 3;
             if (e.wheel.x) d.dv->left = std::max(0, d.dv->left + e.wheel.x * 4);
             diff_clamp(*d.dv, L);
+            redraw();
+            break;
+        }
+        if (d.mv) {
+            Layout L2 = layout();
+            MergeGeom g2 = merge_geom(L2);
+            if (E.my >= g2.body_y + (float)g2.top_rows * (float)E.rowh) d.mv->rtop -= (long)e.wheel.y * 3; else d.mv->top -= (long)e.wheel.y * 3;
+            merge_clamp(*d.mv, g2);
             redraw();
             break;
         }
