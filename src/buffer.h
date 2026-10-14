@@ -1,0 +1,55 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef HE_BUFFER_H
+#define HE_BUFFER_H
+#include <stddef.h>
+#include <stdint.h>
+#include <string>
+#include <vector>
+
+#include "lineindex.h"
+
+/* Piece table: the file is mapped read-only (never copied), edits append to one add buffer. A line-start index
+ * is built once with memchr and patched per edit. */
+class Buffer {
+public:
+    Buffer() = default;
+    ~Buffer();
+    Buffer(const Buffer &) = delete;
+    Buffer &operator=(const Buffer &) = delete;
+
+    bool open(const char *path);   /* false: unreadable; a missing file opens as empty so it can be created on save */
+    bool save(const char *path);   /* temp file in the same directory, fsync, rename; the buffer stays untouched on failure */
+
+    size_t size() const { return size_; }
+    size_t lines() const { return idx_.count(); }
+    size_t line_start(size_t line) const { return idx_.at(line); }
+    size_t line_len(size_t line) const;                      /* bytes without the newline */
+    size_t line_of(size_t pos) const;                        /* line containing byte offset pos */
+    void copy(size_t pos, size_t len, std::string &out) const;
+    void line_text(size_t line, std::string &out) const { copy(idx_.at(line), line_len(line), out); }
+
+    void insert(size_t pos, const char *s, size_t n);
+    void erase(size_t pos, size_t n);
+
+    uint64_t revision() const { return rev_; }
+    bool modified() const { return rev_ != saved_rev_; }
+    size_t pieces() const { return pieces_.size(); }
+
+private:
+    struct Piece { uint8_t add; size_t off, len; };
+    const char *base(const Piece &p) const { return (p.add ? add_.data() : orig_) + p.off; }
+    size_t find(size_t pos, size_t *within) const;           /* piece index holding pos, offset inside it */
+
+    const char *orig_ = nullptr;
+    size_t orig_len_ = 0, map_len_ = 0;
+    std::string add_;
+    std::vector<Piece> pieces_;
+    LineIndex idx_;
+    size_t size_ = 0;
+    uint64_t rev_ = 0, saved_rev_ = 0;
+};
+#endif
