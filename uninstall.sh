@@ -2,7 +2,7 @@
 # Copyright (c) 2026 BeanGreen247
 # SPDX-License-Identifier: MIT
 #
-# Removes Hootedit's program and desktop entry. Your files and settings are never touched.
+# Removes Hootedit's program, desktop entry and icon. Your files and settings are never touched.
 #   ./uninstall.sh                removes every copy found in /usr/local and ~/.local
 #   ./uninstall.sh --system       only /usr/local
 #   ./uninstall.sh --user         only ~/.local
@@ -26,7 +26,7 @@ done
 
 removed=0
 for p in "${PREFIXES[@]}"; do
-  for f in "$p/bin/hootedit" "$p/share/applications/hootedit.desktop"; do
+  for f in "$p/bin/hootedit" "$p/share/applications/hootedit.desktop" "$p/share/icons/hicolor/256x256/apps/hootedit.png"; do
     [ -e "$f" ] || continue
     SUDO=(); [ -w "$(dirname "$f")" ] || SUDO=(sudo)
     if [ "$DRY" = 1 ]; then echo "[dry run] ${SUDO[*]:-} rm $f"; else "${SUDO[@]}" rm -v -- "$f"; fi

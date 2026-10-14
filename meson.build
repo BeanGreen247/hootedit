@@ -25,6 +25,8 @@ lestrix_lib = static_library('lestrix_vendored', lestrix, include_directories: i
 executable('hootedit', files('src/main.cpp', 'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/icons.cpp', 'src/tree.cpp', 'src/git.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/search.cpp') + engine,
            include_directories: inc, link_with: lestrix_lib, dependencies: deps + [cxx.find_library('util', required: false)], install: true)
 
+install_data('data/hootedit.png', install_dir: get_option('datadir') / 'icons' / 'hicolor' / '256x256' / 'apps')
+
 test_buffer = executable('test_buffer', files('tests/test_buffer.cpp', 'src/buffer.cpp'),
   override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
 test('buffer differential', test_buffer, args: ['--gen'])

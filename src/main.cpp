@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "appicon.h"
 #include "doc.h"
 #include "engine/atlas.h"
 #include "engine/font.h"
@@ -1780,6 +1781,10 @@ bool gl_init(GlKind kind, int w, int h) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     }
     E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (E.win) {   /* the owl as the window icon (64x64, embedded) */
+        SDL_Surface *ic = SDL_CreateRGBSurfaceWithFormatFrom((void *)APP_ICON_RGBA, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
+        if (ic) { SDL_SetWindowIcon(E.win, ic); SDL_FreeSurface(ic); }
+    }
     E.gl = E.win ? SDL_GL_CreateContext(E.win) : nullptr;
     if (!E.gl || sd_gl_load(kind)) return false;
     SDL_GL_SetSwapInterval(1);

@@ -1,5 +1,9 @@
 # Hootedit
 
+<p align="center">
+  <img src="data/hootedit.png" alt="Hootedit logo" width="96"/>
+</p>
+
 A fast native code editor in C++. No Electron, no GTK, no web view. Everything in the text path is our own code: a piece-table buffer, a chunked line index, a table-driven syntax engine, an own regular-expression engine and fuzzy matcher for search, and the glyph-atlas OpenGL renderer and terminal engine from [Lestrix](https://github.com/BeanGreen247/lestrix) (vendored in `src/engine/` and `src/lestrix/`, from Lestrix commit 0289c8e). Dependencies: SDL2, FreeType, fontconfig, OpenGL.
 
 Look: dark and quiet, in the style of Lestrix. A menu bar, a command box with the language picker, a rail with the pin and rotated tabs, a tab row, a plain status bar. No minimap, no breadcrumbs, no animations, no welcome page; an empty window shows the name, not a logo.
@@ -17,7 +21,7 @@ Look: dark and quiet, in the style of Lestrix. A menu bar, a command box with th
 ./uninstall.sh                  # removes every copy found in /usr/local and ~/.local (--system, --user or --prefix DIR to pick one)
 ```
 
-Run it as your normal user, not with sudo. Without a flag in a terminal it asks where to install; without a terminal it defaults to system-wide, the same as Lestrix. Missing build packages are installed through apt, dnf, pacman or zypper (`--no-deps` skips that). The program and a desktop entry are installed; uninstall removes only those two files and never touches your files or settings.
+Run it as your normal user, not with sudo. Without a flag in a terminal it asks where to install; without a terminal it defaults to system-wide, the same as Lestrix. Missing build packages are installed through apt, dnf, pacman or zypper (`--no-deps` skips that). The program, a desktop entry and the icon are installed; uninstall removes only those files and never touches your files or settings.
 
 Run: `hootedit [FILE|FOLDER...]`. Options: `--theme NAME`, `--cache-stats` (print the statistics and the operation timings at exit), `--size WxH`, `--version`.
 

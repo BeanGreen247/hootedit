@@ -2,6 +2,7 @@
 Type=Application
 Name=Hootedit
 Comment=Fast native code editor
+Icon=hootedit
 Exec=hootedit %F
 Terminal=false
 Categories=Utility;TextEditor;Development;
