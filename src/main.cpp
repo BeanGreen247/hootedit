@@ -196,7 +196,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL };
@@ -281,6 +281,9 @@ struct Ed {
     int hover_kind = 0, hover_id = -1;
     float mx = -1, my = -1;
     std::string title_last;
+    bool blank_tab = false;                          /* the placeholder document has been turned into a real empty tab (double click or Ctrl+N) */
+    float hit_floor = 1e9f;                          /* hit boxes are cut off at this y: nothing behind the status bar can be clicked */
+    std::string git_for;                             /* the folder the Git tab was last computed for */
 
     /* workspace and sidebar */
     Tree tree;
@@ -323,8 +326,12 @@ const Uint32 SCRIPT_MOUSE = 0x5c11b7u;
 void on_usr1(int) { g_print_stats = 1; }
 
 Doc &D() { return *E.docs[(size_t)E.active]; }
+/* no file and nothing typed: the start screen shows, with no tab strip */
+bool splash() { return E.docs.size() == 1 && D().pristine() && !E.blank_tab; }
 Ed::Term *cur_term();
 std::vector<int> fd_view();
+void git_refresh();
+void git_follow_active();
 void launch_external(std::string name);
 void detect_externals();
 int S(float n) { return (int)lroundf(n * E.scale); }
@@ -443,17 +450,33 @@ void set_active(int i) {
     std::string t = D().name() + " - Hootedit";
     if (t != E.title_last) { E.title_last = t; SDL_SetWindowTitle(E.win, t.c_str()); }
     if (!D().path.empty() && E.tree.root().size() && D().path.compare(0, E.tree.root().size(), E.tree.root()) == 0) E.tree.reveal(D().path);
+    git_follow_active();
     redraw();
 }
 
 void remove_doc(int i) {
     E.docs.erase(E.docs.begin() + i);
-    if (E.docs.empty()) new_doc();
+    if (E.docs.empty()) { new_doc(); E.blank_tab = false; }   /* the last tab is gone: back to the start screen */
     set_active(std::min(E.active > i ? E.active - 1 : E.active, (int)E.docs.size() - 1));
 }
 
+/* when the workspace itself is not a repository, the Git tab follows the file in the active tab */
+void git_follow_active() {
+    if (E.git.repo && E.git_for == E.tree.root()) return;
+    if (D().path.empty()) return;
+    std::string dir = D().path.substr(0, D().path.rfind('/'));
+    if (dir != E.git_for) git_refresh();
+}
+
 void git_refresh() {
-    E.git = git_query(E.tree.root().empty() ? "." : E.tree.root());
+    std::string ws = E.tree.root().empty() ? "." : E.tree.root();
+    E.git = git_query(ws);
+    E.git_for = ws;
+    if (!E.git.repo && !E.docs.empty() && !D().path.empty()) {   /* the workspace is no repository: show the one the open file belongs to */
+        std::string dir = D().path.substr(0, D().path.rfind('/'));
+        GitInfo g2 = git_query(dir);
+        if (g2.repo) { E.git = g2; E.git_for = dir; }
+    }
     E.quick_files.clear();
     E.sfiles.reset();                           /* the file list is rebuilt on the next search or quick open */
     redraw();
@@ -766,7 +789,11 @@ void draw_icon(Icon ic, float x, float y, int size, uint32_t rgba) {
     r_push(E.r, &inst, 1);
 }
 
-void hit(float x, float y, float w, float h, int kind, int id) { E.hits.push_back({x, y, w, h, kind, id}); }
+void hit(float x, float y, float w, float h, int kind, int id) {
+    if (y >= E.hit_floor) return;
+    if (y + h > E.hit_floor) h = E.hit_floor - y;   /* a row that peeks under the status bar must not be clickable there */
+    E.hits.push_back({x, y, w, h, kind, id});
+}
 float ui_base(float y, float h) { return y + (h - (float)E.uh) / 2 + (float)E.uasc; }
 bool hovered(int kind, int id) { return E.hover_kind == kind && E.hover_id == id; }
 
@@ -950,7 +977,6 @@ void draw_sidebar(const Layout &L) {
     float ty = pby + pb + (float)S(14);
     const char *names[3] = {"FILES", "SEARCH", "GIT"};
     for (int i = 0; i < 3; i++) {
-        if (i == 2 && !E.git.repo) continue;
         const AtlasGlyph *g = vlabel(names[i], E.ui, FS_BOLD);
         if (!g) continue;
         float th = (float)g->h + (float)S(28);
@@ -1111,6 +1137,12 @@ void draw_sidebar(const Layout &L) {
         float content = (ry + E.side_scroll) - list_top;
         float maxs = std::max(0.f, content - (bot - list_top) + rowh);
         if (E.side_scroll > maxs) E.side_scroll = maxs;
+    } else if (!E.git.repo) {
+        draw_text(E.ui, cx, ui_base(ry, rowh), E.git.available ? "No git repository here" : "git is not installed", C_UI, cw, FS_BOLD);
+        if (E.git.available) {
+            draw_text(E.ui, cx, ui_base(ry + rowh, rowh), "Open a folder, or a file,", C_UI_DIM, cw);
+            draw_text(E.ui, cx, ui_base(ry + rowh * 2 - (float)S(4), rowh), "that is inside a repository.", C_UI_DIM, cw);
+        }
     } else {
         std::string br = E.git.branch + (E.git.ahead || E.git.behind ? sfmt("   %d ahead  %d behind", E.git.ahead, E.git.behind) : std::string());
         draw_icon(IC_GIT, cx, ry + (rowh - (float)S(14)) / 2, S(14), C_ACCENT);
@@ -1289,6 +1321,7 @@ void build_frame() {
     Doc &d = D();
     if (E.follow) { ensure_visible(L); E.follow = false; }
     E.hits.clear();
+    E.hit_floor = (float)L.bar_y;
     size_t cl = d.buf.line_of(d.cur), cb = d.cur - d.buf.line_start(cl);
     std::string t;
     double tm0 = E.timing ? now_s() : 0;
@@ -1301,14 +1334,16 @@ void build_frame() {
     r_rect(E.r, ex, (float)(L.tab_y + L.tab_h - 1), ew, 1, C_BORDER);
     {
         float tx = ex, ty = (float)L.tab_y, th = (float)L.tab_h;
-        std::vector<float> tw(E.docs.size());
+        if (splash()) hit(tx, ty, ew, th, H_TABSPACE, 0);   /* no tabs yet: a double click anywhere on the strip opens an empty one */
+        const size_t nt = splash() ? 0 : E.docs.size();
+        std::vector<float> tw(nt);
         float total = 0;
-        for (size_t i = 0; i < E.docs.size(); i++) {
+        for (size_t i = 0; i < nt; i++) {
             tw[i] = text_width(E.ui, E.docs[i]->name().c_str()) + (float)S(48);
             total += tw[i];
         }
         if (total > ew) for (float &w : tw) w = std::max((float)S(90), w * ew / total);
-        for (size_t i = 0; i < E.docs.size(); i++) {
+        for (size_t i = 0; i < nt; i++) {
             bool act = (int)i == E.active;
             r_rect(E.r, tx, ty, tw[i], th, act ? C_EDITOR : C_CHROME);
             if (act) r_rect(E.r, tx, ty + th - (float)S(2), tw[i], (float)S(2), C_ACCENT);
@@ -1325,16 +1360,17 @@ void build_frame() {
             hit(tx + tw[i] - (float)S(30), ty, (float)S(30), th, H_TABCLOSE, (int)i);
             tx += tw[i];
         }
+        if (nt) hit(tx, ty, ex + ew - tx, th, H_TABSPACE, 0);   /* the empty part of the strip: a double click opens a new empty tab */
     }
     double tm1 = E.timing ? now_s() : 0;
 
     /* ---- editor area ---- */
-    if (E.docs.size() == 1 && d.pristine()) {
+    if (splash()) {
         const char *name = "Hootedit";
         float cxm = ex + ew / 2;
         float w = text_width(E.big, name);
         draw_text(E.big, cxm - w / 2, (float)E.H / 2, name, C_BORDER, (float)E.W);
-        const char *hint = "Ctrl+N new   Ctrl+P open   Ctrl+B sidebar   hootedit FILE or FOLDER";
+        const char *hint = "Double click or Ctrl+N: new tab   Ctrl+P: open   Ctrl+B: sidebar";
         draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, (float)E.H / 2 + (float)S(34), hint, C_UI_FAINT, ew);
     } else {
         /* the faint band behind the cursor line also covers the gutter */
@@ -1438,7 +1474,7 @@ void build_frame() {
             if (line >= d.buf.lines()) break;
             char num[24];
             snprintf(num, sizeof num, "%zu", line + 1);
-            float x = (float)(L.text_x - S(25)) - (float)(strlen(num) * (size_t)E.cw);
+            float x = (float)(L.ed_x + S(20));   /* left aligned */
             draw_text(E.font, x, (float)(L.text_y + row * E.rowh + E.rowasc), num, line == cl ? C_GUTTER_CUR : C_GUTTER, (float)E.W);
         }
         if (E.blink_on && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows) {
@@ -1451,6 +1487,7 @@ void build_frame() {
 
     if (L.panel_h > 0) draw_panel(L);
 
+    E.hit_floor = 1e9f;   /* the status bar owns the area below the editor */
     /* ---- status bar ---- */
     float by0 = (float)L.bar_y, bh = (float)L.status_h;
     r_rect(E.r, 0, by0, (float)E.W, bh, C_CHROME);
@@ -1484,7 +1521,9 @@ void build_frame() {
     if (E.timing) { E.t_gutter += tm3 - tm1; E.t_status += now_s() - tm3; E.t_top += tm1 - tm0; }
 
     /* ---- sidebar ---- */
+    E.hit_floor = (float)L.bar_y;
     if (E.side_open) draw_sidebar(L);
+    E.hit_floor = 1e9f;   /* menus, the command box and dialogs may go anywhere */
 
     /* ---- menu bar and command box (drawn last so menus and the box sit above the sidebar) ---- */
     float menu_end;
@@ -2067,7 +2106,6 @@ void open_side(bool open) {
 }
 
 void show_view(View v) {
-    if (v == V_GIT && !E.git.repo) { E.status_msg = E.git.available ? "not a git repository" : "git is not installed"; redraw(); return; }
     E.view = v;
     if (v == V_GIT) git_refresh();
     open_side(true);
@@ -2288,7 +2326,10 @@ void do_action(int act) {
     Doc &d = D();
     if (act > A_NONE && act < A_COUNT) begin_op(ACT_LABEL[act]);
     switch (act) {
-    case A_NEW: new_doc(); set_active((int)E.docs.size() - 1); break;
+    case A_NEW:
+        if (splash()) { E.blank_tab = true; set_active(0); }   /* the start screen turns into an empty tab */
+        else { new_doc(); set_active((int)E.docs.size() - 1); }
+        break;
     case A_OPEN_FILE: begin_prompt(PK_OPEN_FILE); break;
     case A_OPEN_FOLDER: begin_prompt(PK_OPEN_FOLDER); break;
     case A_SAVE: save_active(); break;
@@ -2593,6 +2634,7 @@ void click_hit(const Hit &h) {
         break;
     case H_TERMTAB: if (h.id >= 0 && h.id < (int)E.terms.size()) { E.term_active = h.id; E.term_focus = true; } break;
     case H_SPLIT: E.split_drag = true; break;
+    case H_TABSPACE: if (g_clicks >= 2) do_action(A_NEW); break;
     case H_VSCROLL: E.sb_drag = true; sb_to_pointer(); break;
     case H_FD_ITEM: {
         std::vector<int> view = fd_view();
@@ -2751,6 +2793,7 @@ void handle_event(const SDL_Event &e) {
             if (E.side_open && !E.pinned) open_side(false);
             E.term_focus = false;
             Layout L = layout();
+            if (splash() && g_clicks >= 2 && my >= (float)L.tab_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x) { do_action(A_NEW); return; }   /* double click on the start screen */
             if (my >= (float)L.text_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x) {
                 Doc &d = D();
                 d.break_group();
@@ -2835,18 +2878,28 @@ void run_script(const char *script) {
             continue;
         }
         E.ev_t0 = now_s();
+        if (step.compare(0, 9, "hitcheck:") == 0) {   /* prints what a click at x,y would hit (test hook) */
+            int x = 0, y = 0;
+            sscanf(step.c_str() + 9, "%d,%d", &x, &y);
+            build_frame();
+            const Hit *found = nullptr;
+            for (size_t i = E.hits.size(); i-- > 0;) { const Hit &h = E.hits[i]; if ((float)x >= h.x && (float)x < h.x + h.w && (float)y >= h.y && (float)y < h.y + h.h) { found = &h; break; } }
+            printf("hitcheck %d,%d: %s kind=%d id=%d\n", x, y, found ? "hit" : "none", found ? found->kind : 0, found ? found->id : -1);
+            continue;
+        }
         if (step == "frame") { begin_op("empty frame (nothing changed, full redraw)"); frame_if_timed(); continue; }
         if (step.compare(0, 5, "open:") == 0) { open_path(step.substr(5)); frame_if_timed(); continue; }
         if (step.compare(0, 5, "text:") == 0) { text_input(step.c_str() + 5); frame_if_timed(); continue; }
         if (step.compare(0, 5, "menu:") == 0) { open_menu(atoi(step.c_str() + 5)); frame_if_timed(); continue; }
-        if (step.compare(0, 6, "mouse:") == 0 || step.compare(0, 6, "click:") == 0) {
+        if (step.compare(0, 6, "mouse:") == 0 || step.compare(0, 6, "click:") == 0 || step.compare(0, 7, "dclick:") == 0) {
             int x = 0, y = 0;
-            sscanf(step.c_str() + 6, "%d,%d", &x, &y);
+            bool dbl = step[0] == 'd';
+            sscanf(step.c_str() + (dbl ? 7 : 6), "%d,%d", &x, &y);
             SDL_Event ev = {};
             if (step[0] == 'm') { ev.type = SDL_MOUSEMOTION; ev.motion.which = SCRIPT_MOUSE; ev.motion.x = (int)((float)x / E.scale); ev.motion.y = (int)((float)y / E.scale); }
-            else { ev.type = SDL_MOUSEBUTTONDOWN; ev.button.button = SDL_BUTTON_LEFT; ev.button.x = (int)((float)x / E.scale); ev.button.y = (int)((float)y / E.scale); }
+            else { ev.type = SDL_MOUSEBUTTONDOWN; ev.button.button = SDL_BUTTON_LEFT; ev.button.clicks = dbl ? 2 : 1; ev.button.x = (int)((float)x / E.scale); ev.button.y = (int)((float)y / E.scale); }
             handle_event(ev);
-            if (step[0] == 'c') { SDL_Event up = {}; up.type = SDL_MOUSEBUTTONUP; handle_event(up); }
+            if (step[0] != 'm') { SDL_Event up = {}; up.type = SDL_MOUSEBUTTONUP; handle_event(up); }
             build_frame();   /* refresh the hit boxes the way the real loop would before the next event */
             frame_if_timed();
             continue;
@@ -2944,7 +2997,6 @@ int main(int argc, char **argv) {
     SDL_StartTextInput();
     set_workspace(workspace);
     E.side_open = true;
-    if (!E.git.repo && E.view == V_GIT) E.view = V_EXPLORER;
     set_active(0);
 
     E.now = now_s();
