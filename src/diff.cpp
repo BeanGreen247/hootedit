@@ -122,3 +122,41 @@ void diff_build(DiffModel &m, const std::string &old_text, const std::string &ne
     }
     while (ai < (int)m.a.size() && bi < (int)m.b.size()) m.rows.push_back({ai++, bi++, DK_SAME, -1, 0, 0, 0, 0});
 }
+
+void diff_layout(DiffView &v, bool inline_mode) {
+    v.vrows.clear();
+    v.change_v.assign(v.m.hunks.size(), -1);
+    v.vinline = inline_mode;
+    v.vdirty = false;
+    const int CTX = 3, MIN_HIDE = 4;
+    const std::vector<DiffRow> &rows = v.m.rows;
+    auto opened = [&](int start) { for (int o : v.open_folds) if (o == start) return true; return false; };
+    auto note = [&](const DiffRow &r) { if (r.hunk >= 0 && v.change_v[(size_t)r.hunk] < 0) v.change_v[(size_t)r.hunk] = (int)v.vrows.size(); };
+    for (size_t i = 0; i < rows.size();) {
+        const DiffRow &r = rows[i];
+        if (r.kind == DK_SAME) {
+            size_t j = i;
+            while (j < rows.size() && rows[j].kind == DK_SAME) j++;
+            size_t run = j - i;
+            bool at_start = i == 0, at_end = j == rows.size();
+            size_t keep_head = at_start ? 0 : (size_t)CTX, keep_tail = at_end ? 0 : (size_t)CTX;
+            if (!v.all_open && run >= keep_head + keep_tail + (size_t)MIN_HIDE && !opened((int)(i + keep_head))) {
+                for (size_t k = 0; k < keep_head; k++) v.vrows.push_back({(int)(i + k), 0, 0});
+                v.vrows.push_back({(int)(i + keep_head), 3, (int)(run - keep_head - keep_tail)});
+                for (size_t k = run - keep_tail; k < run; k++) v.vrows.push_back({(int)(i + k), 0, 0});
+            } else
+                for (size_t k = 0; k < run; k++) v.vrows.push_back({(int)(i + k), 0, 0});
+            i = j;
+            continue;
+        }
+        note(r);
+        if (!inline_mode) v.vrows.push_back({(int)i, 0, 0});
+        else {
+            if (r.kind == DK_MOD) {   /* the removed line, then the added one */
+                v.vrows.push_back({(int)i, 1, 0});
+                v.vrows.push_back({(int)i, 2, 0});
+            } else v.vrows.push_back({(int)i, r.kind == DK_DEL ? (uint8_t)1 : (uint8_t)2, 0});
+        }
+        i++;
+    }
+}

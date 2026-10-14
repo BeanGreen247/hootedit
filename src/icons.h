@@ -10,7 +10,7 @@
 
 #include "engine/atlas.h"
 
-enum Icon { IC_EXPLORER, IC_SEARCH, IC_GIT, IC_PIN, IC_PIN_OUT, IC_CHEV_R, IC_CHEV_D, IC_CLOSE, IC_DOT, IC_FILE, IC_ARROW_L, IC_ARROW_R, IC_FOLDER, IC_LOGO_BODY, IC_LOGO_EYES, IC_COUNT };
+enum Icon { IC_EXPLORER, IC_SEARCH, IC_GIT, IC_PIN, IC_PIN_OUT, IC_CHEV_R, IC_CHEV_D, IC_CLOSE, IC_DOT, IC_FILE, IC_ARROW_L, IC_ARROW_R, IC_FOLDER, IC_LOGO_BODY, IC_LOGO_EYES, IC_CHECK, IC_PLUS, IC_MINUS, IC_REFRESH, IC_ARROW_U, IC_ARROW_D, IC_TRI_R, IC_HATCH, IC_OPEN_FILE, IC_COUNT };
 
 /* Alpha bitmap of icon `ic` at size x size pixels, drawn from shapes on a 16x16 grid with 4x4 supersampling.
  * No icon font and no image files: the same code serves every display scale. */

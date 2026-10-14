@@ -6,10 +6,12 @@
 #ifndef HE_DOC_H
 #define HE_DOC_H
 #include <stdint.h>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "buffer.h"
+#include "diff.h"
 #include "syntax.h"
 
 /* One open file: buffer, cursor and selection, undo history, language and the cached lexer state per line. */
@@ -30,6 +32,7 @@ public:
     std::string eol = "LF";                   /* "LF" or "CRLF", from the first line break when the file was opened */
     std::string indent = "Spaces: 4";         /* status-bar label guessed from the first indented lines */
 
+    std::shared_ptr<DiffView> dv;             /* set: this tab shows a diff, not text (read only) */
     std::string title;                        /* shown instead of the file name when set (diff views) */
     void load_text(const std::string &text);  /* replace everything, clean state, no undo history */
     std::string name() const;
@@ -37,7 +40,7 @@ public:
     size_t sel_lo() const { return anchor < cur ? anchor : cur; }
     size_t sel_hi() const { return anchor < cur ? cur : anchor; }
     bool modified() const { return undo_.size() != save_point_; }
-    bool pristine() const { return path.empty() && buf.size() == 0 && undo_.empty() && redo_.empty(); }
+    bool pristine() const { return !dv && path.empty() && buf.size() == 0 && undo_.empty() && redo_.empty(); }
 
     /* every edit goes through replace(): one undo record, cursor placed after the new text */
     void replace(size_t pos, size_t del, const char *ins, size_t n);

@@ -62,7 +62,10 @@ namespace {
  * apply_theme() fills these in; the defaults below only matter for the first frame before a theme is applied. */
 uint32_t C_CHROME, C_MENUBAR, C_EDITOR, C_BORDER, C_SELROW, C_HOVER, C_ACCENT, C_FIELD, C_GROUP, C_UI, C_UI_DIM, C_UI_FAINT, C_FG, C_GUTTER, C_GUTTER_CUR,
          C_CURSOR, C_MENU, C_MENU_BORDER, C_MENU_SEL, C_SEL, C_BOX, C_BOX_LINE, C_RED, C_GREEN, C_ORANGE, C_ON_ACCENT,
-         C_CURLINE, C_GUIDE, C_GUIDE_ACT, C_OCC, C_BRACKET, C_SB_THUMB, C_SB_HOT;
+         C_CURLINE, C_GUIDE, C_GUIDE_ACT, C_OCC, C_BRACKET, C_SB_THUMB, C_SB_HOT,
+         C_GIT_ADD, C_GIT_MOD, C_GIT_DEL, C_GIT_UNT, C_GIT_CONF,                 /* file status colours (VS Code's gitDecoration.*) */
+         C_GUT_ADD, C_GUT_MOD, C_GUT_DEL,                                         /* the change bars in the editor gutter (editorGutter.*) */
+         C_DIFF_ADD, C_DIFF_ADD_TXT, C_DIFF_DEL, C_DIFF_DEL_TXT, C_DIFF_FILL, C_DIFF_FOLD;   /* diff editor line and word backgrounds */
 const uint32_t C_SHADE = RGBA(0, 0, 0, 120);
 uint32_t TOKCOL[T_COUNT];   /* indexed by Tok */
 const double BLINK_FOR = 10.0;   /* the cursor stops blinking this long after the last input: an idle editor draws nothing */
@@ -196,13 +199,28 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE };
-enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME };
+enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL };
 enum Pending { P_NONE, P_CLOSE, P_QUIT };
 enum PromptKind { PK_SAVEAS, PK_OPEN_FILE, PK_OPEN_FOLDER };
 enum View { V_EXPLORER, V_SEARCH, V_GIT };
+
+struct GitUi {
+    std::string msg;                                   /* the commit message being typed */
+    bool open_staged = true, open_changes = true, open_graph = true, open_tl = true;
+    std::vector<GitCommit> log;                        /* the branch history, newest first */
+    int log_sel = -1;                                  /* the expanded commit, or -1 */
+    std::vector<GitFile> sel_files;                    /* its files, or the files that differ between two commits */
+    std::string cmp_a, cmp_b;                          /* set while sel_files is a comparison of two commits */
+    std::vector<GitCommit> tl;                         /* history of the active file */
+    std::string tl_path;
+    std::string mark_hash, mark_label;                 /* "Select for compare": Ctrl+click marks, Shift+click compares with the mark */
+    std::string err;                                   /* the last commit failure */
+    bool blame_inline = true;                          /* the faint "who changed this line" text after the cursor line */
+    double blame_t0 = 0;
+};
 
 struct Ed {
     SDL_Window *win = nullptr;
@@ -292,6 +310,7 @@ struct Ed {
     bool pinned = true, side_open = true, root_open = true;
     double side_close_at = 0;
     float side_scroll = 0;
+    GitUi g;
     float tab_scroll = 0;                            /* how far the tab strip is scrolled, in pixels */
     bool tab_reveal = false;                         /* bring the active tab into view on the next frame */
     int tab_press = -1;                              /* tab under the mouse button, -1 none */
@@ -334,11 +353,29 @@ const Uint32 SCRIPT_MOUSE = 0x5c11b7u;
 void on_usr1(int) { g_print_stats = 1; }
 
 Doc &D() { return *E.docs[(size_t)E.active]; }
+
+/* what is known about one open file's relation to git: the HEAD text and the changed line ranges (gutter bars), and blame */
+struct GutterCache {
+    uint64_t rev = ~0ull;                          /* buffer revision the hunks were computed for */
+    bool base_stale = true, computed = false, tracked_ok = false;
+    std::vector<std::string> base_lines;
+    std::unordered_map<std::string, int> ids;      /* line text -> id, over the HEAD text */
+    std::vector<DiffHunk> hunks;                   /* HEAD lines against the buffer's lines */
+    std::vector<GitBlame> blame;
+    bool blame_tried = false, blame_ok = false;
+};
+std::unordered_map<const Doc *, GutterCache> g_gutter;
+
+void gutter_invalidate() { for (auto &kv : g_gutter) { kv.second.base_stale = true; kv.second.computed = false; kv.second.blame_tried = false; kv.second.blame_ok = false; } }
 /* no file and nothing typed: the start screen shows, with no tab strip */
 bool splash() { return E.docs.size() == 1 && D().pristine() && !E.blank_tab; }
 Ed::Term *cur_term();
 std::vector<int> fd_view();
 void git_refresh();
+void git_ui_reload();
+void git_ui_timeline();
+void diff_reload_all();
+void gutter_invalidate();
 void git_follow_active();
 void launch_external(std::string name);
 void detect_externals();
@@ -460,10 +497,12 @@ void set_active(int i) {
     if (t != E.title_last) { E.title_last = t; SDL_SetWindowTitle(E.win, t.c_str()); }
     if (!D().path.empty() && E.tree.root().size() && D().path.compare(0, E.tree.root().size(), E.tree.root()) == 0) E.tree.reveal(D().path);
     git_follow_active();
+    if (E.view == V_GIT) git_ui_timeline();
     redraw();
 }
 
 void remove_doc(int i) {
+    g_gutter.erase(E.docs[(size_t)i].get());
     if (!E.docs[(size_t)i]->path.empty()) { E.closed_tabs.push_back(E.docs[(size_t)i]->path); if (E.closed_tabs.size() > 30) E.closed_tabs.erase(E.closed_tabs.begin()); }
     E.docs.erase(E.docs.begin() + i);
     if (E.docs.empty()) { new_doc(); E.blank_tab = false; }   /* the last tab is gone: back to the start screen */
@@ -489,6 +528,9 @@ void git_refresh() {
     }
     E.quick_files.clear();
     E.sfiles.reset();                           /* the file list is rebuilt on the next search or quick open */
+    git_ui_reload();
+    diff_reload_all();
+    gutter_invalidate();
     redraw();
 }
 
@@ -514,18 +556,142 @@ void set_workspace(const std::string &dir) {
     git_refresh();
 }
 
-void open_diff(const GitChange &c) {
-    std::string txt = git_diff(E.git.root, c.path, false);
-    if (txt.empty()) txt = git_diff(E.git.root, c.path, true);
-    if (txt.empty()) { open_path(E.git.root + "/" + c.path); return; }   /* untracked: no diff, show the file */
-    bool replace_first = E.docs.size() == 1 && D().pristine();
+/* ---- diff tabs: both sides come from git (a revision, the index) or from the file on disk ---- */
+
+std::string rel_to_root(const std::string &abs) {
+    const std::string &r = E.git.root;
+    return !r.empty() && abs.size() > r.size() + 1 && abs.compare(0, r.size(), r) == 0 && abs[r.size()] == '/' ? abs.substr(r.size() + 1) : std::string();
+}
+
+std::string diff_fetch(const DiffView &v, const std::string &rev) {
+    if (rev.empty()) return std::string();
+    if (rev != "WORK") return git_show(v.root, rev, v.path);
+    std::string out;
+    FILE *f = fopen((v.root + "/" + v.path).c_str(), "rb");
+    if (!f) return out;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0 && out.size() < (8u << 20)) out.append(buf, n);
+    fclose(f);
+    return out;
+}
+
+void lex_states(const Lang *lang, const std::vector<std::string> &lines, std::vector<uint8_t> &st) {
+    st.assign(lines.size() + 1, 0);
+    std::vector<uint8_t> tok(256);
+    uint8_t state = 0;
+    for (size_t i = 0; i < lines.size(); i++) {
+        st[i] = state;
+        if (lang == lang_plain()) continue;
+        if (tok.size() < lines[i].size() + 1) tok.resize(lines[i].size() + 64);
+        state = lex_line(lang, lines[i].data(), lines[i].size(), state, tok.data());
+    }
+    st[lines.size()] = state;
+}
+
+void diff_load(DiffView &v) {
+    std::string l = diff_fetch(v, v.left_rev), r = diff_fetch(v, v.right_rev);
+    v.binary = memchr(l.data(), 0, std::min<size_t>(l.size(), 8192)) || memchr(r.data(), 0, std::min<size_t>(r.size(), 8192));
+    v.too_big = l.size() > (4u << 20) || r.size() > (4u << 20);
+    v.m = DiffModel();
+    v.sa.clear(); v.sb.clear();
+    if (!v.binary && !v.too_big) {
+        diff_build(v.m, l, r);
+        const std::string &first = !v.m.b.empty() ? v.m.b[0] : !v.m.a.empty() ? v.m.a[0] : std::string();
+        v.lang = lang_detect(v.path.c_str(), first.data(), first.size());
+        lex_states(v.lang, v.m.a, v.sa);
+        lex_states(v.lang, v.m.b, v.sb);
+    } else v.lang = lang_plain();
+    v.vdirty = true;
+}
+
+void diff_reload_all() {
+    for (auto &dp : E.docs) {
+        if (!dp->dv) continue;
+        DiffView &v = *dp->dv;
+        if (v.root != E.git.root) continue;
+        bool live = v.left_rev == "WORK" || v.right_rev == "WORK" || v.left_rev == ":" || v.right_rev == ":" || v.left_rev == "HEAD" || v.right_rev == "HEAD";
+        if (live) diff_load(v);
+    }
+}
+
+Doc &open_diff_spec(const std::string &path, const std::string &lrev, const std::string &rrev, const std::string &llabel, const std::string &rlabel, const std::string &title, const std::string &info) {
+    for (size_t i = 0; i < E.docs.size(); i++) {
+        Doc &o = *E.docs[i];
+        if (o.dv && o.dv->root == E.git.root && o.dv->path == path && o.dv->left_rev == lrev && o.dv->right_rev == rrev) { diff_load(*o.dv); set_active((int)i); return o; }
+    }
+    bool replace_first = E.docs.size() == 1 && D().pristine() && !E.blank_tab;
     Doc &d = new_doc(false);
-    d.title = c.path.substr(c.path.rfind('/') == std::string::npos ? 0 : c.path.rfind('/') + 1) + " (diff)";
-    d.load_text(txt);
-    d.set_language(nullptr, false);
-    for (int i = 0; i < lang_count(); i++) if (!strcmp(lang_name(lang_at(i)), "Diff")) d.set_language(lang_at(i), true);
+    d.title = title;
+    d.dv = std::make_shared<DiffView>();
+    DiffView &v = *d.dv;
+    v.root = E.git.root; v.path = path; v.left_rev = lrev; v.right_rev = rrev;
+    v.left_label = llabel; v.right_label = rlabel; v.info = info;
+    diff_load(v);
+    d.lang = v.lang;
     if (replace_first) E.docs.erase(E.docs.begin());
     set_active((int)E.docs.size() - 1);
+    return D();
+}
+
+std::string base_name(const std::string &p) { size_t sl = p.rfind('/'); return sl == std::string::npos ? p : p.substr(sl + 1); }
+
+void open_change_diff(const GitChange &c, bool staged) {
+    std::string name = base_name(c.path);
+    if (c.x == '?' && c.y == '?') { open_diff_spec(c.path, "", "WORK", "(untracked)", "Working Tree", name + " (Untracked)", "New file, not tracked yet"); return; }
+    if (staged) open_diff_spec(c.path, "HEAD", ":", "HEAD", "Index", name + " (Index)", "Staged changes: HEAD against the index");
+    else open_diff_spec(c.path, ":", "WORK", "Index", "Working Tree", name + " (Working Tree)", "Unstaged changes: the index against the file on disk");
+}
+
+void open_commit_diff(const GitCommit &c, const GitFile &f) {
+    std::string h7 = c.hash.substr(0, 7);
+    std::string info = h7 + "  " + c.subject + "   " + c.author + ", " + git_ago(c.date, (long)time(nullptr));
+    open_diff_spec(f.path, f.status == 'A' ? std::string() : c.hash + "^", f.status == 'D' ? std::string() : c.hash, f.status == 'A' ? "(new file)" : h7 + "^", f.status == 'D' ? "(deleted)" : h7, base_name(f.path) + " (" + h7 + ")", info);
+}
+
+void open_compare_diff(const std::string &path, const std::string &a, const std::string &b) {
+    open_diff_spec(path, a, b, a.substr(0, 7), b.substr(0, 7), base_name(path) + " (" + a.substr(0, 7) + " .. " + b.substr(0, 7) + ")", "Comparing two revisions of " + path);
+}
+
+/* ---- the Source Control lists that come from git log ---- */
+
+void git_ui_timeline() {
+    GitUi &g = E.g;
+    std::string rel = E.git.repo && !E.docs.empty() && !D().dv ? rel_to_root(D().path) : std::string();
+    if (rel == g.tl_path && !rel.empty()) return;
+    g.tl_path = rel;
+    g.tl.clear();
+    if (!rel.empty()) g.tl = git_log(E.git.root, 60, rel);
+}
+
+void git_ui_reload() {
+    GitUi &g = E.g;
+    if (!E.git.repo) { g.log.clear(); g.tl.clear(); g.tl_path.clear(); g.log_sel = -1; g.sel_files.clear(); return; }
+    if (E.view != V_GIT) { g.tl_path = "\x01"; return; }   /* loaded when the tab is shown */
+    std::string keep = g.log_sel >= 0 && (size_t)g.log_sel < g.log.size() ? g.log[(size_t)g.log_sel].hash : std::string();
+    g.log = git_log(E.git.root, 120, "");
+    g.log_sel = -1;
+    if (!keep.empty() && g.cmp_a.empty()) for (size_t i = 0; i < g.log.size(); i++) if (g.log[i].hash == keep) g.log_sel = (int)i;
+    if (g.log_sel < 0) { g.sel_files.clear(); g.cmp_a.clear(); g.cmp_b.clear(); }
+    g.tl_path = "\x01";   /* force the timeline to reload */
+    git_ui_timeline();
+}
+
+void git_do(bool ok, const char *what) {
+    if (!ok) E.status_msg = std::string("git ") + what + " failed";
+    git_refresh();
+}
+
+void git_commit_now() {
+    GitUi &g = E.g;
+    std::string m = g.msg;
+    while (!m.empty() && (m.back() == '\n' || m.back() == ' ')) m.pop_back();
+    if (m.empty()) { g.err = "Type a commit message first"; redraw(); return; }
+    begin_op("git commit");
+    std::string err;
+    if (git_commit(E.git.root, m, &err, true)) { g.msg.clear(); g.err.clear(); E.status_msg = "committed"; }
+    else g.err = err;
+    git_refresh();
 }
 
 void close_confirmed() {
@@ -823,6 +989,69 @@ uint32_t lang_color(const Lang *l) {
 
 uint32_t file_color(const std::string &name) { return lang_color(lang_detect(name.c_str(), nullptr, 0)); }
 
+
+/* ---- git decorations in the editor: change bars in the gutter and blame for the cursor line ---- */
+
+GutterCache *gutter_for(Doc &d) {
+    if (d.dv || !E.git.repo || d.path.empty() || d.buf.lines() > 50000) return nullptr;
+    std::string rel = rel_to_root(d.path);
+    if (rel.empty()) return nullptr;
+    GutterCache &c = g_gutter[&d];
+    if (c.base_stale) {
+        std::string base = git_show(E.git.root, "HEAD", rel);
+        diff_split_lines(base, c.base_lines);
+        c.ids.clear();
+        for (const std::string &l : c.base_lines) c.ids.emplace(l, (int)c.ids.size());
+        c.base_stale = false;
+        c.computed = false;
+    }
+    if (!c.computed || c.rev != d.buf.revision()) {
+        size_t nl = d.buf.lines();
+        if (nl > 1 && d.buf.line_len(nl - 1) == 0) nl--;   /* the empty line after the final newline is not a line of text */
+        std::vector<int> a(c.base_lines.size()), b(nl);
+        for (size_t i = 0; i < a.size(); i++) a[i] = c.ids[c.base_lines[i]];
+        std::unordered_map<std::string, int> extra;
+        std::string t;
+        for (size_t i = 0; i < b.size(); i++) {
+            d.buf.line_text(i, t);
+            if (!t.empty() && t.back() == '\r') t.pop_back();
+            auto it = c.ids.find(t);
+            if (it != c.ids.end()) { b[i] = it->second; continue; }
+            auto ex = extra.emplace(t, (int)(c.ids.size() + extra.size()));
+            b[i] = ex.first->second;
+        }
+        if (d.buf.size() == 0) b.clear();
+        c.hunks = diff_ids(a, b, 800, nullptr);
+        c.rev = d.buf.revision();
+        c.computed = true;
+    }
+    return &c;
+}
+
+const GitBlame *blame_for(Doc &d, size_t line) {
+    if (d.dv || d.modified() || !E.git.repo || d.path.empty()) return nullptr;
+    GutterCache *c = gutter_for(d);
+    if (!c) return nullptr;
+    if (!c->blame_tried) {
+        c->blame_tried = true;
+        std::string rel = rel_to_root(d.path);
+        c->blame_ok = d.buf.size() < (2u << 20) && git_blame(E.git.root, rel, c->blame);
+    }
+    return c->blame_ok && line < c->blame.size() ? &c->blame[line] : nullptr;
+}
+
+std::string blame_text(const GitBlame &b) {
+    if (b.hash.find_first_not_of('0') == std::string::npos) return "You, Uncommitted changes";
+    return b.author + ", " + git_ago(b.time, (long)time(nullptr)) + "  \xE2\x80\xA2  " + b.summary;
+}
+
+void open_blame_commit(const GitBlame &b, const std::string &path) {
+    if (b.hash.find_first_not_of('0') == std::string::npos) { open_diff_spec(path, ":", "WORK", "Index", "Working Tree", base_name(path) + " (Working Tree)", "Unstaged changes"); return; }
+    GitCommit c;
+    c.hash = b.hash; c.subject = b.summary; c.author = b.author; c.date = b.time;
+    open_commit_diff(c, GitFile{'M', path});
+}
+
 /* ---- layout ---- */
 
 struct Layout {
@@ -971,6 +1200,305 @@ uint32_t git_dot(const GitChange &c) {
 
 void draw_dot(float cx, float cy, int size, uint32_t rgba) { draw_icon(IC_DOT, cx - (float)size / 2, cy - (float)size / 2, size, rgba); }
 
+
+/* ---- the Source Control view (modelled on VS Code's): summary, commit box, staged and other changes, history graph, file timeline ---- */
+
+struct GEnt { int idx; bool staged; char st; };
+
+void git_entries(std::vector<GEnt> &staged, std::vector<GEnt> &other) {
+    for (size_t i = 0; i < E.git.changes.size(); i++) {
+        const GitChange &c = E.git.changes[i];
+        bool conflict = (c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D'));
+        if (c.x == '?' && c.y == '?') other.push_back({(int)i, false, '?'});
+        else if (conflict) other.push_back({(int)i, false, 'C'});
+        else {
+            if (c.x != ' ') staged.push_back({(int)i, true, c.x});
+            if (c.y != ' ') other.push_back({(int)i, false, c.y});
+        }
+    }
+}
+
+uint32_t status_color(char st) {
+    switch (st) {
+    case 'M': return C_GIT_MOD;
+    case 'A': case 'R': return C_GIT_ADD;
+    case 'D': return C_GIT_DEL;
+    case '?': return C_GIT_UNT;
+    case 'C': return C_GIT_CONF;
+    default: return C_UI_DIM;
+    }
+}
+
+const char *status_letter(char st) {
+    switch (st) { case 'M': return "M"; case 'A': return "A"; case 'D': return "D"; case 'R': return "R"; case '?': return "U"; case 'C': return "!"; default: return "?"; }
+}
+
+void draw_pill(float x, float y, float w, float h, uint32_t col) {
+    int cap = (int)(h * 2.36f);   /* IC_DOT's circle is 0.425 of its box wide */
+    draw_icon(IC_DOT, x + h / 2 - (float)cap / 2, y + h / 2 - (float)cap / 2, cap, col);
+    draw_icon(IC_DOT, x + w - h / 2 - (float)cap / 2, y + h / 2 - (float)cap / 2, cap, col);
+    r_rect(E.r, x + h / 2, y, std::max(0.f, w - h), h, col);
+}
+
+float draw_badge(float right, float y, float h, int n, uint32_t bg, uint32_t fg) {   /* a count in a pill, right aligned at `right`; returns its left edge */
+    std::string t = std::to_string(n);
+    float w = std::max(h, text_width(E.ui, t.c_str()) + (float)S(10));
+    draw_pill(right - w, y, w, h, bg);
+    draw_text(E.ui, right - w + (w - text_width(E.ui, t.c_str())) / 2, ui_base(y, h) - (float)S(1), t.c_str(), fg, w);
+    return right - w;
+}
+
+void git_ref_pills(const std::string &refs, float *right, float y, float h, float minx) {   /* branch and tag labels, right aligned; drawn from the right edge inwards */
+    std::vector<std::pair<std::string, int>> labs;   /* label, kind: 0 local branch, 1 remote, 2 tag */
+    size_t pos = 0;
+    while (pos < refs.size()) {
+        size_t e = refs.find(", ", pos);
+        if (e == std::string::npos) e = refs.size();
+        std::string r = refs.substr(pos, e - pos);
+        pos = e + 2;
+        if (r == "HEAD") continue;
+        if (r.compare(0, 8, "HEAD -> ") == 0) r = r.substr(8);
+        int kind = r.compare(0, 5, "tag: ") == 0 ? 2 : r.find('/') != std::string::npos ? 1 : 0;
+        if (kind == 2) r = r.substr(5);
+        labs.push_back({r, kind});
+    }
+    for (size_t i = 0; i < labs.size() && i < 3; i++) {
+        float w = text_width(E.ui, labs[i].first.c_str()) + (float)S(14);
+        if (*right - w < minx) break;
+        uint32_t bg = labs[i].second == 0 ? C_ACCENT : labs[i].second == 1 ? ui_mix(C_CHROME, C_ACCENT, 0.40) : ui_mix(C_CHROME, C_GIT_MOD, 0.45);
+        uint32_t fg = labs[i].second == 0 ? C_ON_ACCENT : C_UI;
+        draw_pill(*right - w, y, w, h, bg);
+        draw_text(E.ui, *right - w + (float)S(7), ui_base(y, h) - (float)S(1), labs[i].first.c_str(), fg, w - (float)S(10));
+        *right -= w + (float)S(4);
+    }
+}
+
+void draw_git_view(float rail, float sw, float cx, float cw, float list_top, float bot, float &ry) {
+    GitUi &g = E.g;
+    const float rowh = (float)S(26), full_x = rail + 1, full_w = sw - rail - 2, right = sw - (float)S(10);
+    auto visible = [&](float h) { return ry + h >= list_top && ry <= bot; };
+    std::vector<GEnt> staged, other;
+    git_entries(staged, other);
+    int n_mod = 0, n_add = 0, n_del = 0, n_unt = 0;
+    for (const GitChange &c : E.git.changes) {
+        if (c.x == '?') n_unt++;
+        else if (c.x == 'D' || c.y == 'D') n_del++;
+        else if (c.x == 'A' || c.x == 'R') n_add++;
+        else n_mod++;
+    }
+
+    /* title and refresh */
+    if (visible(rowh)) {
+        draw_text(E.ui, cx, ui_base(ry, rowh), "SOURCE CONTROL", C_GROUP, cw, FS_BOLD);
+        float bx = right - (float)S(22);
+        if (hovered(H_GITREFRESH, 0)) r_rect(E.r, bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), C_HOVER);
+        draw_icon(IC_REFRESH, bx, ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+        hit(bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), H_GITREFRESH, 0);
+    }
+    ry += rowh;
+
+    /* branch, sync state and the number of changes */
+    if (visible(rowh)) {
+        draw_icon(IC_GIT, cx, ry + (rowh - (float)S(14)) / 2, S(14), C_ACCENT);
+        float pen = draw_text(E.ui, cx + (float)S(22), ui_base(ry, rowh), E.git.branch.c_str(), C_UI, cw * 0.55f, FS_BOLD);
+        if (E.git.ahead) { draw_icon(IC_ARROW_U, pen + (float)S(6), ry + (rowh - (float)S(14)) / 2, S(14), C_UI_DIM); pen = draw_text(E.ui, pen + (float)S(20), ui_base(ry, rowh), std::to_string(E.git.ahead).c_str(), C_UI_DIM, (float)S(40)); }
+        if (E.git.behind) { draw_icon(IC_ARROW_D, pen + (float)S(6), ry + (rowh - (float)S(14)) / 2, S(14), C_UI_DIM); draw_text(E.ui, pen + (float)S(20), ui_base(ry, rowh), std::to_string(E.git.behind).c_str(), C_UI_DIM, (float)S(40)); }
+        std::string tot = E.git.changes.empty() ? "clean" : sfmt("%zu change%s", E.git.changes.size(), E.git.changes.size() == 1 ? "" : "s");
+        draw_text(E.ui, right - text_width(E.ui, tot.c_str()), ui_base(ry, rowh), tot.c_str(), E.git.changes.empty() ? C_GIT_UNT : C_UI_DIM, (float)S(120));
+    }
+    ry += rowh;
+    if (!E.git.changes.empty()) {   /* modified / added / deleted / untracked, coloured like the file rows */
+        if (visible(rowh)) {
+            float x = cx;
+            struct { int n; const char *l, *sh; uint32_t c; } sm[4] = {{n_mod, "modified", "M", C_GIT_MOD}, {n_add, "added", "A", C_GIT_ADD}, {n_del, "deleted", "D", C_GIT_DEL}, {n_unt, "untracked", "U", C_GIT_UNT}};
+            float need = 0;
+            for (auto &it : sm) if (it.n) need += text_width(E.ui, sfmt("%d %s", it.n, it.l).c_str()) + (float)S(22);
+            bool compact = need > cw;   /* the long words do not fit the sidebar: use the letters VS Code shows on the rows */
+            for (auto &it : sm) {
+                if (!it.n) continue;
+                std::string t = sfmt("%d %s", it.n, compact ? it.sh : it.l);
+                draw_dot(x + (float)S(4), ry + rowh / 2, S(8), it.c);
+                x = draw_text(E.ui, x + (float)S(12), ui_base(ry, rowh), t.c_str(), C_UI_DIM, sw - x) + (float)S(10);
+            }
+        }
+        ry += (float)S(22);
+    }
+
+    /* commit message and button */
+    {
+        std::vector<std::string> ml;
+        size_t pos = 0;
+        while (true) { size_t e = g.msg.find('\n', pos); ml.push_back(g.msg.substr(pos, e == std::string::npos ? std::string::npos : e - pos)); if (e == std::string::npos) break; pos = e + 1; }
+        int shown = std::min<int>(5, (int)ml.size());
+        float lh = (float)S(18), bh = (float)shown * lh + (float)S(12);
+        bool foc = E.mode == M_GITMSG;
+        if (visible(bh)) {
+            r_rect(E.r, cx, ry, cw, bh, foc ? C_ACCENT : C_BOX_LINE);
+            r_rect(E.r, cx + 1, ry + 1, cw - 2, bh - 2, C_FIELD);
+            if (g.msg.empty()) draw_text(E.ui, cx + (float)S(8), ui_base(ry + (float)S(6), lh), "Message (Ctrl+Enter to commit)", C_UI_FAINT, cw - (float)S(16));
+            float pen = cx + (float)S(8);
+            for (int i = 0; i < shown; i++) {
+                const std::string &line = ml[ml.size() - (size_t)shown + (size_t)i];
+                pen = draw_text(E.ui, cx + (float)S(8), ui_base(ry + (float)S(6) + (float)i * lh, lh), line.c_str(), C_UI, cw - (float)S(16));
+            }
+            if (foc && E.blink_on) r_rect(E.r, pen + 1, ry + (float)S(6) + (float)(shown - 1) * lh + (float)S(2), std::max(1.f, E.scale), lh - (float)S(4), C_CURSOR);
+            hit(cx, ry, cw, bh, H_GITMSG, 0);
+        }
+        ry += bh + (float)S(6);
+        if (!g.err.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, (float)S(20)), g.err.c_str(), C_RED, cw); ry += (float)S(22); }
+        float bth = (float)S(30);
+        if (visible(bth)) {
+            bool can = !E.git.changes.empty();
+            std::string lab = !can ? "Nothing to commit" : !staged.empty() ? sfmt("Commit  (%zu staged)", staged.size()) : sfmt("Commit All  (%zu)", other.size());
+            uint32_t bg = !can ? C_FIELD : hovered(H_GITCOMMIT, 0) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT;
+            uint32_t fg = can ? C_ON_ACCENT : C_UI_FAINT;
+            r_rect(E.r, cx, ry, cw, bth, bg);
+            float lw = text_width(E.ui, lab.c_str()) + (float)S(22);
+            float lx = cx + (cw - lw) / 2;
+            if (can) draw_icon(IC_CHECK, lx, ry + (bth - (float)S(16)) / 2, S(16), fg);
+            draw_text(E.ui, lx + (can ? (float)S(22) : 0.f), ui_base(ry, bth), lab.c_str(), fg, cw);
+            hit(cx, ry, cw, bth, H_GITCOMMIT, 0);
+        }
+        ry += bth + (float)S(10);
+    }
+
+    auto section = [&](int id, const char *name, bool open, int count, int all_id) {
+        float h = (float)S(26);
+        if (visible(h)) {
+            if (hovered(H_GITSEC, id)) r_rect(E.r, full_x, ry, full_w, h, C_HOVER);
+            draw_icon(open ? IC_CHEV_D : IC_CHEV_R, cx - (float)S(4), ry + (h - (float)S(16)) / 2, S(16), C_GROUP);
+            float pen = draw_text(E.ui, cx + (float)S(14), ui_base(ry, h), name, C_UI_DIM, cw, FS_BOLD);
+            hit(full_x, ry, full_w, h, H_GITSEC, id);
+            float r = right;
+            if (all_id >= 0 && count > 0) {   /* stage all / unstage all */
+                float bx = right - (float)S(20);
+                if (hovered(H_GITALL, all_id)) r_rect(E.r, bx - (float)S(2), ry + (float)S(3), (float)S(22), h - (float)S(6), C_HOVER);
+                draw_icon(all_id == 0 ? IC_PLUS : IC_MINUS, bx, ry + (h - (float)S(16)) / 2, S(16), C_UI_DIM);
+                hit(bx - (float)S(2), ry + (float)S(3), (float)S(22), h - (float)S(6), H_GITALL, all_id);
+                r = bx - (float)S(6);
+            }
+            if (count >= 0) draw_badge(r, ry + (h - (float)S(16)) / 2, (float)S(16), count, C_ACCENT, C_ON_ACCENT);
+            (void)pen;
+        }
+        ry += h;
+    };
+
+    auto file_rows = [&](const std::vector<GEnt> &ents) {
+        for (size_t k = 0; k < ents.size(); k++) {
+            const GEnt &en = ents[k];
+            const GitChange &c = E.git.changes[(size_t)en.idx];
+            int id = en.idx * 2 + (en.staged ? 1 : 0);
+            if (visible(rowh)) {
+                bool hv = hovered(H_GITROW, id) || hovered(H_GITSTG, id) || hovered(H_GITOPEN, id);
+                if (hv) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+                std::string base = base_name(c.path), dir = c.path.size() > base.size() ? c.path.substr(0, c.path.size() - base.size() - 1) : std::string();
+                uint32_t col = status_color(en.st);
+                draw_dot(cx + (float)S(8), ry + rowh / 2, S(8), file_color(base));
+                float lim = right - (float)S(18) - (hv ? (float)S(42) : 0.f);
+                float pen = draw_text(E.ui, cx + (float)S(20), ui_base(ry, rowh), base.c_str(), en.st == 'D' ? C_UI_FAINT : C_UI, lim - cx - (float)S(20));
+                if (!dir.empty() && pen + (float)S(30) < lim) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir.c_str(), C_UI_FAINT, lim - pen - (float)S(8));
+                float lw = text_width(E.ui, status_letter(en.st));
+                draw_text(E.ui, right - (float)S(8) - lw, ui_base(ry, rowh), status_letter(en.st), col, (float)S(20), FS_BOLD);
+                hit(full_x, ry, full_w, rowh, H_GITROW, id);
+                if (hv) {
+                    float bx = right - (float)S(46);
+                    for (int b = 0; b < 2; b++) {
+                        int kind = b == 0 ? H_GITOPEN : H_GITSTG;
+                        if (hovered(kind, id)) r_rect(E.r, bx - (float)S(1), ry + (float)S(3), (float)S(20), rowh - (float)S(6), C_SELROW);
+                        draw_icon(b == 0 ? IC_OPEN_FILE : en.staged ? IC_MINUS : IC_PLUS, bx + (float)S(1), ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+                        hit(bx - (float)S(1), ry + (float)S(3), (float)S(20), rowh - (float)S(6), kind, id);
+                        bx += (float)S(22);
+                    }
+                }
+            }
+            ry += rowh;
+        }
+    };
+
+    if (E.git.changes.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "No changes. The working tree matches HEAD.", C_UI_FAINT, cw); ry += rowh; }
+    if (!staged.empty()) { section(0, "Staged Changes", g.open_staged, (int)staged.size(), 1); if (g.open_staged) file_rows(staged); }
+    if (!other.empty()) { section(1, "Changes", g.open_changes, (int)other.size(), 0); if (g.open_changes) file_rows(other); }
+    ry += (float)S(6);
+
+    /* the history graph */
+    section(2, "GRAPH", g.open_graph, (int)g.log.size(), -1);
+    if (g.open_graph) {
+        const float gh = (float)S(24);
+        for (size_t i = 0; i < g.log.size(); i++) {
+            const GitCommit &c = g.log[i];
+            bool sel = (int)i == g.log_sel, marked = !g.mark_hash.empty() && c.hash == g.mark_hash;
+            if (visible(gh)) {
+                if (sel) r_rect(E.r, full_x, ry, full_w, gh, C_SELROW);
+                else if (hovered(H_GITLOG, (int)i)) r_rect(E.r, full_x, ry, full_w, gh, C_HOVER);
+                if (marked) r_rect(E.r, full_x, ry, (float)S(2), gh, C_ACCENT);
+                float lx = cx + (float)S(6);
+                r_rect(E.r, lx - (float)S(1), ry + (i == 0 ? gh / 2 : 0.f), (float)S(2), i + 1 == g.log.size() ? gh / 2 : (i == 0 ? gh / 2 : gh), C_GUT_MOD);
+                draw_dot(lx, ry + gh / 2, S(11), i == 0 ? C_ACCENT : C_GUT_MOD);
+                if (i == 0 || c.parents > 1) draw_dot(lx, ry + gh / 2, S(5), sel ? C_SELROW : C_CHROME);   /* HEAD and merges are hollow */
+                float pr = right;
+                git_ref_pills(c.refs, &pr, ry + (gh - (float)S(16)) / 2, (float)S(16), cx + cw * 0.35f);
+                draw_text(E.ui, cx + (float)S(20), ui_base(ry, gh), c.subject.c_str(), C_UI, pr - cx - (float)S(24), i == 0 ? FS_BOLD : FS_REGULAR);
+                hit(full_x, ry, full_w, gh, H_GITLOG, (int)i);
+            }
+            ry += gh;
+            if (sel) {   /* the commit's details and files, indented under it */
+                float mh = (float)S(22);
+                if (visible(mh)) {
+                    std::string meta = g.cmp_a.empty() ? sfmt("%s  %s, %s", c.hash.substr(0, 7).c_str(), c.author.c_str(), git_ago(c.date, (long)time(nullptr)).c_str())
+                                                       : sfmt("comparing %s with %s", g.cmp_a.substr(0, 7).c_str(), g.cmp_b.substr(0, 7).c_str());
+                    draw_text(E.ui, cx + (float)S(20), ui_base(ry, mh), meta.c_str(), C_UI_FAINT, cw - (float)S(20));
+                    r_rect(E.r, cx + (float)S(5), ry, (float)S(2), mh, C_GUT_MOD);
+                }
+                ry += mh;
+                for (size_t k = 0; k < g.sel_files.size(); k++) {
+                    const GitFile &f = g.sel_files[k];
+                    if (visible(rowh)) {
+                        if (hovered(H_GITCFILE, (int)k)) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+                        r_rect(E.r, cx + (float)S(5), ry, (float)S(2), rowh, C_GUT_MOD);
+                        std::string base = base_name(f.path), dir = f.path.size() > base.size() ? f.path.substr(0, f.path.size() - base.size() - 1) : std::string();
+                        float lim = right - (float)S(22);
+                        float pen = draw_text(E.ui, cx + (float)S(20), ui_base(ry, rowh), base.c_str(), status_color(f.status), lim - cx - (float)S(20));
+                        if (!dir.empty() && pen + (float)S(30) < lim) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir.c_str(), C_UI_FAINT, lim - pen - (float)S(8));
+                        draw_text(E.ui, right - (float)S(8) - text_width(E.ui, status_letter(f.status)), ui_base(ry, rowh), status_letter(f.status), status_color(f.status), (float)S(20), FS_BOLD);
+                        hit(full_x, ry, full_w, rowh, H_GITCFILE, (int)k);
+                    }
+                    ry += rowh;
+                }
+                if (g.sel_files.empty()) { if (visible(mh)) draw_text(E.ui, cx + (float)S(20), ui_base(ry, mh), "no file changes", C_UI_FAINT, cw); ry += mh; }
+            }
+        }
+        if (g.log.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "No commits yet", C_UI_FAINT, cw); ry += rowh; }
+        if (!g.mark_hash.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), sfmt("Marked %s. Shift+click to compare", g.mark_label.c_str()).c_str(), C_UI_FAINT, cw); ry += rowh; }
+        else { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "Ctrl+click marks, Shift+click compares", C_UI_FAINT, cw); ry += rowh; }
+    }
+    ry += (float)S(6);
+
+    /* history of the file in the active tab */
+    {
+        std::string title = g.tl_path.empty() || g.tl_path[0] == '\x01' ? std::string("TIMELINE") : "TIMELINE  " + base_name(g.tl_path);
+        section(3, title.c_str(), g.open_tl, g.tl_path.empty() || g.tl_path[0] == '\x01' ? -1 : (int)g.tl.size(), -1);
+        if (g.open_tl) {
+            const float th = (float)S(24);
+            for (size_t i = 0; i < g.tl.size(); i++) {
+                const GitCommit &c = g.tl[i];
+                bool marked = !g.mark_hash.empty() && c.hash == g.mark_hash;
+                if (visible(th)) {
+                    if (hovered(H_GITTL, (int)i)) r_rect(E.r, full_x, ry, full_w, th, C_HOVER);
+                    if (marked) r_rect(E.r, full_x, ry, (float)S(2), th, C_ACCENT);
+                    std::string ago = git_ago(c.date, (long)time(nullptr));
+                    float aw = text_width(E.ui, ago.c_str());
+                    draw_dot(cx + (float)S(6), ry + th / 2, S(8), C_GUT_MOD);
+                    draw_text(E.ui, cx + (float)S(20), ui_base(ry, th), c.subject.c_str(), C_UI, right - cx - (float)S(28) - aw);
+                    draw_text(E.ui, right - aw, ui_base(ry, th), ago.c_str(), C_UI_FAINT, aw + 2);
+                    hit(full_x, ry, full_w, th, H_GITTL, (int)i);
+                }
+                ry += th;
+            }
+            if (g.tl.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), g.tl_path.empty() || g.tl_path[0] == '\x01' ? "Open a tracked file to see its history" : "No history for this file yet", C_UI_FAINT, cw); ry += rowh; }
+        }
+    }
+}
+
 void draw_sidebar(const Layout &L) {
     float sw = (float)L.side_x1, top = (float)L.menu_h, bot = (float)L.bar_y;
     float rail = (float)S(29);
@@ -990,13 +1518,19 @@ void draw_sidebar(const Layout &L) {
     for (int i = 0; i < 3; i++) {
         const AtlasGlyph *g = vlabel(names[i], E.ui, FS_BOLD);
         if (!g) continue;
-        float th = (float)g->h + (float)S(28);
+        bool badge = i == 2 && E.git.repo && !E.git.changes.empty();
+        float th = (float)g->h + (float)S(28) + (badge ? (float)S(18) : 0.f);
         bool on = (int)E.view == i;
         if (on) { r_rect(E.r, 0, ty, rail, th, C_SELROW); r_rect(E.r, 0, ty, (float)S(2), th, C_ACCENT); }
         else if (hovered(H_ACTIVITY, i)) r_rect(E.r, 0, ty, rail, th, C_HOVER);
         RInst inst;
-        r_make_glyph(E.r, &inst, g, (rail - (float)g->w) / 2 + 1, ty + (th - (float)g->h) / 2, on ? C_ACCENT : C_UI_DIM);
+        r_make_glyph(E.r, &inst, g, (rail - (float)g->w) / 2 + 1, ty + ((th - (badge ? (float)S(18) : 0.f)) - (float)g->h) / 2, on ? C_ACCENT : C_UI_DIM);
         r_push(E.r, &inst, 1);
+        if (badge) {
+            std::string nb = std::to_string(E.git.changes.size());
+            float bw = std::max((float)S(16), text_width(E.ui, nb.c_str()) + (float)S(8));
+            draw_badge((rail + bw) / 2, ty + th - (float)S(22), (float)S(16), (int)E.git.changes.size(), C_ACCENT, C_ON_ACCENT);
+        }   /* how many files changed, like the badge on VS Code's source control icon */
         hit(0, ty, rail, th, H_ACTIVITY, i);
         ty += th + (float)S(2);
     }
@@ -1155,35 +1689,244 @@ void draw_sidebar(const Layout &L) {
             draw_text(E.ui, cx, ui_base(ry + rowh * 2 - (float)S(4), rowh), "that is inside a repository.", C_UI_DIM, cw);
         }
     } else {
-        std::string br = E.git.branch + (E.git.ahead || E.git.behind ? sfmt("   %d ahead  %d behind", E.git.ahead, E.git.behind) : std::string());
-        draw_icon(IC_GIT, cx, ry + (rowh - (float)S(14)) / 2, S(14), C_ACCENT);
-        draw_text(E.ui, cx + (float)S(22), ui_base(ry, rowh), br.c_str(), C_UI, cw - (float)S(22), FS_BOLD);
-        ry += rowh + (float)S(6);
-        if (E.git.changes.empty()) draw_text(E.ui, cx, ui_base(ry, rowh), "Working tree clean", C_UI_DIM, cw);
-        const char *order[3] = {"STAGED", "CHANGES", "UNTRACKED"};
-        for (const char *grp : order) {
-            size_t n = 0;
-            for (const GitChange &c : E.git.changes) if (!strcmp(git_group(c), grp)) n++;
-            if (!n) continue;
-            group(sfmt("%s  %zu", grp, n), false, true, 0);
-            for (size_t i = 0; i < E.git.changes.size(); i++) {
-                const GitChange &c = E.git.changes[i];
-                if (strcmp(git_group(c), grp)) continue;
-                if (ry + rowh >= list_top && ry <= bot) {
-                    if (hovered(H_GITROW, (int)i)) r_rect(E.r, rail + 1, ry, sw - rail - 2, rowh, C_HOVER);
-                    size_t slash = c.path.rfind('/');
-                    std::string base = slash == std::string::npos ? c.path : c.path.substr(slash + 1), dir = slash == std::string::npos ? "" : c.path.substr(0, slash);
-                    draw_dot(cx + (float)S(5), ry + rowh / 2, S(10), git_dot(c));
-                    float pen = draw_text(E.ui, cx + (float)S(18), ui_base(ry, rowh), base.c_str(), C_UI, cw - (float)S(18));
-                    if (!dir.empty()) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir.c_str(), C_UI_FAINT, sw - pen - (float)S(18));
-                    hit(rail + 1, ry, sw - rail - 2, rowh, H_GITROW, (int)i);
-                }
-                ry += rowh;
-            }
-            ry += (float)S(8);
-        }
+        draw_git_view(rail, sw, cx, cw, list_top, bot, ry);
+        float content = (ry + E.side_scroll) - list_top;
+        float maxs = std::max(0.f, content - (bot - list_top) + (float)S(20));
+        if (E.side_scroll > maxs) E.side_scroll = maxs;
     }
     r_clip_off(E.r);
+}
+
+
+/* ---- the diff tab: side by side or inline, folded unchanged regions, change navigation ---- */
+
+int diff_rows_visible(const Layout &L) { return std::max(1, (L.ed_bottom - L.text_y - S(30)) / E.rowh); }
+
+void diff_clamp(DiffView &v, const Layout &L) {
+    long maxtop = std::max<long>(0, (long)v.vrows.size() - 1);
+    if (v.top < 0) v.top = 0;
+    if (v.top > maxtop) v.top = maxtop;
+    (void)L;
+}
+
+void diff_goto_change(DiffView &v, int k, const Layout &L) {
+    if (v.vdirty) diff_layout(v, v.vinline);
+    if (k < 0 || (size_t)k >= v.change_v.size() || v.change_v[(size_t)k] < 0) return;
+    v.cur_change = k;
+    v.top = std::max<long>(0, v.change_v[(size_t)k] - diff_rows_visible(L) / 3);
+    diff_clamp(v, L);
+}
+
+void diff_step(DiffView &v, int dir, const Layout &L) {
+    if (v.m.hunks.empty()) return;
+    int n = (int)v.m.hunks.size();
+    int k = v.cur_change < 0 ? (dir > 0 ? 0 : n - 1) : (v.cur_change + dir + n) % n;
+    diff_goto_change(v, k, L);
+}
+
+/* one line of code with syntax colours at (x, y): `left` columns scrolled off, at most `cols` shown */
+void emit_code(float x, float y, const std::string &text, int left, int cols, const Lang *lang, uint8_t state) {
+    static std::vector<RInst> v;
+    v.clear();
+    if (E.tok.size() < text.size() + 1) E.tok.resize(text.size() + 64);
+    if (lang != lang_plain()) lex_line(lang, text.data(), text.size(), state, E.tok.data());
+    else memset(E.tok.data(), 0, text.size());
+    int col = 0;
+    for (size_t i = 0; i < text.size() && col < left + cols;) {
+        size_t a, i0 = i;
+        uint32_t cp = u8_decode(text.data() + i, text.size() - i, &a);
+        i += a;
+        if (cp == '\t') { col = (col / TAB_W + 1) * TAB_W; continue; }
+        if (col >= left && cp != ' ') {
+            const AtlasGlyph *g = atlas_glyph(E.atlas, E.font, cp, FS_REGULAR);
+            if (g && !g->blank) { RInst inst; r_make_glyph(E.r, &inst, g, (float)((col - left) * E.cw), (float)E.rowasc, TOKCOL[E.tok[i0]]); v.push_back(inst); }
+        }
+        col++;
+    }
+    if (!v.empty()) r_push_at(E.r, v.data(), (int)v.size(), x, y);
+}
+
+void draw_diff(const Layout &L, float ex, float ew) {
+    Doc &d = D();
+    DiffView &v = *d.dv;
+    const float tb_h = (float)S(30), body_y = (float)L.text_y + tb_h;
+    const int rows = diff_rows_visible(L);
+    bool inl = v.mode == 2 || (v.mode == 0 && ew < (float)S(900));
+    if (v.vdirty || v.vinline != inl) diff_layout(v, inl);
+    if (v.top < 0) { v.top = 0; if (v.cur_change >= 0) diff_goto_change(v, v.cur_change, L); }
+    diff_clamp(v, L);
+    const DiffModel &m = v.m;
+
+    /* toolbar: what is compared, the change counter and the buttons */
+    r_rect(E.r, ex, (float)L.text_y, ew, tb_h, C_CHROME);
+    r_rect(E.r, ex, (float)L.text_y + tb_h - 1, ew, 1, C_BORDER);
+    float by = (float)L.text_y + (tb_h - (float)S(22)) / 2, bh = (float)S(22), rx = ex + ew - (float)S(10);
+    auto button = [&](int id, const char *label, Icon ic, bool has_icon) {
+        float tw = label ? text_width(E.ui, label) : 0.f;
+        float w = (float)S(12) + (has_icon ? (float)S(16) : 0.f) + (label ? tw + (has_icon ? (float)S(4) : 0.f) : 0.f);
+        float x = rx - w;
+        if (hovered(H_DIFFBTN, id)) r_rect(E.r, x, by, w, bh, C_HOVER);
+        float px = x + (float)S(6);
+        if (has_icon) { draw_icon(ic, px, by + (bh - (float)S(16)) / 2, S(16), C_UI_DIM); px += (float)S(20); }
+        if (label) draw_text(E.ui, px, ui_base(by, bh), label, C_UI_DIM, tw + 2);
+        hit(x, by, w, bh, H_DIFFBTN, id);
+        rx = x - (float)S(2);
+    };
+    button(3, "Open File", IC_OPEN_FILE, true);
+    button(2, v.vinline ? "Side by side" : "Inline", IC_FILE, false);
+    button(1, nullptr, IC_ARROW_D, true);
+    button(0, nullptr, IC_ARROW_U, true);
+    {
+        std::string cnt = m.hunks.empty() ? "no changes" : v.cur_change >= 0 ? sfmt("change %d of %zu", v.cur_change + 1, m.hunks.size()) : sfmt("%zu change%s", m.hunks.size(), m.hunks.size() == 1 ? "" : "s");
+        float cw2 = text_width(E.ui, cnt.c_str());
+        draw_text(E.ui, rx - cw2 - (float)S(6), ui_base(by, bh), cnt.c_str(), C_UI_FAINT, cw2 + 2);
+        rx -= cw2 + (float)S(16);
+    }
+    {
+        std::string lab = v.left_label + "  \xE2\x86\x94  " + v.right_label;
+        float lw = draw_text(E.ui, ex + (float)S(12), ui_base(by, bh), lab.c_str(), C_UI, std::max(0.f, rx - ex - (float)S(24)), FS_BOLD);
+        if (!v.info.empty() && lw + (float)S(30) < rx) draw_text(E.ui, lw + (float)S(14), ui_base(by, bh), v.info.c_str(), C_UI_FAINT, rx - lw - (float)S(20));
+    }
+
+    if (v.binary || v.too_big || m.hunks.empty()) {
+        const char *msg = v.binary ? "Binary files differ" : v.too_big ? "File too large to compare" : "No differences: both sides are identical";
+        float w = text_width(E.big, msg);
+        draw_text(E.big, ex + (ew - w) / 2, body_y + (float)S(80), msg, C_UI_FAINT, ew);
+        return;
+    }
+
+    int nd = 1;
+    for (size_t n = std::max(m.a.size(), m.b.size()); n >= 10; n /= 10) nd++;
+    const float numw = (float)((nd + 2) * E.cw);
+    const float half = v.vinline ? ew : (ew - 1) / 2;
+    const float tx_a = ex + numw + (float)S(6), tx_b = ex + half + 1 + numw + (float)S(6);   /* text origin: left column, right column */
+    const float itx = ex + 2 * numw + (float)S(6);                                           /* inline */
+    const int cols = std::max(1, (int)((v.vinline ? ew - 2 * numw - (float)S(24) : half - numw - (float)S(24)) / (float)E.cw));
+    int nrows = (int)std::min<long>(rows, (long)v.vrows.size() - v.top);
+
+    auto number = [&](float x0, int line, uint32_t col, float y) {
+        if (line < 0) return;
+        char nb[24];
+        snprintf(nb, sizeof nb, "%d", line + 1);
+        draw_text(E.font, x0 + (numw - (float)S(14) - (float)(strlen(nb) * (size_t)E.cw)) / 2 + (float)S(2), y + (float)E.rowasc, nb, col, numw);
+    };
+    auto range_rect = [&](float tx, const std::string &t, int b0, int b1, uint32_t col, float y) {
+        int c0 = std::max(0, col_of(t, (size_t)b0) - v.left), c1 = std::min(cols, col_of(t, (size_t)b1) - v.left);
+        if (c1 > c0) r_rect(E.r, tx + (float)(c0 * E.cw), y, (float)((c1 - c0) * E.cw), (float)E.rowh, col);
+    };
+    auto hatch = [&](float x0, float w, float y) {
+        r_clip(E.r, (int)x0, (int)y, (int)w, E.rowh);
+        for (float hx = x0; hx < x0 + w; hx += (float)E.rowh) draw_icon(IC_HATCH, hx, y, E.rowh, C_DIFF_FILL);
+        r_clip_off(E.r);
+    };
+
+    if (!v.vinline) r_rect(E.r, ex + half, body_y, 1, (float)(rows * E.rowh), C_BORDER);   /* under the rows, so a fold bar covers it */
+    for (int r = 0; r < nrows; r++) {
+        const DiffView::VRow &vr = v.vrows[(size_t)(v.top + r)];
+        float y = body_y + (float)(r * E.rowh);
+        if (vr.sub == 3) {   /* a folded stretch of unchanged lines */
+            bool hv = hovered(H_DIFFFOLD, (int)(v.top + r));
+            r_rect(E.r, ex, y, ew, (float)E.rowh, hv ? C_SELROW : C_DIFF_FOLD);
+            std::string t = sfmt("%d unchanged lines hidden", vr.n);
+            float tw = text_width(E.ui, t.c_str());
+            float cx0 = ex + (ew - tw) / 2;
+            draw_icon(IC_CHEV_R, cx0 - (float)S(20), y + ((float)E.rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+            draw_text(E.ui, cx0, ui_base(y, (float)E.rowh), t.c_str(), C_UI_DIM, tw + 2);
+            hit(ex, y, ew, (float)E.rowh, H_DIFFFOLD, (int)(v.top + r));
+            continue;
+        }
+        const DiffRow &row = m.rows[(size_t)vr.row];
+        bool changed = row.kind != DK_SAME;
+        const std::string *ta = row.a >= 0 ? &m.a[(size_t)row.a] : nullptr, *tb = row.b >= 0 ? &m.b[(size_t)row.b] : nullptr;
+        bool cur = changed && v.cur_change >= 0 && row.hunk == v.cur_change;
+        if (v.vinline) {
+            bool del = vr.sub == 1, add = vr.sub == 2;
+            const std::string *t = del ? ta : add ? tb : tb;
+            int ln = del ? row.a : row.b;
+            uint32_t bg = del ? C_DIFF_DEL : add ? C_DIFF_ADD : 0;
+            if (bg) r_rect(E.r, ex, y, ew, (float)E.rowh, bg);
+            if (row.kind == DK_MOD) { if (del) range_rect(itx, *ta, row.ia0, row.ia1, C_DIFF_DEL_TXT, y); else range_rect(itx, *tb, row.ib0, row.ib1, C_DIFF_ADD_TXT, y); }
+            if (cur) r_rect(E.r, ex, y, (float)S(2), (float)E.rowh, C_ACCENT);
+            number(ex, vr.sub == 0 ? row.a : del ? row.a : -1, C_GUTTER, y);
+            number(ex + numw, vr.sub == 0 ? row.b : add ? row.b : -1, C_GUTTER, y);
+            if (del || add) draw_text(E.font, ex + 2 * numw - (float)S(16), y + (float)E.rowasc, del ? "-" : "+", del ? C_GUT_DEL : C_GUT_ADD, (float)S(16));
+            r_clip(E.r, (int)itx, (int)y, (int)(ex + ew - itx), E.rowh);
+            if (t) emit_code(itx, y, *t, v.left, cols, v.lang, del ? v.sa[(size_t)ln] : v.sb[(size_t)ln]);
+            r_clip_off(E.r);
+            continue;
+        }
+        /* side by side: left column (old), divider, right column (new) */
+        uint32_t bga = row.kind == DK_MOD || row.kind == DK_DEL ? C_DIFF_DEL : 0, bgb = row.kind == DK_MOD || row.kind == DK_ADD ? C_DIFF_ADD : 0;
+        if (bga) r_rect(E.r, ex, y, half, (float)E.rowh, bga);
+        if (bgb) r_rect(E.r, ex + half + 1, y, half, (float)E.rowh, bgb);
+        if (!ta) hatch(ex, half, y);
+        if (!tb) hatch(ex + half + 1, half, y);
+        if (row.kind == DK_MOD) { range_rect(tx_a, *ta, row.ia0, row.ia1, C_DIFF_DEL_TXT, y); range_rect(tx_b, *tb, row.ib0, row.ib1, C_DIFF_ADD_TXT, y); }
+        if (cur) { r_rect(E.r, ex, y, (float)S(2), (float)E.rowh, C_ACCENT); r_rect(E.r, ex + half + 1, y, (float)S(2), (float)E.rowh, C_ACCENT); }
+        number(ex, row.a, C_GUTTER, y);
+        number(ex + half + 1, row.b, C_GUTTER, y);
+        r_clip(E.r, (int)tx_a, (int)y, (int)(ex + half - tx_a), E.rowh);
+        if (ta) emit_code(tx_a, y, *ta, v.left, cols, v.lang, v.sa[(size_t)row.a]);
+        r_clip_off(E.r);
+        r_clip(E.r, (int)tx_b, (int)y, (int)(ex + ew - tx_b), E.rowh);
+        if (tb) emit_code(tx_b, y, *tb, v.left, cols, v.lang, v.sb[(size_t)row.b]);
+        r_clip_off(E.r);
+    }
+
+    /* scrollbar with the changes marked on the track, like VS Code's overview ruler */
+    {
+        float track_h = (float)(rows * E.rowh), sx = (float)(E.W - S(10));
+        long total = (long)v.vrows.size();
+        if (total > rows) {
+            float th = std::max((float)S(24), track_h * (float)rows / (float)total), ty = body_y + (track_h - th) * (float)v.top / (float)std::max<long>(1, total - rows);
+            for (size_t k = 0; k < v.change_v.size(); k++) {
+                if (v.change_v[k] < 0) continue;
+                const DiffHunk &h = m.hunks[k];
+                uint32_t col = h.an == 0 ? C_GUT_ADD : h.bn == 0 ? C_GUT_DEL : C_GUT_MOD;
+                r_rect(E.r, sx, body_y + track_h * (float)v.change_v[k] / (float)total, (float)S(8), std::max(2.f, E.scale * 2), col);
+            }
+            r_rect(E.r, sx + (float)S(2), ty, (float)S(6), th, ui_mix(C_EDITOR, C_FG, 0.20));
+        }
+    }
+}
+
+bool diff_key(const SDL_KeyboardEvent &k, bool ctrl, bool shift) {   /* keys in a diff tab; true when consumed */
+    DiffView &v = *D().dv;
+    Layout L = layout();
+    int page = std::max(1, diff_rows_visible(L) - 2);
+    SDL_Keycode sym = k.keysym.sym;
+    bool alt = k.keysym.mod & KMOD_ALT;
+    if (ctrl || alt) {
+        if (sym == SDLK_SLASH || sym == SDLK_RIGHTBRACKET || sym == SDLK_LEFTBRACKET || sym == SDLK_d || sym == SDLK_l || sym == SDLK_k || sym == SDLK_RETURN || sym == SDLK_BACKSPACE || sym == SDLK_DELETE) return !(alt && !ctrl && false);
+        if (ctrl && sym == SDLK_HOME) { v.top = 0; touch(); return true; }
+        if (ctrl && sym == SDLK_END) { v.top = (long)v.vrows.size(); diff_clamp(v, L); touch(); return true; }
+        return false;
+    }
+    switch (sym) {
+    case SDLK_UP: v.top -= 1; break;
+    case SDLK_DOWN: v.top += 1; break;
+    case SDLK_PAGEUP: v.top -= page; break;
+    case SDLK_PAGEDOWN: v.top += page; break;
+    case SDLK_HOME: v.top = 0; break;
+    case SDLK_END: v.top = (long)v.vrows.size(); break;
+    case SDLK_LEFT: v.left = std::max(0, v.left - 4); break;
+    case SDLK_RIGHT: v.left += 4; break;
+    case SDLK_F7: diff_step(v, shift ? -1 : 1, L); touch(); return true;
+    case SDLK_i: v.mode = v.vinline ? 1 : 2; v.vdirty = true; break;
+    case SDLK_e: v.all_open = !v.all_open; v.vdirty = true; break;
+    case SDLK_o: case SDLK_RETURN: case SDLK_KP_ENTER: {
+        std::string p = v.root + "/" + v.path;
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) open_path(p); else E.status_msg = "the file is not on disk any more";
+        touch();
+        return true;
+    }
+    case SDLK_BACKSPACE: case SDLK_DELETE: case SDLK_TAB: return true;
+    default: return false;
+    }
+    diff_clamp(v, L);
+    touch();
+    return true;
 }
 
 /* ---- the frame ---- */
@@ -1409,6 +2152,8 @@ void build_frame() {
         float w = text_width(E.big, name);
         draw_text(E.big, cxm - w / 2, y0 + (float)ls + gap1 + nameh - (float)S(8), name, wm, (float)E.W);
         draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, y0 + (float)ls + gap1 + nameh + gap2 + (float)S(13), hint, C_UI_FAINT, ew);
+    } else if (d.dv) {
+        draw_diff(L, ex, ew);
     } else {
         /* the faint band behind the cursor line also covers the gutter */
         if (cl >= d.top && cl < d.top + (size_t)L.rows) r_rect(E.r, (float)L.ed_x, (float)(L.text_y + (long)(cl - d.top) * E.rowh), (float)(L.text_x - L.ed_x), (float)E.rowh, C_CURLINE);
@@ -1515,6 +2260,40 @@ void build_frame() {
             float x = (float)L.ed_x + (colw - (float)(strlen(num) * (size_t)E.cw)) / 2;   /* centered, so 1, 42 and 1337 share one axis */
             draw_text(E.font, x, (float)(L.text_y + row * E.rowh + E.rowasc), num, line == cl ? C_GUTTER_CUR : C_GUTTER, (float)E.W);
         }
+        if (GutterCache *gc = gutter_for(d)) {   /* change bars: green added, blue changed, a red wedge where lines were removed */
+            const std::vector<DiffHunk> &hs = gc->hunks;
+            size_t lo = 0, hi = hs.size();
+            while (lo < hi) { size_t mid = (lo + hi) / 2; if (hs[mid].b0 + std::max(hs[mid].bn, 1) <= (int)d.top) lo = mid + 1; else hi = mid; }
+            float bx = (float)(L.text_x - S(9)), bw = (float)S(3);
+            for (size_t k = lo; k < hs.size() && hs[k].b0 <= (int)(d.top + (size_t)L.rows); k++) {
+                const DiffHunk &h = hs[k];
+                if (h.bn > 0) {
+                    long r0 = std::max<long>(h.b0, (long)d.top), r1 = std::min<long>(h.b0 + h.bn, (long)(d.top + (size_t)L.rows));
+                    if (r1 > r0) {
+                        float y0 = (float)(L.text_y + (r0 - (long)d.top) * E.rowh);
+                        r_rect(E.r, bx, y0, bw, (float)((r1 - r0) * E.rowh), h.an == 0 ? C_GUT_ADD : C_GUT_MOD);
+                        hit((float)(L.text_x - S(14)), y0, (float)S(14), (float)((r1 - r0) * E.rowh), H_GUTTER, h.b0);
+                    }
+                } else {
+                    long row = (long)h.b0 - (long)d.top;
+                    if (row >= 0 && row <= L.rows) {
+                        float y0 = (float)(L.text_y + row * E.rowh);
+                        draw_icon(IC_TRI_R, bx - (float)S(1), y0 - (float)S(5), S(10), C_GUT_DEL);
+                        hit((float)(L.text_x - S(14)), y0 - (float)S(6), (float)S(14), (float)S(12), H_GUTTER, h.b0);
+                    }
+                }
+            }
+        }
+        if (E.g.blame_inline && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows && !d.has_sel()) {
+            if (const GitBlame *bl = blame_for(d, cl)) {
+                d.buf.line_text(cl, t);
+                int c0 = col_of(t, t.size()) - d.left + 4;
+                if (c0 >= 0 && c0 < L.cols) {
+                    std::string bt = blame_text(*bl);
+                    draw_text(E.ui, (float)(L.text_x + c0 * E.cw), (float)(L.text_y + (long)(cl - d.top) * E.rowh + E.rowasc), bt.c_str(), ui_mix(C_EDITOR, C_FG, 0.34), (float)(E.W - L.text_x - c0 * E.cw - S(16)));
+                }
+            }
+        }
         if (E.blink_on && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows) {
             d.buf.line_text(cl, t);
             int c = col_of(t, cb) - d.left;
@@ -1536,6 +2315,7 @@ void build_frame() {
         d.buf.line_text(cl, t);
         std::string items[5] = {lang_name(d.lang), d.eol, "UTF-8", d.indent, sfmt("Ln %zu, Col %d", cl + 1, col_of(t, cb) + 1)};
         if (d.has_sel()) items[4] += sfmt(" (%zu selected)", d.sel_hi() - d.sel_lo());
+        if (d.dv) { items[4] = d.dv->m.hunks.empty() ? "no changes" : sfmt("%zu change%s", d.dv->m.hunks.size(), d.dv->m.hunks.size() == 1 ? "" : "s"); items[1] = "diff"; items[3] = d.dv->vinline ? "inline" : "side by side"; }
         for (int i = 0; i < 5; i++) {
             float w = text_width(E.ui, items[(size_t)i].c_str());
             float x = rx - w;
@@ -1551,6 +2331,16 @@ void build_frame() {
             float pen = draw_text(E.ui, lx + (float)S(18), sy, E.git.branch.c_str(), C_UI_DIM, (float)S(160));
             hit(lx, by0, pen - lx, bh, H_ACT, A_VIEW_GIT);
             lx = pen + (float)S(18);
+        }
+        if (const GitBlame *bl = blame_for(d, cl)) {
+            std::string bt = blame_text(*bl);
+            float bw2 = std::min(text_width(E.ui, bt.c_str()), std::max(0.f, rx - lx - (float)S(200)));
+            if (bw2 > (float)S(60)) {
+                if (hovered(H_BLAME, 0)) r_rect(E.r, lx - (float)S(6), by0 + 1, bw2 + (float)S(12), bh - 1, C_HOVER);
+                draw_text(E.ui, lx, sy, bt.c_str(), C_UI_DIM, bw2 + 2);
+                hit(lx - (float)S(6), by0, bw2 + (float)S(12), bh, H_BLAME, 0);
+                lx += bw2 + (float)S(18);
+            }
         }
         std::string last = E.ops.empty() ? std::string() : E.ops.back().name + "  " + fmt_ms(E.ops.back().ms);
         std::string left = E.status_msg.empty() ? (last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
@@ -2291,6 +3081,24 @@ void apply_theme(const UiTheme *t) {
     C_OCC = ui_mix(tbg, accent, 0.24); C_BRACKET = ui_mix(tbg, accent, 0.50);
     C_SB_THUMB = ui_mix(tbg, tfg, 0.20); C_SB_HOT = ui_mix(tbg, tfg, 0.38);
     C_SEL = ui_mix(tbg, accent, 0.38); C_BOX = ui_mix(bg1, bg0, 0.55); C_BOX_LINE = ui_mix(bg1, ink, 0.22);
+    {   /* VS Code's own colours (git extension manifest, Dark/Light Modern, diff editor registry); dark or light by the editor background */
+        double lum = (0.299 * (tbg & 255) + 0.587 * ((tbg >> 8) & 255) + 0.114 * ((tbg >> 16) & 255)) / 255.0;
+        bool light = lum > 0.5;
+        C_GIT_ADD = light ? RGBA(0x58, 0x7c, 0x0c, 255) : RGBA(0x81, 0xb8, 0x8b, 255);
+        C_GIT_MOD = light ? RGBA(0x89, 0x55, 0x03, 255) : RGBA(0xe2, 0xc0, 0x8d, 255);
+        C_GIT_DEL = light ? RGBA(0xad, 0x07, 0x07, 255) : RGBA(0xc7, 0x4e, 0x39, 255);
+        C_GIT_UNT = light ? RGBA(0x00, 0x71, 0x00, 255) : RGBA(0x73, 0xc9, 0x91, 255);
+        C_GIT_CONF = light ? RGBA(0xad, 0x07, 0x07, 255) : RGBA(0xe4, 0x67, 0x6b, 255);
+        C_GUT_ADD = RGBA(0x2e, 0xa0, 0x43, 255);
+        C_GUT_MOD = light ? RGBA(0x00, 0x5f, 0xb8, 255) : RGBA(0x00, 0x78, 0xd4, 255);
+        C_GUT_DEL = RGBA(0xf8, 0x51, 0x49, 255);
+        C_DIFF_ADD = ui_mix(tbg, RGBA(155, 185, 85, 255), light ? 0.30 : 0.20);        /* diffEditor.insertedLineBackground */
+        C_DIFF_ADD_TXT = ui_mix(tbg, RGBA(156, 204, 44, 255), light ? 0.42 : 0.34);    /* diffEditor.insertedTextBackground, over the line colour */
+        C_DIFF_DEL = ui_mix(tbg, RGBA(255, 0, 0, 255), light ? 0.16 : 0.20);           /* diffEditor.removedLineBackground */
+        C_DIFF_DEL_TXT = ui_mix(tbg, RGBA(255, 0, 0, 255), light ? 0.30 : 0.38);
+        C_DIFF_FILL = ui_mix(tbg, tfg, 0.14);                                          /* diffEditor.diagonalFill */
+        C_DIFF_FOLD = ui_mix(bg1, tbg, 0.5);
+    }
     C_RED = ui_rgba(t->red, 255); C_GREEN = ui_rgba(t->up, 255); C_ORANGE = ui_rgba(t->ansi[3], 255);
     unsigned r = accent & 255, g = (accent >> 8) & 255, b = (accent >> 16) & 255;
     C_ON_ACCENT = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0 > 0.47 ? RGBA(16, 18, 20, 255) : RGBA(255, 255, 255, 255);
@@ -2598,6 +3406,7 @@ void search_step(int dir) {   /* Up/Down in the results list: next or previous m
 }
 
 void do_action(int act) {
+    if (D().dv && (act == A_CUT || act == A_PASTE || act == A_UNDO || act == A_REDO || act == A_SAVE || act == A_SAVEAS)) { E.status_msg = "diff tabs are read only"; redraw(); return; }
     Doc &d = D();
     if (act > A_NONE && act < A_COUNT) begin_op(ACT_LABEL[act]);
     switch (act) {
@@ -2743,6 +3552,18 @@ void key_down(const SDL_KeyboardEvent &k) {
         touch();
         return;
     }
+    if (E.mode == M_GITMSG) {
+        if (sym == SDLK_ESCAPE) E.mode = M_EDIT;
+        else if (sym == SDLK_BACKSPACE) pop_utf8(E.g.msg);
+        else if ((sym == SDLK_RETURN || sym == SDLK_KP_ENTER) && ctrl) { E.mode = M_EDIT; git_commit_now(); }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) E.g.msg += '\n';
+        else if (sym == SDLK_v && ctrl) { char *t = SDL_GetClipboardText(); if (t) { E.g.msg += t; SDL_free(t); } }
+        else if (sym == SDLK_u && ctrl) E.g.msg.clear();
+        else return;
+        E.g.err.clear();
+        touch();
+        return;
+    }
     if (E.mode == M_QUICK) {
         int n = (int)E.quick_hits.size();
         if (sym == SDLK_ESCAPE) E.mode = M_EDIT;
@@ -2850,6 +3671,7 @@ void key_down(const SDL_KeyboardEvent &k) {
         touch();
         return;
     }
+    if (d.dv && diff_key(k, ctrl, shift)) return;
     if (ctrl && !alt && (sym == SDLK_LEFT || sym == SDLK_RIGHT)) { d.break_group(); d.move_to(sym == SDLK_LEFT ? word_left(d, d.cur) : word_right(d, d.cur), shift, false); E.follow = true; touch(); return; }
     if (ctrl && !shift && (sym == SDLK_BACKSPACE || sym == SDLK_DELETE)) {
         if (!d.has_sel()) { size_t o = sym == SDLK_BACKSPACE ? word_left(d, d.cur) : word_right(d, d.cur); d.anchor = o; }
@@ -2935,13 +3757,101 @@ void click_hit(const Hit &h) {
     }
     case H_ACTIVITY: show_view((View)h.id); break;
     case H_PIN: do_action(A_PIN); break;
-    case H_GITROW:
-        if ((size_t)h.id < E.git.changes.size()) {
-            GitChange c = E.git.changes[(size_t)h.id];
-            if (!E.pinned) open_side(false);
-            if (SDL_GetModState() & KMOD_CTRL) open_path(E.git.root + "/" + c.path); else open_diff(c);
-        }
+    case H_GITROW: case H_GITOPEN: case H_GITSTG: {
+        size_t idx = (size_t)(h.id / 2);
+        bool staged = (h.id & 1) != 0;
+        if (idx >= E.git.changes.size()) break;
+        GitChange c = E.git.changes[idx];
+        E.mode = M_EDIT;
+        if (h.kind == H_GITSTG) { begin_op(staged ? "git unstage" : "git stage"); git_do(staged ? git_unstage(E.git.root, c.path) : git_stage(E.git.root, c.path), staged ? "unstage" : "stage"); break; }
+        if (!E.pinned) open_side(false);
+        if (h.kind == H_GITOPEN || (SDL_GetModState() & KMOD_CTRL)) open_path(E.git.root + "/" + c.path); else open_change_diff(c, staged);
         break;
+    }
+    case H_GITSEC: {
+        bool *f[4] = {&E.g.open_staged, &E.g.open_changes, &E.g.open_graph, &E.g.open_tl};
+        if (h.id >= 0 && h.id < 4) *f[h.id] = !*f[h.id];
+        break;
+    }
+    case H_BLAME: {
+        Doc &d = D();
+        const GitBlame *bl = blame_for(d, d.buf.line_of(d.cur));
+        if (bl) { GitBlame b = *bl; open_blame_commit(b, rel_to_root(d.path)); }
+        break;
+    }
+    case H_GUTTER: {   /* a click on a change bar opens the working-tree diff of the file at that change */
+        Doc &d = D();
+        std::string rel = rel_to_root(d.path);
+        if (rel.empty()) break;
+        Doc &nd = open_diff_spec(rel, ":", "WORK", "Index", "Working Tree", base_name(rel) + " (Working Tree)", "Unstaged changes: the index against the file on disk");
+        if (nd.dv) { DiffView &v = *nd.dv; for (size_t k = 0; k < v.m.hunks.size(); k++) if (v.m.hunks[k].b0 + std::max(v.m.hunks[k].bn, 1) > h.id) { v.cur_change = (int)k; break; } v.top = -1; }   /* top = -1: scroll to cur_change when drawn */
+        break;
+    }
+    case H_DIFFFOLD: {
+        Doc &d = D();
+        if (!d.dv || (size_t)h.id >= d.dv->vrows.size()) break;
+        d.dv->open_folds.push_back(d.dv->vrows[(size_t)h.id].row);
+        d.dv->vdirty = true;
+        break;
+    }
+    case H_DIFFBTN: {
+        Doc &d = D();
+        if (!d.dv) break;
+        DiffView &v = *d.dv;
+        Layout L = layout();
+        if (h.id == 0) diff_step(v, -1, L);
+        else if (h.id == 1) diff_step(v, 1, L);
+        else if (h.id == 2) { v.mode = v.vinline ? 1 : 2; v.vdirty = true; }
+        else if (h.id == 3) { std::string p = v.root + "/" + v.path; struct stat st; if (stat(p.c_str(), &st) == 0) open_path(p); else E.status_msg = "the file is not on disk any more"; }
+        break;
+    }
+    case H_GITREFRESH: begin_op("git refresh"); git_refresh(); break;
+    case H_GITALL: {
+        begin_op(h.id == 0 ? "git stage all" : "git unstage all");
+        git_do(h.id == 0 ? git_stage_all(E.git.root) : git_unstage(E.git.root, "."), h.id == 0 ? "stage all" : "unstage all");
+        break;
+    }
+    case H_GITMSG: E.mode = M_GITMSG; break;
+    case H_GITCOMMIT: E.mode = M_EDIT; git_commit_now(); break;
+    case H_GITLOG: {
+        GitUi &g = E.g;
+        if ((size_t)h.id >= g.log.size()) break;
+        const GitCommit &c = g.log[(size_t)h.id];
+        Uint16 mod = SDL_GetModState();
+        E.mode = M_EDIT;
+        if (mod & KMOD_CTRL) { g.mark_hash = c.hash; g.mark_label = c.hash.substr(0, 7); break; }
+        if ((mod & KMOD_SHIFT) && !g.mark_hash.empty() && g.mark_hash != c.hash) {   /* the marked commit is the left side, this one the right */
+            g.log_sel = h.id; g.cmp_a = g.mark_hash; g.cmp_b = c.hash;
+            g.sel_files = git_compare_files(E.git.root, g.cmp_a, g.cmp_b);
+            break;
+        }
+        if (g.log_sel == h.id) { g.log_sel = -1; g.sel_files.clear(); g.cmp_a.clear(); g.cmp_b.clear(); break; }
+        g.log_sel = h.id; g.cmp_a.clear(); g.cmp_b.clear();
+        g.sel_files = git_commit_files(E.git.root, c.hash);
+        break;
+    }
+    case H_GITCFILE: {
+        GitUi &g = E.g;
+        if (g.log_sel < 0 || (size_t)g.log_sel >= g.log.size() || (size_t)h.id >= g.sel_files.size()) break;
+        E.mode = M_EDIT;
+        if (!E.pinned) open_side(false);
+        const GitFile &f = g.sel_files[(size_t)h.id];
+        if (!g.cmp_a.empty()) open_compare_diff(f.path, g.cmp_a, g.cmp_b);
+        else open_commit_diff(g.log[(size_t)g.log_sel], f);
+        break;
+    }
+    case H_GITTL: {
+        GitUi &g = E.g;
+        if ((size_t)h.id >= g.tl.size()) break;
+        const GitCommit &c = g.tl[(size_t)h.id];
+        Uint16 mod = SDL_GetModState();
+        E.mode = M_EDIT;
+        if (mod & KMOD_CTRL) { g.mark_hash = c.hash; g.mark_label = c.hash.substr(0, 7); break; }
+        if (!E.pinned) open_side(false);
+        if ((mod & KMOD_SHIFT) && !g.mark_hash.empty() && g.mark_hash != c.hash) open_compare_diff(g.tl_path, g.mark_hash, c.hash);
+        else open_commit_diff(c, GitFile{'M', g.tl_path});
+        break;
+    }
     case H_SIDEBOX: E.mode = M_SIDE; if (E.view == V_GIT) E.view = V_EXPLORER; if (E.view == V_EXPLORER && !E.side_q.empty()) side_filter_update(); break;
     case H_SRES: open_hit(h.id); break;
     case H_SIDEHIT:
@@ -2981,6 +3891,7 @@ void text_input(const char *s) {
         if (!(SDL_GetModState() & (KMOD_CTRL | KMOD_ALT))) { begin_op("terminal key"); tcore_text(cur_term()->core, s); touch(); }
         return;
     }
+    if (E.mode == M_EDIT && D().dv) return;   /* diff tabs are read only */
     if (E.mode == M_EDIT) begin_op("keystroke");
     else if (E.mode == M_QUICK) begin_op("quick-open filter", std::to_string(E.quick_files.size()) + " files");
     else if (E.mode == M_SIDE && E.view == V_EXPLORER) begin_op("file filter", std::to_string(E.quick_files.size()) + " files");
@@ -3001,6 +3912,7 @@ void text_input(const char *s) {
         touch();
         return;
     }
+    if (E.mode == M_GITMSG) { E.g.msg += s; E.g.err.clear(); touch(); return; }
     if (E.mode == M_PROMPT) { E.prompt_q += s; touch(); return; }
     if (E.mode == M_PICK) { E.pick_filter += s; E.pick_sel = 0; touch(); return; }
     if (E.mode == M_QUICK) { E.quick_q += s; E.quick_sel = 0; quick_update(); touch(); return; }
@@ -3077,6 +3989,13 @@ void handle_event(const SDL_Event &e) {
             break;
         }
         Doc &d = D();
+        if (d.dv) {
+            d.dv->top -= (long)e.wheel.y * 3;
+            if (e.wheel.x) d.dv->left = std::max(0, d.dv->left + e.wheel.x * 4);
+            diff_clamp(*d.dv, L);
+            redraw();
+            break;
+        }
         long nt = (long)d.top - (long)e.wheel.y * 3;
         d.top = nt < 0 ? 0 : std::min((size_t)nt, d.buf.lines() - 1);
         if (e.wheel.x) d.left = std::max(0, d.left + e.wheel.x * 4);
@@ -3107,7 +4026,7 @@ void handle_event(const SDL_Event &e) {
                     Hit c = h; click_hit(c); return;
                 }
             }
-            bool was_overlay = E.mode == M_PICK || E.mode == M_FIND || E.mode == M_MENU || E.mode == M_QUICK || E.mode == M_SIDE;
+            bool was_overlay = E.mode == M_PICK || E.mode == M_FIND || E.mode == M_MENU || E.mode == M_QUICK || E.mode == M_SIDE || E.mode == M_GITMSG;
             if (was_overlay) { E.mode = M_EDIT; E.menu_open = -1; }
             if (E.mode != M_EDIT) return;
             if (E.side_open && !E.pinned) open_side(false);
@@ -3183,7 +4102,12 @@ void handle_event(const SDL_Event &e) {
         break;
     case SDL_WINDOWEVENT:
         if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESIZED) { SDL_GL_GetDrawableSize(E.win, &E.W, &E.H); redraw(); }
-        else if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) { E.focused = true; touch(); }
+        else if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+            E.focused = true;
+            static double last_git = 0;
+            if (E.git.repo && now_s() - last_git > 1.5) { last_git = now_s(); git_refresh(); }   /* the files may have changed in another program */
+            touch();
+        }
         else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) { E.focused = false; E.blink_on = true; redraw(); }
         else if (e.window.event == SDL_WINDOWEVENT_LEAVE) { E.mx = E.my = -1; if (!E.pinned && E.side_open) E.side_close_at = E.now + 0.35; update_hover(); }
         else if (e.window.event == SDL_WINDOWEVENT_EXPOSED) redraw();
@@ -3236,6 +4160,10 @@ void run_script(const char *script) {
         if (step.compare(0, 5, "open:") == 0) { open_path(step.substr(5)); frame_if_timed(); continue; }
         if (step.compare(0, 5, "text:") == 0) { text_input(step.c_str() + 5); frame_if_timed(); continue; }
         if (step.compare(0, 5, "menu:") == 0) { open_menu(atoi(step.c_str() + 5)); frame_if_timed(); continue; }
+        if (step.compare(0, 4, "mod:") == 0) {   /* mod:ctrl, mod:shift or mod:none holds a modifier for the following clicks (test hook) */
+            SDL_SetModState(step == "mod:ctrl" ? KMOD_LCTRL : step == "mod:shift" ? KMOD_LSHIFT : KMOD_NONE);
+            continue;
+        }
         if (step.compare(0, 6, "wheel:") == 0) {   /* wheel:x,y,dy over a point (test hook) */
             int x = 0, y = 0, dy = 0;
             sscanf(step.c_str() + 6, "%d,%d,%d", &x, &y, &dy);

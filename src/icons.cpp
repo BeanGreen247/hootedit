@@ -22,6 +22,8 @@ bool ring(float x, float y, float cx, float cy, float r, float t) { float d = sq
 bool box(float x, float y, float x0, float y0, float x1, float y1) { return x >= x0 && x <= x1 && y >= y0 && y <= y1; }
 bool box_out(float x, float y, float x0, float y0, float x1, float y1, float t) { return box(x, y, x0, y0, x1, y1) && !box(x, y, x0 + t, y0 + t, x1 - t, y1 - t); }
 
+bool in_poly(float x, float y, const float (*p)[2], int n);
+
 bool inside(Icon ic, float x, float y) {
     switch (ic) {
     case IC_EXPLORER:   /* two sheets */
@@ -51,6 +53,20 @@ bool inside(Icon ic, float x, float y) {
     case IC_FOLDER: return box_out(x, y, 1.5f, 5.6f, 14.5f, 13.6f, 1.2f) || box_out(x, y, 1.5f, 3.2f, 6.6f, 5.8f, 1.2f);
     case IC_ARROW_L: return seg(x, y, 3, 8, 13, 8, 0.75f) || seg(x, y, 3, 8, 7.5f, 3.5f, 0.75f) || seg(x, y, 3, 8, 7.5f, 12.5f, 0.75f);
     case IC_ARROW_R: return seg(x, y, 3, 8, 13, 8, 0.75f) || seg(x, y, 13, 8, 8.5f, 3.5f, 0.75f) || seg(x, y, 13, 8, 8.5f, 12.5f, 0.75f);
+    case IC_CHECK: return seg(x, y, 3, 8.5f, 6.5f, 12, 0.95f) || seg(x, y, 6.5f, 12, 13, 4.5f, 0.95f);
+    case IC_PLUS: return seg(x, y, 3, 8, 13, 8, 0.8f) || seg(x, y, 8, 3, 8, 13, 0.8f);
+    case IC_MINUS: return seg(x, y, 3, 8, 13, 8, 0.8f);
+    case IC_REFRESH: {   /* an open ring with an arrow head at the top right */
+        float dx = x - 8, dy = y - 8, a = atan2f(dy, dx);
+        bool gap = a > -1.35f && a < -0.25f;
+        return (ring(x, y, 8, 8, 4.6f, 1.5f) && !gap) || seg(x, y, 12.9f, 2.4f, 12.9f, 6.2f, 0.8f) || seg(x, y, 12.9f, 6.2f, 9.2f, 6.2f, 0.8f);
+    }
+    case IC_ARROW_U: return seg(x, y, 8, 13, 8, 3, 0.75f) || seg(x, y, 8, 3, 3.8f, 7.2f, 0.75f) || seg(x, y, 8, 3, 12.2f, 7.2f, 0.75f);
+    case IC_ARROW_D: return seg(x, y, 8, 3, 8, 13, 0.75f) || seg(x, y, 8, 13, 3.8f, 8.8f, 0.75f) || seg(x, y, 8, 13, 12.2f, 8.8f, 0.75f);
+    case IC_TRI_R: { const float t[3][2] = {{3, 2}, {13, 8}, {3, 14}}; return in_poly(x, y, t, 3); }
+    case IC_OPEN_FILE:   /* a sheet with a small arrow leaving it */
+        return seg(x, y, 3.5f, 1.5f, 8.5f, 1.5f, 0.7f) || seg(x, y, 3.5f, 1.5f, 3.5f, 14.5f, 0.7f) || seg(x, y, 3.5f, 14.5f, 12.5f, 14.5f, 0.7f) || seg(x, y, 12.5f, 14.5f, 12.5f, 10, 0.7f) ||
+               seg(x, y, 7, 9, 13.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 9.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 13.5f, 6.5f, 0.75f);
     default: return false;
     }
 }
@@ -101,7 +117,17 @@ static std::vector<uint8_t> logo_bitmap(Icon ic, int size) {
     return out;
 }
 
+static std::vector<uint8_t> hatch_bitmap(int size) {   /* diagonal stripes that tile seamlessly: the period divides the tile */
+    int period = size;
+    for (int p = 10; p >= 4; p--) if (size % p == 0) { period = p; break; }
+    std::vector<uint8_t> out((size_t)size * (size_t)size, 0);
+    for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++) out[(size_t)y * (size_t)size + (size_t)x] = (x + y) % period < std::max(1, period / 4) ? 255 : 0;
+    return out;
+}
+
 std::vector<uint8_t> icon_bitmap(Icon ic, int size) {
+    if (ic == IC_HATCH) return hatch_bitmap(size);
     if (ic == IC_LOGO_BODY || ic == IC_LOGO_EYES) return logo_bitmap(ic, size);
     std::vector<uint8_t> out((size_t)size * (size_t)size);
     const int N = 4;
