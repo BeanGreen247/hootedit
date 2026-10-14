@@ -16,6 +16,7 @@ struct RemoteProfile {
     std::string name, proto;      /* proto: ssh, sftp, ftp, ftps, smb */
     std::string host, user, path, key;   /* key: an identity file for ssh and sftp, empty for the defaults */
     int port = 0;                 /* 0 = the protocol's default */
+    bool insecure = false;        /* ftps: accept a self-signed certificate (insecure=1 in remotes.ini) */
 };
 struct RemoteEntry { std::string name; bool dir = false; };
 

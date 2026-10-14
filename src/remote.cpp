@@ -105,18 +105,25 @@ std::string join(const std::string &a, const std::string &b) {
     return a.back() == '/' ? a + b : a + "/" + b;
 }
 
-/* curl config file with the credentials, 0600, removed again by the caller */
-std::string curl_cfg(const RemoteProfile &p, const std::string &pw) {
-    char t[] = "/tmp/hootedit-curl-XXXXXX";
-    int fd = mkstemp(t);
+/* private file for credentials: 0600 in the per-user runtime directory (tmpfs), removed again by the caller */
+std::string secret_file(const std::string &body) {
+    std::string t = ctl_dir() + "/auth-XXXXXX";
+    int fd = mkstemp(&t[0]);
     if (fd < 0) return "";
-    std::string esc = "user = \"";
-    for (char c : p.user + ":" + pw) { if (c == '"' || c == '\\') esc += '\\'; esc += c; }
-    esc += "\"\n";
-    ssize_t w = write(fd, esc.data(), esc.size());
+    ssize_t w = write(fd, body.data(), body.size());
     (void)w;
     close(fd);
     return t;
+}
+
+/* curl config with the credentials; ftps is explicit TLS (AUTH TLS) unless the port is 990 */
+std::string curl_cfg(const RemoteProfile &p, const std::string &pw) {
+    std::string esc = "user = \"";
+    for (char c : p.user + ":" + pw) { if (c == '"' || c == '\\') esc += '\\'; esc += c; }
+    esc += "\"\n";
+    if (p.proto == "ftps") esc += "ssl-reqd\n";
+    if (p.proto == "ftps" && p.insecure) esc += "insecure\n";
+    return secret_file(esc);
 }
 
 std::string url(const RemoteProfile &p, const std::string &path) {
@@ -124,7 +131,7 @@ std::string url(const RemoteProfile &p, const std::string &path) {
     if (pt.empty() || pt[0] != '/') pt = "/" + pt;
     std::string enc;
     for (unsigned char c : pt) { if (isalnum(c) || strchr("/-_.~", c)) enc += (char)c; else { char b[4]; snprintf(b, sizeof b, "%%%02X", c); enc += b; } }
-    return p.proto + "://" + p.host + (p.port ? ":" + std::to_string(p.port) : "") + enc;
+    return std::string(p.proto == "ftps" && p.port == 990 ? "ftps" : "ftp") + "://" + p.host + (p.port ? ":" + std::to_string(p.port) : "") + enc;
 }
 
 /* smb: the first path component is the share */
@@ -138,9 +145,11 @@ bool smb_split(const std::string &path, std::string *share, std::string *rest) {
     return true;
 }
 
-std::string smb_cmd(const RemoteProfile &p, const std::string &pw, const std::string &share, const std::string &cmds) {
-    std::string c = "SMB_PW=" + q(pw) + "; export PASSWD=\"$SMB_PW\"; smbclient " + q("//" + p.host + "/" + share) + " -U " + q(p.user.empty() ? "guest" : p.user) + (p.port ? " -p " + std::to_string(p.port) : "") + (pw.empty() ? " -N" : "") + " -c " + q(cmds);
-    return c;
+/* the credentials go in a private auth file (smbclient -A), never on a command line; the caller removes it */
+std::string smb_auth(const RemoteProfile &p, const std::string &pw) { return pw.empty() ? std::string() : secret_file("username = " + (p.user.empty() ? std::string("guest") : p.user) + "\npassword = " + pw + "\n"); }
+
+std::string smb_cmd(const RemoteProfile &p, const std::string &auth, const std::string &share, const std::string &cmds) {
+    return "smbclient " + q("//" + p.host + "/" + share) + (auth.empty() ? " -N" : " -A " + q(auth)) + (p.port ? " -p " + std::to_string(p.port) : "") + " -c " + q(cmds) + "; rc=$?; " + (auth.empty() ? "" : "rm -f " + q(auth) + "; ") + "exit $rc";
 }
 
 }  // namespace
@@ -160,7 +169,7 @@ std::vector<RemoteProfile> remote_load() {
         if (v.empty()) continue;
         RemoteProfile &p = v.back();
         if (k == "name") p.name = val; else if (k == "proto") p.proto = val; else if (k == "host") p.host = val;
-        else if (k == "user") p.user = val; else if (k == "path") p.path = val; else if (k == "key") p.key = val; else if (k == "port") p.port = atoi(val.c_str());
+        else if (k == "user") p.user = val; else if (k == "path") p.path = val; else if (k == "key") p.key = val; else if (k == "port") p.port = atoi(val.c_str()); else if (k == "insecure") p.insecure = val == "1";
     }
     fclose(f);
     return v;
@@ -169,7 +178,7 @@ std::vector<RemoteProfile> remote_load() {
 void remote_save(const std::vector<RemoteProfile> &v) {
     FILE *f = fopen((config_dir() + "/remotes.ini").c_str(), "w");
     if (!f) return;
-    for (const RemoteProfile &p : v) fprintf(f, "name=%s\nproto=%s\nhost=%s\nuser=%s\npath=%s\nport=%d\nkey=%s\n", p.name.c_str(), p.proto.c_str(), p.host.c_str(), p.user.c_str(), p.path.c_str(), p.port, p.key.c_str());   /* no passwords are ever stored */
+    for (const RemoteProfile &p : v) fprintf(f, "name=%s\nproto=%s\nhost=%s\nuser=%s\npath=%s\nport=%d\nkey=%s\ninsecure=%d\n", p.name.c_str(), p.proto.c_str(), p.host.c_str(), p.user.c_str(), p.path.c_str(), p.port, p.key.c_str(), p.insecure ? 1 : 0);   /* no passwords are ever stored */
     fclose(f);
 }
 
@@ -228,7 +237,8 @@ int remote_list(const RemoteProfile &p, const std::string &pw, const std::string
     } else if (p.proto == "smb") {
         std::string share, rest;
         if (!smb_split(dir, &share, &rest)) {
-            c = run("PASSWD=" + q(pw) + " smbclient -L " + q("//" + p.host) + " -U " + q(p.user.empty() ? "guest" : p.user) + (pw.empty() ? " -N" : "") + " -g", &o);
+            std::string auth = smb_auth(p, pw);
+            c = run("smbclient -L " + q("//" + p.host) + (auth.empty() ? " -N" : " -A " + q(auth)) + (p.port ? " -p " + std::to_string(p.port) : "") + " -g; rc=$?; " + (auth.empty() ? "" : "rm -f " + q(auth) + "; ") + "exit $rc", &o);
             if (c == 0) {
                 size_t pos = 0;
                 while (pos < o.size()) {
@@ -240,7 +250,7 @@ int remote_list(const RemoteProfile &p, const std::string &pw, const std::string
                 }
             }
         } else {
-            c = run(smb_cmd(p, pw, share, "ls \"" + (rest.empty() ? "" : rest + "/") + "*\""), &o);
+            c = run(smb_cmd(p, smb_auth(p, pw), share, "ls \"" + (rest.empty() ? "" : rest + "/") + "*\""), &o);
             if (c == 0) {
                 size_t pos = 0;
                 while (pos < o.size()) {   /* "  name      D  0  Tue Oct 14 12:00:00 2026" */
@@ -282,7 +292,7 @@ int remote_get(const RemoteProfile &p, const std::string &pw, const std::string 
     else if (p.proto == "smb") {
         std::string share, rest;
         if (!smb_split(remote, &share, &rest)) return -1;
-        c = run(smb_cmd(p, pw, share, "get " + q(rest) + " " + q(local)), &o);
+        c = run(smb_cmd(p, smb_auth(p, pw), share, "get " + q(rest) + " " + q(local)), &o);
     } else {
         std::string cfg = curl_cfg(p, pw);
         c = run("curl -sS --connect-timeout 12 --max-time 120 -K " + q(cfg) + " -o " + q(local) + " " + q(url(p, remote)), &o);
@@ -300,7 +310,7 @@ int remote_put(const RemoteProfile &p, const std::string &pw, const std::string 
     else if (p.proto == "smb") {
         std::string share, rest;
         if (!smb_split(remote, &share, &rest)) return -1;
-        c = run(smb_cmd(p, pw, share, "put " + q(local) + " " + q(rest)), &o);
+        c = run(smb_cmd(p, smb_auth(p, pw), share, "put " + q(local) + " " + q(rest)), &o);
     } else {
         std::string cfg = curl_cfg(p, pw);
         c = run("curl -sS --connect-timeout 12 --max-time 120 -K " + q(cfg) + " -T " + q(local) + " " + q(url(p, remote)), &o);
