@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <map>
 #include <set>
 #include <thread>
 #include <memory>
@@ -28,6 +29,8 @@
 #include <vector>
 
 #include "appicon.h"
+#include "askpass.h"
+#include "remote.h"
 #include "doc.h"
 #include "engine/atlas.h"
 #include "engine/font.h"
@@ -202,13 +205,13 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
 enum Pending { P_NONE, P_CLOSE, P_QUIT };
 enum PromptKind { PK_SAVEAS, PK_OPEN_FILE, PK_OPEN_FOLDER };
-enum View { V_EXPLORER, V_SEARCH, V_GIT };
+enum View { V_EXPLORER, V_SEARCH, V_GIT, V_REMOTE };
 
 struct GitUi {
     std::string msg;                                   /* the commit message being typed */
@@ -232,7 +235,7 @@ struct GitUi {
 /* A VS Code style modal: a message, optional detail, an optional input, and buttons left to right. done gets the button index, or -1 for Esc. */
 struct Dialog {
     std::string title, detail, text, placeholder;
-    bool input = false;
+    bool input = false, mask = false;
     std::vector<std::string> btns;
     int focus = 0;
     std::function<void(int, const std::string &)> done;
@@ -412,6 +415,7 @@ bool splash() { return E.docs.size() == 1 && D().pristine() && !E.blank_tab; }
 Ed::Term *cur_term();
 std::vector<int> fd_view();
 void git_refresh();
+void remote_push_changed();
 void git_ui_reload();
 void git_ui_timeline();
 void diff_reload_all();
@@ -497,7 +501,7 @@ void settings_load() {
         char *v = eq + 1;
         v[strcspn(v, "\r\n")] = 0;
         if (!strcmp(line, "sidebar_pinned")) E.pinned = atoi(v) != 0;
-        else if (!strcmp(line, "sidebar_view")) E.view = !strcmp(v, "git") ? V_GIT : !strcmp(v, "search") ? V_SEARCH : V_EXPLORER;
+        else if (!strcmp(line, "sidebar_view")) E.view = !strcmp(v, "git") ? V_GIT : !strcmp(v, "search") ? V_SEARCH : !strcmp(v, "remote") ? V_REMOTE : V_EXPLORER;
         else if (!strcmp(line, "theme")) E.theme = ui_theme_find(v);
         else if (!strcmp(line, "follow_fleetwm")) E.follow_fleet = atoi(v) != 0;
         else if (!strcmp(line, "terminal")) E.term_choice = v;
@@ -517,7 +521,7 @@ void settings_save() {
     mkdir(dir.c_str(), 0755);
     FILE *f = fopen(p.c_str(), "w");
     if (!f) return;
-    fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
+    fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : E.view == V_REMOTE ? "remote" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
     fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0);
     fclose(f);
 }
@@ -756,6 +760,7 @@ void after_save() {
     if (E.pending == P_CLOSE) { close_confirmed(); }
     else if (E.pending == P_QUIT) { E.pending = P_NONE; remove_doc(E.confirm_idx); request_quit(); }
     if (E.git.repo) git_refresh();
+    remote_push_changed();
     redraw();
 }
 
@@ -784,6 +789,7 @@ void save_active() {
     bool ok = d.save(nullptr);
     E.status_msg = ok ? "saved " + d.path : "SAVE FAILED, buffer kept: " + d.path;
     if (ok && E.git.repo) git_refresh();
+    if (ok) remote_push_changed();
     redraw();
 }
 
@@ -1042,8 +1048,9 @@ std::vector<std::string> wrap_lines(const std::string &t, float w, int style = F
 }
 
 void dlg_show(const std::string &title, const std::string &detail, std::vector<std::string> btns, std::function<void(int, const std::string &)> done,
-              bool input = false, const std::string &text = "", const std::string &ph = "") {
+              bool input = false, const std::string &text = "", const std::string &ph = "", bool mask = false) {
     Dialog &d = E.dlg;
+    d.mask = mask;
     d.title = title; d.detail = detail; d.btns = std::move(btns); d.done = std::move(done);
     d.input = input; d.text = text; d.placeholder = ph; d.focus = 0;
     E.mode = M_DIALOG;
@@ -1191,7 +1198,7 @@ void draw_dialog() {
         r_rect(E.r, px + pad + 1, y + 1, iw - 2, (float)S(28), C_FIELD);
         float pen = px + pad + (float)S(8);
         if (d.text.empty()) draw_text(E.ui, pen, ui_base(y, (float)S(30)), d.placeholder.c_str(), C_UI_FAINT, iw - (float)S(16));
-        else pen = draw_text(E.ui, pen, ui_base(y, (float)S(30)), d.text.c_str(), C_UI, iw - (float)S(16));
+        else { std::string shown = d.mask ? std::string(d.text.size() > 40 ? 40 : d.text.size(), '*') : d.text; pen = draw_text(E.ui, pen, ui_base(y, (float)S(30)), shown.c_str(), C_UI, iw - (float)S(16)); }
         if (E.blink_on) r_rect(E.r, pen + 1, y + (float)S(6), std::max(1.f, E.scale), (float)S(18), C_CURSOR);
         y += (float)S(36);
     }
@@ -1222,6 +1229,8 @@ void draw_dialog() {
 
 void pick_custom(const std::string &title, std::vector<Ed::PItem> items, std::function<void(const Ed::PItem &)> cb);
 void settings_save();
+void open_side(bool open);
+bool new_terminal();
 
 std::string trim_nl(std::string m) {
     while (!m.empty() && (m.back() == '\n' || m.back() == ' ' || m.back() == '\r')) m.pop_back();
@@ -1261,26 +1270,17 @@ bool git_sync_run(const std::string &what, const std::string &args, std::string 
     return c == 0;
 }
 
+void job_start(GitJob &j, const std::string &label, std::function<int(std::string &)> fn, std::function<void(int, const std::string &)> cb);
+
 void git_start(const std::string &label, const std::string &args, std::function<void(int, const std::string &)> cb) {
     if (g_job.running) { E.status_msg = "git is busy: " + g_job.label; redraw(); return; }
-    if (g_job.th.joinable()) g_job.th.join();
-    g_job.running = true; g_job.done = false; g_job.label = label; g_job.cb = std::move(cb); g_job.out.clear();
+    askpass_start();
     std::string root = E.git.root;
-    g_job.th = std::thread([root, args] { int c = git_exec(root, args, &g_job.out); g_job.code = c; g_job.done = true; app_wake(); });
+    job_start(g_job, label, [root, args](std::string &out) { return git_exec(root, args, &out); }, [cb](int c, const std::string &o) { E.status_msg.clear(); if (cb) cb(c, o); });
     E.status_msg = label + "..."; redraw();
 }
 
-void git_job_poll() {
-    if (!g_job.running || !g_job.done) return;
-    g_job.th.join();
-    g_job.running = false;
-    auto cb = std::move(g_job.cb);
-    int c = g_job.code;
-    std::string o = g_job.out;
-    E.status_msg.clear();
-    if (cb) cb(c, o);
-    redraw();
-}
+void git_job_poll();
 
 std::string git_remote_name() {
     std::string o;
@@ -1609,6 +1609,279 @@ void git_commit_menu(float x, float y) {   /* the arrow on the Commit button */
     ctx_show(x, y, {ci("Commit", [] { git_commit_flow(0); }), ci("Commit (Amend)", [] { git_commit_flow(1); }), ci("Commit (Signed Off)", [] { git_commit_flow(2); }), ci_sep(),
                     ci("Commit and Push", [] { git_commit_flow(3); }), ci("Commit and Sync", [] { git_commit_flow(4); }), ci_sep(), ci("Undo Last Commit", [] { git_undo_last_commit(); })});
 }
+
+/* ---- the Remote tab: saved connections (ssh, sftp, ftp, ftps, smb), their folders, and files edited in place ---- */
+
+struct RConn {
+    bool connected = false, busy = false, open = true;
+    std::string pw, err;                                         /* the password lives in memory for this session only */
+    std::map<std::string, std::vector<RemoteEntry>> dirs;
+    std::set<std::string> expanded, loading;
+};
+struct RemoteUi {
+    std::vector<RemoteProfile> profiles;
+    std::vector<RConn> conns;
+    bool loaded = false;
+    struct Opened { int prof; std::string remote; long mtime; };
+    std::map<std::string, Opened> files;                         /* local copy -> where it came from, to upload on save */
+};
+RemoteUi g_rem;
+GitJob g_rjob;
+struct RRow { int prof; std::string path; int kind; };          /* kind: 0 connection, 1 folder, 2 file, 3 loading */
+std::vector<RRow> g_rrows;
+
+void remote_ensure() {
+    if (g_rem.loaded) return;
+    g_rem.loaded = true;
+    g_rem.profiles = remote_load();
+    g_rem.conns.assign(g_rem.profiles.size(), RConn());
+}
+
+std::string remote_root(const RemoteProfile &p) { return p.path.empty() ? (p.proto == "ssh" || p.proto == "sftp" ? "." : "/") : p.path; }
+
+void job_start(GitJob &j, const std::string &label, std::function<int(std::string &)> fn, std::function<void(int, const std::string &)> cb) {
+    if (j.th.joinable()) j.th.join();
+    j.running = true; j.done = false; j.label = label; j.cb = std::move(cb); j.out.clear();
+    j.th = std::thread([&j, fn] { std::string o; int c = fn(o); j.out = o; j.code = c; j.done = true; app_wake(); });
+}
+
+void job_poll(GitJob &j) {
+    if (!j.running || !j.done) return;
+    j.th.join();
+    j.running = false;
+    auto cb = std::move(j.cb);
+    int c = j.code;
+    std::string o = j.out;
+    if (cb) cb(c, o);
+    redraw();
+}
+
+std::string remote_cache_path(const RemoteProfile &p, const std::string &remote) {
+    const char *x = getenv("XDG_CACHE_HOME"), *h = getenv("HOME");
+    std::string d = x && *x ? x : std::string(h ? h : ".") + "/.cache";
+    mkdir(d.c_str(), 0755);
+    d += "/hootedit";
+    mkdir(d.c_str(), 0755);
+    d += "/remote";
+    mkdir(d.c_str(), 0755);
+    std::string nm = p.name;
+    for (char &c : nm) if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '_';
+    d += "/" + nm;
+    mkdir(d.c_str(), 0700);
+    std::string rel = remote;
+    while (!rel.empty() && (rel[0] == '/' || rel[0] == '.')) rel.erase(0, 1);
+    size_t pos = 0;
+    while ((pos = rel.find('/', pos)) != std::string::npos) { mkdir((d + "/" + rel.substr(0, pos)).c_str(), 0700); pos++; }
+    return d + "/" + rel;
+}
+
+void remote_error(const std::string &what, const std::string &msg) { dlg_show(what, msg, {"OK"}, nullptr); }
+
+void remote_list_dir(int pi, const std::string &path, bool then_open = true) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    RConn &c = g_rem.conns[(size_t)pi];
+    if (c.loading.count(path) || g_rjob.running) return;
+    c.loading.insert(path);
+    if (then_open) c.expanded.insert(path);
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string pw = c.pw;
+    auto res = std::make_shared<std::vector<RemoteEntry>>();
+    job_start(g_rjob, "Listing " + p.name, [p, pw, path, res](std::string &err) { return remote_list(p, pw, path, *res, &err); }, [pi, path, res](int code, const std::string &err) {
+        if (pi >= (int)g_rem.conns.size()) return;
+        RConn &c2 = g_rem.conns[(size_t)pi];
+        c2.loading.erase(path);
+        if (code != 0) { c2.expanded.erase(path); remote_error("Cannot list " + path, err); return; }
+        std::sort(res->begin(), res->end(), [](const RemoteEntry &a, const RemoteEntry &b) { return a.dir != b.dir ? a.dir : a.name < b.name; });
+        c2.dirs[path] = *res;
+    });
+}
+
+void remote_connect_now(int pi) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    RConn &c = g_rem.conns[(size_t)pi];
+    if (c.busy || g_rjob.running) { E.status_msg = "another remote operation is running"; return; }
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string missing;
+    if (!remote_tools(p, &missing)) { remote_error("'" + missing + "' is not installed", "Hootedit uses the " + missing + " command to talk to " + p.proto + " servers. Install it and try again."); return; }
+    if (!askpass_start() && (p.proto == "ssh" || p.proto == "sftp")) E.status_msg = "password prompts are unavailable";
+    c.busy = true; c.err.clear();
+    std::string pw = c.pw, root = remote_root(p);
+    auto res = std::make_shared<std::vector<RemoteEntry>>();
+    job_start(g_rjob, "Connecting to " + p.name, [p, pw, root, res](std::string &err) {
+        int rc = remote_connect(p, pw, &err);
+        if (rc == 0 && (p.proto == "ssh" || p.proto == "sftp")) rc = remote_list(p, pw, root, *res, &err);
+        else if (rc == 0) rc = remote_list(p, pw, root, *res, &err);
+        return rc;
+    }, [pi, root, res, p](int code, const std::string &err) {
+        if (pi >= (int)g_rem.conns.size()) return;
+        RConn &c2 = g_rem.conns[(size_t)pi];
+        c2.busy = false;
+        if (code != 0) { c2.connected = false; c2.pw.clear(); c2.err = err; remote_error("Cannot connect to " + p.name, err); return; }
+        std::sort(res->begin(), res->end(), [](const RemoteEntry &a, const RemoteEntry &b) { return a.dir != b.dir ? a.dir : a.name < b.name; });
+        c2.connected = true; c2.open = true;
+        c2.dirs[root] = *res;
+        E.status_msg = "connected to " + p.name;
+    });
+}
+
+void remote_connect(int pi) {
+    remote_ensure();
+    if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) return;
+    const RemoteProfile &p = g_rem.profiles[(size_t)pi];
+    if (remote_needs_password(p) && g_rem.conns[(size_t)pi].pw.empty() && !p.user.empty() && p.user != "anonymous") {
+        dlg_show("Password for " + remote_label(p), "Used for this session only. Hootedit does not store passwords.", {"Connect", "Cancel"}, [pi](int i, const std::string &t) {
+            if (i != 0 || (size_t)pi >= g_rem.conns.size()) return;
+            g_rem.conns[(size_t)pi].pw = t;
+            remote_connect_now(pi);
+        }, true, "", "Password", true);
+        return;
+    }
+    remote_connect_now(pi);
+}
+
+void remote_disconnect_now(int pi) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    RConn &c = g_rem.conns[(size_t)pi];
+    c.connected = false; c.dirs.clear(); c.expanded.clear(); c.pw.clear();
+    std::thread([p] { remote_disconnect(p); }).detach();
+    E.status_msg = "disconnected from " + p.name;
+}
+
+void remote_open_file(int pi, const std::string &path) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size() || g_rjob.running) return;
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string pw = g_rem.conns[(size_t)pi].pw, local = remote_cache_path(p, path);
+    job_start(g_rjob, "Downloading " + base_name(path), [p, pw, path, local](std::string &err) { return remote_get(p, pw, path, local, &err); }, [pi, path, local](int code, const std::string &err) {
+        if (code != 0) { remote_error("Cannot open " + base_name(path), err); return; }
+        struct stat st;
+        long mt = stat(local.c_str(), &st) == 0 ? (long)st.st_mtime : 0;
+        g_rem.files[local] = {pi, path, mt};
+        if (!E.pinned) open_side(false);
+        open_path(local);
+        E.status_msg = "opened " + path + " (saving uploads it)";
+    });
+}
+
+/* after a save: any open tab that came from a server and changed on disk is uploaded again */
+void remote_push_changed() {
+    if (g_rem.files.empty() || g_rjob.running) return;
+    for (auto &dp : E.docs) {
+        auto it = g_rem.files.find(dp->path);
+        if (it == g_rem.files.end() || dp->modified()) continue;
+        struct stat st;
+        if (stat(dp->path.c_str(), &st) != 0 || (long)st.st_mtime == it->second.mtime) continue;
+        it->second.mtime = (long)st.st_mtime;
+        int pi = it->second.prof;
+        if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) continue;
+        RemoteProfile p = g_rem.profiles[(size_t)pi];
+        std::string pw = g_rem.conns[(size_t)pi].pw, local = dp->path, remote = it->second.remote;
+        job_start(g_rjob, "Uploading " + base_name(remote), [p, pw, local, remote](std::string &err) { return remote_put(p, pw, local, remote, &err); }, [remote](int code, const std::string &err) {
+            if (code != 0) remote_error("Upload failed: " + remote, err + "\nYour edits are saved in the local copy; save again to retry.");
+            else E.status_msg = "uploaded " + remote;
+        });
+        return;   /* one at a time; the next save picks up the rest */
+    }
+}
+
+void remote_new_connection() {
+    remote_ensure();
+    std::vector<Ed::PItem> items = {{"SSH (shell and files)", 0, false}, {"SFTP", 1, false}, {"FTP", 2, false}, {"FTPS (FTP over TLS)", 3, false}, {"SMB / Samba share", 4, false}};
+    pick_custom("Select the connection type", items, [](const Ed::PItem &it) {
+        static const char *protos[5] = {"ssh", "sftp", "ftp", "ftps", "smb"};
+        std::string proto = protos[it.id];
+        const char *ph = proto == "smb" ? "user@server  (guest if empty)" : "user@host   or   user@host:port";
+        dlg_show("New " + std::string(protos[it.id]) + " connection", "Server address", {"Next", "Cancel"}, [proto](int i, const std::string &t) {
+            std::string a = trim_nl(t);
+            if (i != 0 || a.empty()) return;
+            RemoteProfile p;
+            p.proto = proto;
+            size_t at = a.find('@');
+            if (at != std::string::npos) { p.user = a.substr(0, at); a = a.substr(at + 1); }
+            size_t col = a.rfind(':');
+            if (col != std::string::npos && a.find(']') == std::string::npos) { p.port = atoi(a.c_str() + col + 1); a = a.substr(0, col); }
+            p.host = a;
+            p.name = a;
+            dlg_show(proto == "smb" ? "Share and folder" : "Remote folder to open", proto == "smb" ? "For example /share/projects" : "Leave empty for the home folder (ssh, sftp) or the root (ftp)", {"Add", "Cancel"}, [p](int i2, const std::string &t2) {
+                if (i2 != 0) return;
+                RemoteProfile q = p;
+                q.path = trim_nl(t2);
+                g_rem.profiles.push_back(q);
+                g_rem.conns.push_back(RConn());
+                remote_save(g_rem.profiles);
+                remote_connect((int)g_rem.profiles.size() - 1);
+            }, true, "", proto == "smb" ? "/share" : "/path (optional)");
+        }, true, "", ph);
+    });
+}
+
+void remote_open_terminal(int pi) {
+    if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) return;
+    std::string line = remote_ssh_line(g_rem.profiles[(size_t)pi]) + "\n";
+    E.term_open = true;
+    if (E.term_choice != "builtin") { launch_external(E.term_choice.substr(E.term_choice.find(':') + 1)); return; }
+    if (new_terminal() && cur_term() && cur_term()->core) { E.term_focus = true; tcore_text(cur_term()->core, line.c_str()); }
+}
+
+void remote_menu(int pi, const std::string &path, int kind, float x, float y) {
+    if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) return;
+    RConn &c = g_rem.conns[(size_t)pi];
+    const RemoteProfile &p = g_rem.profiles[(size_t)pi];
+    bool ssh = p.proto == "ssh" || p.proto == "sftp";
+    if (kind == 0) {
+        std::vector<CtxItem> v = {ci(c.connected ? "Reconnect" : "Connect", [pi] { if (g_rem.conns[(size_t)pi].connected) remote_disconnect_now(pi); remote_connect(pi); }),
+                                  ci("Disconnect", [pi] { remote_disconnect_now(pi); }, "", c.connected), ci("Refresh", [pi] { RConn &k = g_rem.conns[(size_t)pi]; k.dirs.clear(); k.expanded.clear(); remote_connect_now(pi); }, "", c.connected), ci_sep(),
+                                  ci("Open SSH Terminal", [pi] { remote_open_terminal(pi); }, "", ssh), ci_sep(),
+                                  ci("Edit Connections File", [] { const char *x2 = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME"); open_path((x2 && *x2 ? std::string(x2) : std::string(h ? h : ".") + "/.config") + "/hootedit/remotes.ini"); }),
+                                  ci("Remove Connection", [pi] {
+                                      dlg_show("Remove the connection '" + g_rem.profiles[(size_t)pi].name + "'?", "Only the saved entry is removed. Nothing on the server changes.", {"Remove", "Cancel"}, [pi](int i, const std::string &) {
+                                          if (i != 0 || (size_t)pi >= g_rem.profiles.size()) return;
+                                          remote_disconnect_now(pi);
+                                          g_rem.profiles.erase(g_rem.profiles.begin() + pi);
+                                          g_rem.conns.erase(g_rem.conns.begin() + pi);
+                                          for (auto it = g_rem.files.begin(); it != g_rem.files.end();) { if (it->second.prof == pi) it = g_rem.files.erase(it); else { if (it->second.prof > pi) it->second.prof--; ++it; } }
+                                          remote_save(g_rem.profiles);
+                                      }); })};
+        ctx_show(x, y, std::move(v));
+    } else if (kind == 1) {
+        ctx_show(x, y, {ci("Refresh", [pi, path] { g_rem.conns[(size_t)pi].dirs.erase(path); remote_list_dir(pi, path); }), ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
+    } else if (kind == 2) {
+        ctx_show(x, y, {ci("Open", [pi, path] { remote_open_file(pi, path); }), ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
+    }
+}
+
+void remote_row_click(int idx) {
+    if (idx < 0 || (size_t)idx >= g_rrows.size()) return;
+    RRow r = g_rrows[(size_t)idx];
+    RConn &c = g_rem.conns[(size_t)r.prof];
+    if (r.kind == 0) {
+        if (!c.connected) remote_connect(r.prof); else c.open = !c.open;
+    } else if (r.kind == 1) {
+        if (c.expanded.count(r.path)) c.expanded.erase(r.path);
+        else if (c.dirs.count(r.path)) c.expanded.insert(r.path);
+        else remote_list_dir(r.prof, r.path);
+    } else if (r.kind == 2) remote_open_file(r.prof, r.path);
+}
+
+void askpass_poll() {
+    if (E.mode == M_DIALOG) return;
+    AskReq r;
+    if (!askpass_take(r)) return;
+    std::string low = r.prompt;
+    for (char &c : low) c = (char)tolower((unsigned char)c);
+    bool secret = low.find("password") != std::string::npos || low.find("passphrase") != std::string::npos || low.find("pin") != std::string::npos || low.find("token") != std::string::npos;
+    std::string title = trim_nl(r.prompt);
+    while (!title.empty() && (title.back() == ':' || title.back() == ' ')) title.pop_back();
+    if (title.empty()) title = "Authentication required";
+    int fd = r.fd;
+    if (low.find("(yes/no") != std::string::npos) {   /* ssh asking whether to trust a new host key */
+        dlg_show(trim_nl(r.prompt), "The authenticity of this host cannot be verified yet. Only continue if you trust it.", {"Yes", "No"}, [fd](int i, const std::string &) { if (i < 0) askpass_reply(fd, false, ""); else askpass_reply(fd, true, i == 0 ? "yes" : "no"); });
+        return;
+    }
+    dlg_show(title, "Asked by git or ssh. Hootedit passes your answer on and does not store it.", {"OK", "Cancel"}, [fd](int i, const std::string &t) { askpass_reply(fd, i == 0, t); }, true, "", secret ? "Enter secret" : "Enter value", secret);
+}
+
+void git_job_poll() { job_poll(g_job); }
 
 bool hovered(int kind, int id) { return E.hover_kind == kind && E.hover_id == id; }
 
@@ -2203,6 +2476,87 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
     }
 }
 
+void draw_remote_view(float rail, float sw, float cx, float cw, float list_top, float bot, float &ry) {
+    remote_ensure();
+    g_rrows.clear();
+    const float rowh = (float)S(26), full_x = rail + 1, full_w = sw - rail - 2, right = sw - (float)S(10);
+    auto visible = [&](float h) { return ry + h >= list_top && ry <= bot; };
+    if (visible(rowh)) {
+        draw_text(E.ui, cx, ui_base(ry, rowh), "REMOTE EXPLORER", C_GROUP, cw, FS_BOLD);
+        float bx = right - (float)S(22);
+        if (hovered(H_RNEW, 0)) r_rect(E.r, bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), C_HOVER);
+        draw_icon(IC_PLUS, bx, ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+        hit(bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), H_RNEW, 0);
+    }
+    ry += rowh;
+    if (g_rem.profiles.empty()) {
+        if (visible(rowh * 3)) {
+            draw_text(E.ui, cx, ui_base(ry, rowh), "No connections yet", C_UI, cw, FS_BOLD);
+            draw_text(E.ui, cx, ui_base(ry + rowh, rowh), "SSH, SFTP, FTP, FTPS and SMB", C_UI_DIM, cw);
+            float by = ry + rowh * 2 + (float)S(4), bh = (float)S(30);
+            r_rect(E.r, cx, by, cw, bh, hovered(H_RNEW, 1) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT);
+            float lw = text_width(E.ui, "New Connection");
+            draw_text(E.ui, cx + (cw - lw) / 2, ui_base(by, bh), "New Connection", C_ON_ACCENT, cw);
+            hit(cx, by, cw, bh, H_RNEW, 1);
+        }
+        ry += rowh * 3 + (float)S(10);
+        return;
+    }
+    std::function<void(int, const std::string &, int)> emit = [&](int pi, const std::string &dir, int depth) {
+        RConn &c = g_rem.conns[(size_t)pi];
+        auto it = c.dirs.find(dir);
+        if (it == c.dirs.end()) return;
+        for (const RemoteEntry &e : it->second) {
+            std::string full = dir == "." ? e.name : (dir.empty() || dir == "/" ? "/" : dir + "/") + e.name;
+            if (dir.back() == '/' && dir.size() > 1) full = dir + e.name;
+            int idx = (int)g_rrows.size();
+            g_rrows.push_back({pi, full, e.dir ? 1 : 2});
+            bool opened = e.dir && c.expanded.count(full);
+            if (visible(rowh)) {
+                if (hovered(H_RROW, idx)) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+                float x = cx + (float)depth * (float)S(12);
+                if (e.dir) { draw_icon(opened ? IC_CHEV_D : IC_CHEV_R, x - (float)S(4), ry + (rowh - (float)S(16)) / 2, S(16), C_GROUP); draw_icon(IC_FOLDER, x + (float)S(12), ry + (rowh - (float)S(14)) / 2, S(14), C_UI_DIM); }
+                else draw_dot(x + (float)S(8), ry + rowh / 2, S(8), file_color(e.name));
+                draw_text(E.ui, x + (float)S(e.dir ? 30 : 20), ui_base(ry, rowh), e.name.c_str(), C_UI, right - x - (float)S(34));
+                hit(full_x, ry, full_w, rowh, H_RROW, idx);
+            }
+            ry += rowh;
+            if (opened) {
+                if (c.dirs.count(full)) emit(pi, full, depth + 1);
+            } else if (e.dir && c.loading.count(full)) { /* the arrow turns into a row of its own below */ }
+            if (e.dir && c.loading.count(full)) { if (visible(rowh)) draw_text(E.ui, cx + (float)(depth + 1) * (float)S(12) + (float)S(20), ui_base(ry, rowh), "loading...", C_UI_FAINT, cw); ry += rowh; }
+        }
+        if (it->second.empty()) { if (visible(rowh)) draw_text(E.ui, cx + (float)depth * (float)S(12) + (float)S(20), ui_base(ry, rowh), "(empty)", C_UI_FAINT, cw); ry += rowh; }
+    };
+    for (size_t pi = 0; pi < g_rem.profiles.size(); pi++) {
+        const RemoteProfile &p = g_rem.profiles[pi];
+        RConn &c = g_rem.conns[pi];
+        int idx = (int)g_rrows.size();
+        g_rrows.push_back({(int)pi, remote_root(p), 0});
+        if (visible(rowh)) {
+            if (hovered(H_RROW, idx)) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+            draw_icon(c.connected && c.open ? IC_CHEV_D : IC_CHEV_R, cx - (float)S(4), ry + (rowh - (float)S(16)) / 2, S(16), C_GROUP);
+            draw_dot(cx + (float)S(20), ry + rowh / 2, S(12), c.busy ? C_ACCENT : c.connected ? C_GIT_ADD : C_UI_FAINT);
+            float pen = draw_text(E.ui, cx + (float)S(30), ui_base(ry, rowh), p.name.c_str(), C_UI, cw * 0.5f, FS_BOLD);
+            std::string tag = p.proto;
+            for (char &ch : tag) ch = (char)toupper((unsigned char)ch);
+            float tw = text_width(E.ui, tag.c_str());
+            draw_text(E.ui, right - tw, ui_base(ry, rowh), tag.c_str(), C_UI_FAINT, tw + 2);
+            if (pen + (float)S(10) < right - tw - (float)S(8)) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), remote_label(p).c_str(), C_UI_FAINT, right - tw - pen - (float)S(16));
+            hit(full_x, ry, full_w, rowh, H_RROW, idx);
+        }
+        ry += rowh;
+        if (c.connected && c.open) emit((int)pi, remote_root(p), 1);
+        else if (!c.connected && !c.busy) {
+            if (visible(rowh) && (!c.err.empty())) draw_text(E.ui, cx + (float)S(20), ui_base(ry, rowh), c.err.c_str(), C_RED, cw - (float)S(20));
+            if (!c.err.empty()) ry += rowh;
+        }
+    }
+    ry += (float)S(8);
+    if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "Right-click a connection for more. Saving a file uploads it.", C_UI_FAINT, cw);
+    ry += rowh;
+}
+
 void draw_sidebar(const Layout &L) {
     float sw = (float)L.side_x1, top = (float)L.menu_h, bot = (float)L.bar_y;
     float rail = (float)S(29);
@@ -2218,8 +2572,8 @@ void draw_sidebar(const Layout &L) {
     draw_icon(IC_PIN, pbx + (pb - (float)S(14)) / 2, pby + (pb - (float)S(14)) / 2, S(14), E.pinned ? C_EDITOR : C_UI_DIM);
     hit(0, top, rail, pby - top + pb + (float)S(4), H_PIN, 0);
     float ty = pby + pb + (float)S(14);
-    const char *names[3] = {"FILES", "SEARCH", "GIT"};
-    for (int i = 0; i < 3; i++) {
+    const char *names[4] = {"FILES", "SEARCH", "GIT", "REMOTE"};
+    for (int i = 0; i < 4; i++) {
         const AtlasGlyph *g = vlabel(names[i], E.ui, FS_BOLD);
         if (!g) continue;
         bool badge = i == 2 && E.git.repo && !E.git.changes.empty();
@@ -2385,6 +2739,11 @@ void draw_sidebar(const Layout &L) {
         }
         float content = (ry + E.side_scroll) - list_top;
         float maxs = std::max(0.f, content - (bot - list_top) + rowh);
+        if (E.side_scroll > maxs) E.side_scroll = maxs;
+    } else if (E.view == V_REMOTE) {
+        draw_remote_view(rail, sw, cx, cw, list_top, bot, ry);
+        float content = (ry + E.side_scroll) - list_top;
+        float maxs = std::max(0.f, content - (bot - list_top) + (float)S(20));
         if (E.side_scroll > maxs) E.side_scroll = maxs;
     } else if (!E.git.repo) {
         draw_text(E.ui, cx, ui_base(ry, rowh), E.git.available ? "No git repository here" : "git is not installed", C_UI, cw, FS_BOLD);
@@ -4497,6 +4856,9 @@ void context_menu_at(const Hit &h, float mx, float my) {
                           ci("Select for Compare", [c] { E.g.mark_hash = c.hash; E.g.mark_label = c.hash.substr(0, 7); }),
                           ci_sep(), ci("Checkout (Detached)", [c] { git_checkout(c.hash, false); }), ci("Create Branch...", [c] { git_create_branch(c.hash); }), ci("Create Tag...", [c] { git_tag_create(c.hash); }),
                           ci("Cherry Pick", [c] { std::string o; if (git_sync_run("cherry-pick", "cherry-pick " + git_quote(c.hash), &o, false)) { git_refresh(); reload_open_docs(); } else { git_error("cherry-pick", o); git_refresh(); } })});
+    } else if (h.kind == H_RROW && h.id >= 0 && (size_t)h.id < g_rrows.size()) {
+        RRow r = g_rrows[(size_t)h.id];
+        remote_menu(r.prof, r.path, r.kind, mx, my);
     } else if (h.kind == H_TAB && h.id >= 0 && (size_t)h.id < E.docs.size()) {
         int i = h.id;
         bool has_path = !E.docs[(size_t)i]->path.empty();
@@ -4724,6 +5086,8 @@ void click_hit(const Hit &h) {
         else if (h.id == 99) E.fd.name_focus = true;
         break;
     }
+    case H_RROW: remote_row_click(h.id); break;
+    case H_RNEW: remote_new_connection(); break;
     case H_DLGBTN: dlg_finish(h.id); return;
     case H_DLGBG: break;
     case H_CTXITEM: ctx_click(h.id); break;
@@ -5003,9 +5367,10 @@ void run_script(const char *script) {
             E.frames++;
         };
         if (step.compare(0, 4, "wait") == 0) {   /* wait:MS lets background work (a search) finish, then polls and draws */
-            double until = now_s() + atof(step.c_str() + 5) / 1000.0;
+            double until = now_s() + atof(step.c_str() + (step[5] == '~' ? 6 : 5)) / 1000.0;
             while (now_s() < until && (E.s_active && !E.sstat.done)) { search_poll(); SDL_Delay(1); }
-            search_poll(); E.ev_t0 = 0; frame_if_timed();
+            while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { git_job_poll(); job_poll(g_rjob); askpass_poll(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
+            search_poll(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
             continue;
         }
         E.ev_t0 = now_s();
@@ -5109,6 +5474,7 @@ void run_script(const char *script) {
 }  // namespace
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--askpass")) return askpass_client(argc >= 3 ? argv[2] : "");   /* git and ssh start us as their password helper */
     std::vector<const char *> args;
     const char *shot = nullptr, *script = nullptr, *cli_theme = nullptr;
     int bench = 0;
@@ -5165,6 +5531,7 @@ int main(int argc, char **argv) {
     E.rowasc = E.asc + (E.rowh - E.ch) / 2;
     E.uh = font_cell_h(E.ui); E.uasc = font_ascent(E.ui);
     g_ev_wake = SDL_RegisterEvents(1);
+    askpass_start();
     tcore_set_history_defaults(10000, 64, 0, false);   /* scrollback of the terminal panel: 10,000 lines, up to 64 MB in memory, no disk spill */
     wp_configure(1);
     tcore_set_native_cat(true);                         /* the built-in fast cat of the engine: plain "cat file" and "producer | cat" at memory speed */
@@ -5213,7 +5580,7 @@ int main(int argc, char **argv) {
     SDL_Event ev;
     while (E.running) {
         double due = E.next_hud ? E.next_hud : E.now;
-        if (g_job.running) due = std::min(due, E.now + 0.2);
+        if (g_job.running || g_rjob.running) due = std::min(due, E.now + 0.2);
         if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, E.last_blink + 0.53);
         if (E.side_close_at > 0) due = std::min(due, E.side_close_at);
         if (E.follow_fleet && !E.fleet_watch) due = std::min(due, E.next_fleet ? E.next_fleet : E.now + 1.0);
@@ -5226,6 +5593,8 @@ int main(int argc, char **argv) {
         g_wake_pending = 0;
         search_poll();
         git_job_poll();
+        job_poll(g_rjob);
+        askpass_poll();
         terms_pump();
         if (E.follow_fleet && !E.fleet_watch) E.fleet_watch = fleetwm_watch_start();
         if (fleetwm_watch_take() || (E.follow_fleet && E.now >= E.next_fleet)) {
@@ -5261,5 +5630,7 @@ int main(int argc, char **argv) {
     if (stats_at_exit) printf("%s\n", cache_stats_text(true).c_str());
     while (!E.terms.empty()) kill_terminal(0);
     if (g_job.th.joinable()) g_job.th.join();
+    if (g_rjob.th.joinable()) g_rjob.th.join();
+    askpass_stop();
     return 0;
 }

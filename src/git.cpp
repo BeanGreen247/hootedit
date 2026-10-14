@@ -4,6 +4,7 @@
  */
 
 #include "git.h"
+#include "askpass.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,7 +237,7 @@ std::string git_quote(const std::string &s) { return shq(s); }
 
 int git_exec(const std::string &root, const std::string &args, std::string *out) {
     int c = -1;
-    std::string o = run_both("GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true git -C " + shq(root) + " " + args + " </dev/null", &c);
+    std::string o = run_both(askpass_env() + "GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true git -C " + shq(root) + " " + args + " </dev/null", &c);
     if (out) *out = o;
     return c;
 }
