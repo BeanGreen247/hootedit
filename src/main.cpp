@@ -171,25 +171,25 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
 const std::vector<Menu> MENUS = {
-    {"File", {{"New File", "Ctrl+N", A_NEW}, {"Open File...", "Ctrl+O", A_OPEN_FILE}, {"Open Folder...", "", A_OPEN_FOLDER}, {"Quick Open...", "Ctrl+P", A_QUICK}, {"", "", A_NONE},
+    {"File", {{"New File", "Ctrl+N", A_NEW}, {"Open File...", "Ctrl+O", A_OPEN_FILE}, {"Open Folder...", "Ctrl+K Ctrl+O", A_OPEN_FOLDER}, {"Quick Open...", "Ctrl+P", A_QUICK}, {"", "", A_NONE},
               {"Save", "Ctrl+S", A_SAVE}, {"Save As...", "Ctrl+Shift+S", A_SAVEAS}, {"", "", A_NONE}, {"Close Tab", "Ctrl+W", A_CLOSE}, {"Exit", "Ctrl+Q", A_QUIT}}},
     {"Edit", {{"Undo", "Ctrl+Z", A_UNDO}, {"Redo", "Ctrl+Y", A_REDO}, {"", "", A_NONE}, {"Cut", "Ctrl+X", A_CUT}, {"Copy", "Ctrl+C", A_COPY}, {"Paste", "Ctrl+V", A_PASTE},
-              {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Find", "Ctrl+F", A_FIND}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
+              {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+Tab", A_NEXT_TAB}, {"Previous Tab", "Ctrl+Shift+Tab", A_PREV_TAB}, {"", "", A_NONE},
-              {"Language Mode...", "Ctrl+Shift+L", A_LANG}, {"Color Theme...", "Ctrl+Shift+T", A_THEME}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+              {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
     {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
                   {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
     {"Help", {{"About Hootedit", "", A_ABOUT}}},
@@ -292,6 +292,14 @@ struct Ed {
     bool pinned = true, side_open = true, root_open = true;
     double side_close_at = 0;
     float side_scroll = 0;
+    float tab_scroll = 0;                            /* how far the tab strip is scrolled, in pixels */
+    bool tab_reveal = false;                         /* bring the active tab into view on the next frame */
+    int tab_press = -1;                              /* tab under the mouse button, -1 none */
+    float tab_press_x = 0;
+    bool tab_dragging = false;
+    std::vector<float> tab_x, tab_w;                 /* the last frame's tab geometry (strip coordinates, unscrolled) */
+    std::vector<std::string> closed_tabs;            /* paths of closed tabs, newest last, for Ctrl+Shift+T */
+    bool chord_k = false;                            /* Ctrl+K was pressed: the next key finishes the chord */
 
     bool dirty = true, running = true, show_stats = false, blink_on = true, focused = true;
     std::string status_msg;
@@ -445,6 +453,7 @@ void set_active(int i) {
     if (i < 0 || i >= (int)E.docs.size()) return;
     E.active = i;
     E.follow = true;
+    E.tab_reveal = true;
     E.find_msg.clear();
     E.status_msg.clear();
     std::string t = D().name() + " - Hootedit";
@@ -455,6 +464,7 @@ void set_active(int i) {
 }
 
 void remove_doc(int i) {
+    if (!E.docs[(size_t)i]->path.empty()) { E.closed_tabs.push_back(E.docs[(size_t)i]->path); if (E.closed_tabs.size() > 30) E.closed_tabs.erase(E.closed_tabs.begin()); }
     E.docs.erase(E.docs.begin() + i);
     if (E.docs.empty()) { new_doc(); E.blank_tab = false; }   /* the last tab is gone: back to the start screen */
     set_active(std::min(E.active > i ? E.active - 1 : E.active, (int)E.docs.size() - 1));
@@ -722,6 +732,7 @@ void fuzzy_filter(const std::vector<std::string> &files, const std::string &q, s
 void quick_update() {
     WorkTimer wt;
     if (E.quick_files.empty()) { ensure_files(); E.quick_files = *E.sfiles; }
+    if (!E.quick_q.empty() && E.quick_q[0] == ':') { E.quick_hits.clear(); E.quick_pos.clear(); return; }   /* ":42" is a line number, not a file name */
     fuzzy_filter(E.quick_files, E.quick_q, 12, E.quick_hits, E.quick_pos);
     E.quick_sel = std::min(E.quick_sel, std::max(0, (int)E.quick_hits.size() - 1));
 }
@@ -1339,14 +1350,27 @@ void build_frame() {
         std::vector<float> tw(nt);
         float total = 0;
         for (size_t i = 0; i < nt; i++) {
-            tw[i] = text_width(E.ui, E.docs[i]->name().c_str()) + (float)S(48);
+            tw[i] = std::min((float)S(240), std::max((float)S(90), text_width(E.ui, E.docs[i]->name().c_str()) + (float)S(48)));
             total += tw[i];
         }
-        if (total > ew) for (float &w : tw) w = std::max((float)S(90), w * ew / total);
+        E.tab_x.assign(nt, 0); E.tab_w = tw;
+        { float acc = 0; for (size_t i = 0; i < nt; i++) { E.tab_x[i] = acc; acc += tw[i]; } }
+        if (E.tab_reveal && E.active >= 0 && (size_t)E.active < nt) {   /* a switch by keyboard or click scrolls the strip just enough to show the tab */
+            float l = E.tab_x[(size_t)E.active], r = l + tw[(size_t)E.active];
+            if (l < E.tab_scroll) E.tab_scroll = l;
+            else if (r > E.tab_scroll + ew) E.tab_scroll = r - ew;
+        }
+        E.tab_reveal = false;
+        E.tab_scroll = std::max(0.f, std::min(E.tab_scroll, total - ew));
+        r_clip(E.r, (int)ex, (int)ty, (int)ew, (int)th);
+        tx = ex - E.tab_scroll;
         for (size_t i = 0; i < nt; i++) {
             bool act = (int)i == E.active;
-            r_rect(E.r, tx, ty, tw[i], th, act ? C_EDITOR : C_CHROME);
+            bool lift = E.tab_dragging && E.tab_press == (int)i;
+            if (tx + tw[i] < ex || tx > ex + ew) { tx += tw[i]; continue; }   /* scrolled out of the strip */
+            r_rect(E.r, tx, ty, tw[i], th, act || lift ? C_EDITOR : C_CHROME);
             if (act) r_rect(E.r, tx, ty + th - (float)S(2), tw[i], (float)S(2), C_ACCENT);
+            if (lift) r_rect(E.r, tx, ty, tw[i], (float)S(2), C_ACCENT);
             r_rect(E.r, tx + tw[i] - 1, ty, 1, th, C_BORDER);
             float ix = tx + (float)S(14);
             const Doc &dd = *E.docs[i];
@@ -1356,11 +1380,16 @@ void build_frame() {
             float cx = tx + tw[i] - (float)S(26), cy = ty + (th - (float)S(16)) / 2;
             if (mod && !hovered(H_TABCLOSE, (int)i)) draw_icon(IC_DOT, cx, cy, S(16), C_UI);
             else if (act || hv) draw_icon(IC_CLOSE, cx, cy, S(16), hovered(H_TABCLOSE, (int)i) ? C_UI : C_UI_DIM);
-            hit(tx, ty, tw[i] - (float)S(30), th, H_TAB, (int)i);
-            hit(tx + tw[i] - (float)S(30), ty, (float)S(30), th, H_TABCLOSE, (int)i);
+            auto clipped_hit = [&](float x0, float w0, int kind) {   /* a tab half under the sidebar must not take its clicks */
+                float x1 = std::max(x0, ex), x2 = std::min(x0 + w0, ex + ew);
+                if (x2 > x1) hit(x1, ty, x2 - x1, th, kind, (int)i);
+            };
+            clipped_hit(tx, tw[i] - (float)S(30), H_TAB);
+            clipped_hit(tx + tw[i] - (float)S(30), (float)S(30), H_TABCLOSE);
             tx += tw[i];
         }
-        if (nt) hit(tx, ty, ex + ew - tx, th, H_TABSPACE, 0);   /* the empty part of the strip: a double click opens a new empty tab */
+        r_clip_off(E.r);
+        if (nt && tx < ex + ew) hit(tx, ty, ex + ew - tx, th, H_TABSPACE, 0);   /* the empty part of the strip: a double click opens a new empty tab */
     }
     double tm1 = E.timing ? now_s() : 0;
 
@@ -1886,6 +1915,243 @@ void move_line(long delta, bool extend) {
     d.move_to(d.buf.line_start((size_t)nl) + byte_of(t, d.want_col), extend, true);
 }
 
+
+/* ---- VS Code style editing commands: word moves, line operations, comments, indent ---- */
+
+int char_class(unsigned char c) { return c == ' ' || c == '\t' ? 0 : (isalnum(c) || c == '_' || c >= 0x80) ? 1 : 2; }
+
+size_t word_left(Doc &d, size_t pos) {
+    size_t l = d.buf.line_of(pos), ls = d.buf.line_start(l);
+    if (pos == ls) return l ? ls - 1 : 0;
+    std::string t;
+    d.buf.line_text(l, t);
+    size_t i = pos - ls;
+    while (i > 0 && char_class((unsigned char)t[i - 1]) == 0) i--;
+    if (i > 0) { int c = char_class((unsigned char)t[i - 1]); while (i > 0 && char_class((unsigned char)t[i - 1]) == c) i--; }
+    return ls + i;
+}
+
+size_t word_right(Doc &d, size_t pos) {
+    size_t l = d.buf.line_of(pos), ls = d.buf.line_start(l), n = d.buf.line_len(l);
+    if (pos - ls >= n) return l + 1 < d.buf.lines() ? d.buf.line_start(l + 1) : pos;
+    std::string t;
+    d.buf.line_text(l, t);
+    size_t i = pos - ls;
+    while (i < n && char_class((unsigned char)t[i]) == 0) i++;
+    if (i < n) { int c = char_class((unsigned char)t[i]); while (i < n && char_class((unsigned char)t[i]) == c) i++; }
+    return ls + i;
+}
+
+/* the lines the selection touches: a selection ending at the very start of a line does not include that line */
+void sel_lines(Doc &d, size_t *l0, size_t *l1) {
+    *l0 = d.buf.line_of(d.sel_lo());
+    *l1 = d.buf.line_of(d.sel_hi());
+    if (d.has_sel() && *l1 > *l0 && d.sel_hi() == d.buf.line_start(*l1)) (*l1)--;
+}
+
+size_t line_end(Doc &d, size_t l) { return d.buf.line_start(l) + d.buf.line_len(l); }
+
+std::string lines_text(Doc &d, size_t l0, size_t l1) {
+    std::string out, t;
+    for (size_t l = l0; l <= l1; l++) { d.buf.line_text(l, t); if (l > l0) out += '\n'; out += t; }
+    return out;
+}
+
+void set_sel(Doc &d, size_t anchor, size_t cur) { d.anchor = anchor; d.cur = cur; d.want_col = d.col_of_byte(d.buf.line_of(cur), cur - d.buf.line_start(d.buf.line_of(cur))); }
+
+void line_move(Doc &d, int dir) {   /* Alt+Up / Alt+Down: the selected lines trade places with their neighbour */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    if (dir < 0 && l0 == 0) return;
+    if (dir > 0 && l1 + 1 >= d.buf.lines()) return;
+    size_t a = d.anchor, c = d.cur;
+    std::string block = lines_text(d, l0, l1), nb;
+    size_t from = d.buf.line_start(dir < 0 ? l0 - 1 : l0), to = line_end(d, dir < 0 ? l1 : l1 + 1);
+    d.buf.line_text(dir < 0 ? l0 - 1 : l1 + 1, nb);
+    std::string out = dir < 0 ? block + "\n" + nb : nb + "\n" + block;
+    d.break_group();
+    d.replace(from, to - from, out.data(), out.size());
+    d.break_group();
+    long delta = dir < 0 ? -(long)(nb.size() + 1) : (long)(nb.size() + 1);
+    set_sel(d, (size_t)((long)a + delta), (size_t)((long)c + delta));
+}
+
+void line_copy(Doc &d, int dir) {   /* Shift+Alt+Up / Down: duplicate the selected lines above or below */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t a = d.anchor, c = d.cur;
+    std::string block = lines_text(d, l0, l1);
+    d.break_group();
+    if (dir > 0) { std::string ins = "\n" + block; d.replace(line_end(d, l1), 0, ins.data(), ins.size()); set_sel(d, a + block.size() + 1, c + block.size() + 1); }
+    else { std::string ins = block + "\n"; d.replace(d.buf.line_start(l0), 0, ins.data(), ins.size()); set_sel(d, a, c); }
+    d.break_group();
+}
+
+void line_delete(Doc &d) {   /* Ctrl+Shift+K */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t from = d.buf.line_start(l0), to = l1 + 1 < d.buf.lines() ? d.buf.line_start(l1 + 1) : d.buf.size();
+    if (l1 + 1 >= d.buf.lines() && l0 > 0) from--;   /* the last line takes the break before it with it */
+    d.break_group();
+    d.replace(from, to - from, "", 0);
+    d.break_group();
+}
+
+void line_open(Doc &d, bool below) {   /* Ctrl+Enter / Ctrl+Shift+Enter: a new line without moving the line break */
+    size_t l = d.buf.line_of(d.cur);
+    std::string t;
+    d.buf.line_text(l, t);
+    size_t w = 0;
+    while (w < t.size() && (t[w] == ' ' || t[w] == '\t')) w++;
+    std::string ind = t.substr(0, w);
+    d.break_group();
+    if (below) { std::string ins = "\n" + ind; d.replace(line_end(d, l), 0, ins.data(), ins.size()); }
+    else { std::string ins = ind + "\n"; size_t ls = d.buf.line_start(l); d.replace(ls, 0, ins.data(), ins.size()); set_sel(d, ls + ind.size(), ls + ind.size()); }
+    d.break_group();
+}
+
+std::string indent_unit(Doc &d) { return d.indent.compare(0, 3, "Tab") == 0 ? std::string("\t") : std::string((size_t)std::max(1, indent_step(d)), ' '); }
+
+void indent_lines(Doc &d, bool out) {   /* Ctrl+] / Ctrl+[ and Tab / Shift+Tab over several lines */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t a = d.anchor, c = d.cur;
+    std::string unit = indent_unit(d), res, t;
+    long first = 0, last = 0;
+    for (size_t l = l0; l <= l1; l++) {
+        d.buf.line_text(l, t);
+        long delta = 0;
+        if (!out) { if (!t.empty()) { t.insert(0, unit); delta = (long)unit.size(); } }
+        else if (!t.empty() && t[0] == '\t') { t.erase(0, 1); delta = -1; }
+        else { size_t k = 0; while (k < t.size() && k < unit.size() && t[k] == ' ') k++; t.erase(0, k); delta = -(long)k; }
+        if (l == l0) first = delta;
+        if (l == l1) last = delta;
+        if (l > l0) res += '\n';
+        res += t;
+    }
+    size_t from = d.buf.line_start(l0), to = line_end(d, l1);
+    d.break_group();
+    d.replace(from, to - from, res.data(), res.size());
+    d.break_group();
+    auto adj = [&](size_t pos) {
+        size_t l = d.buf.line_of(std::min(pos, d.buf.size()));
+        return (size_t)std::max<long>((long)from, (long)pos + (l == l0 ? first : l == l1 ? last : first));
+    };
+    size_t na = adj(a), nc = adj(c);
+    if (a == c) nc = na;
+    set_sel(d, na, nc);
+}
+
+const char *comment_prefix(const Lang *l) {
+    const char *n = lang_name(l);
+    static const char *hash[] = {"Python", "Shell", "YAML", "TOML", "Makefile", "CMake", "Ruby", "Perl", "Dockerfile", "Diff"};
+    for (const char *h : hash) if (!strcmp(n, h)) return "#";
+    if (!strcmp(n, "Lua") || !strcmp(n, "SQL") || !strcmp(n, "Haskell")) return "--";
+    if (!strcmp(n, "INI")) return ";";
+    if (!strcmp(n, "Plain Text") || !strcmp(n, "Markdown") || !strcmp(n, "JSON") || !strcmp(n, "HTML") || !strcmp(n, "XML") || !strcmp(n, "CSS")) return nullptr;
+    return "//";
+}
+
+void toggle_comment(Doc &d) {   /* Ctrl+/ */
+    const char *pre = comment_prefix(d.lang);
+    if (!pre) { E.status_msg = std::string("no line comment for ") + lang_name(d.lang); return; }
+    size_t pl = strlen(pre), l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t a = d.anchor, c = d.cur;
+    std::vector<std::string> ls;
+    bool all = true, any = false;
+    size_t minind = (size_t)-1;
+    for (size_t l = l0; l <= l1; l++) {
+        ls.emplace_back();
+        d.buf.line_text(l, ls.back());
+        const std::string &t = ls.back();
+        size_t w = 0;
+        while (w < t.size() && (t[w] == ' ' || t[w] == '\t')) w++;
+        if (w == t.size()) continue;   /* blank lines neither count nor change */
+        any = true;
+        minind = std::min(minind, w);
+        if (t.compare(w, pl, pre) != 0) all = false;
+    }
+    if (!any) return;
+    std::string res;
+    long first = 0, last = 0;
+    for (size_t i = 0; i < ls.size(); i++) {
+        std::string &t = ls[i];
+        size_t w = 0;
+        while (w < t.size() && (t[w] == ' ' || t[w] == '\t')) w++;
+        long delta = 0;
+        if (w < t.size()) {
+            if (all) { size_t k = pl + (t.compare(w + pl, 1, " ") == 0 ? 1 : 0); t.erase(w, k); delta = -(long)k; }
+            else { std::string ins = std::string(pre) + " "; t.insert(minind, ins); delta = (long)ins.size(); }
+        }
+        if (i == 0) first = delta;
+        if (i + 1 == ls.size()) last = delta;
+        if (i) res += '\n';
+        res += t;
+    }
+    size_t from = d.buf.line_start(l0), to = line_end(d, l1);
+    d.break_group();
+    d.replace(from, to - from, res.data(), res.size());
+    d.break_group();
+    auto adj = [&](size_t pos) { size_t l = d.buf.line_of(std::min(pos, d.buf.size())); return (size_t)std::max<long>((long)from, (long)pos + (l == l0 ? first : l == l1 ? last : first)); };
+    set_sel(d, a == c ? adj(c) : adj(a), adj(c));
+}
+
+void select_next_occurrence(Doc &d) {   /* Ctrl+D: first the word under the cursor, then the next match of the selection */
+    if (!d.has_sel()) {
+        size_t l = d.buf.line_of(d.cur), ls = d.buf.line_start(l);
+        std::string t;
+        d.buf.line_text(l, t);
+        size_t i = d.cur - ls, a = i, b = i;
+        while (a > 0 && char_class((unsigned char)t[a - 1]) == 1) a--;
+        while (b < t.size() && char_class((unsigned char)t[b]) == 1) b++;
+        if (b > a) set_sel(d, ls + a, ls + b);
+        return;
+    }
+    std::string needle = d.selection();
+    if (needle.empty() || needle.size() > 4096) return;
+    size_t from = d.sel_hi(), cap = 8u << 20;
+    std::string hay;
+    d.buf.copy(from, std::min(cap, d.buf.size() - from), hay);
+    size_t at = hay.find(needle);
+    if (at != std::string::npos) { set_sel(d, from + at, from + at + needle.size()); return; }
+    d.buf.copy(0, std::min(d.sel_lo(), cap), hay);   /* wrapped around */
+    at = hay.find(needle);
+    if (at != std::string::npos) set_sel(d, at, at + needle.size());
+}
+
+void goto_line(const std::string &q) {
+    long n = atol(q.c_str());
+    Doc &d = D();
+    if (n < 1) n = 1;
+    size_t l = std::min((size_t)n - 1, d.buf.lines() - 1);
+    d.break_group();
+    set_sel(d, d.buf.line_start(l), d.buf.line_start(l));
+    E.follow = true;
+    size_t rows = (size_t)std::max(1, layout().rows);   /* centre the line like VS Code does */
+    d.top = l > rows / 2 ? l - rows / 2 : 0;
+    E.follow = false;
+}
+
+void reopen_closed_tab() {
+    while (!E.closed_tabs.empty()) {
+        std::string p = E.closed_tabs.back();
+        E.closed_tabs.pop_back();
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) { open_path(p); return; }
+    }
+    E.status_msg = "no closed tab to reopen";
+}
+
+void close_all_tabs() {
+    int kept = 0;
+    for (int i = (int)E.docs.size() - 1; i >= 0; i--) {
+        if (E.docs[(size_t)i]->modified()) { kept++; continue; }
+        remove_doc(i);
+    }
+    if (kept) E.status_msg = sfmt("%d tab%s with unsaved changes kept", kept, kept == 1 ? "" : "s");
+}
+
 void pop_utf8(std::string &s) {
     if (s.empty()) return;
     size_t i = s.size() - 1;
@@ -2381,6 +2647,9 @@ void do_action(int act) {
     case A_STATS: E.show_stats = !E.show_stats; break;
     case A_NEXT_TAB: set_active((E.active + 1) % (int)E.docs.size()); break;
     case A_PREV_TAB: set_active((E.active + (int)E.docs.size() - 1) % (int)E.docs.size()); break;
+    case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
+    case A_REOPEN: reopen_closed_tab(); break;
+    case A_CLOSE_ALL: close_all_tabs(); break;
     case A_ABOUT: E.status_msg = "Hootedit 0.4.0 - BeanGreen247 - fast native editor"; break;
     case A_REFRESH: E.tree.refresh(); git_refresh(); break;
     default: return;
@@ -2479,7 +2748,7 @@ void key_down(const SDL_KeyboardEvent &k) {
         if (sym == SDLK_ESCAPE) E.mode = M_EDIT;
         else if (sym == SDLK_UP) E.quick_sel = std::max(0, E.quick_sel - 1);
         else if (sym == SDLK_DOWN) E.quick_sel = std::min(n - 1, E.quick_sel + 1);
-        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) { E.mode = M_EDIT; if (n) open_path(E.quick_hits[(size_t)E.quick_sel]); }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) { E.mode = M_EDIT; if (!E.quick_q.empty() && E.quick_q[0] == ':') goto_line(E.quick_q.substr(1)); else if (n) open_path(E.quick_hits[(size_t)E.quick_sel]); }
         else if (sym == SDLK_BACKSPACE) { pop_utf8(E.quick_q); E.quick_sel = 0; quick_update(); }
         else return;
         touch();
@@ -2558,6 +2827,45 @@ void key_down(const SDL_KeyboardEvent &k) {
     if (sym == SDLK_BACKSPACE || sym == SDLK_DELETE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER || sym == SDLK_LEFT || sym == SDLK_RIGHT || sym == SDLK_UP || sym == SDLK_DOWN) begin_op(sym == SDLK_BACKSPACE || sym == SDLK_DELETE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER ? "keystroke" : "cursor move");
     if (E.show_stats && sym == SDLK_ESCAPE) { E.show_stats = false; touch(); return; }
     if (E.side_open && !E.pinned && sym == SDLK_ESCAPE) { open_side(false); touch(); return; }
+    bool alt = k.keysym.mod & KMOD_ALT;
+    if (E.chord_k) {   /* the second key of Ctrl+K */
+        E.chord_k = false;
+        E.status_msg.clear();
+        if (sym == SDLK_LSHIFT || sym == SDLK_RSHIFT || sym == SDLK_LCTRL || sym == SDLK_RCTRL) { E.chord_k = true; return; }
+        if (sym == SDLK_t && ctrl) do_action(A_THEME);
+        else if (sym == SDLK_o && ctrl) do_action(A_OPEN_FOLDER);
+        else if (sym == SDLK_w && ctrl) do_action(A_CLOSE_ALL);
+        else if (sym == SDLK_m) do_action(A_LANG);
+        else if (sym == SDLK_s && ctrl) { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); after_save(); }
+        touch();
+        return;
+    }
+    if (ctrl && !shift && !alt && sym == SDLK_k) { E.chord_k = true; E.status_msg = "(Ctrl+K) was pressed. Waiting for the second key of the chord..."; touch(); return; }
+    if (alt && !ctrl && (sym == SDLK_UP || sym == SDLK_DOWN)) { begin_op(shift ? "copy line" : "move line"); if (shift) line_copy(d, sym == SDLK_UP ? -1 : 1); else line_move(d, sym == SDLK_UP ? -1 : 1); E.follow = true; touch(); return; }
+    if (alt && !ctrl && !shift && sym >= SDLK_1 && sym <= SDLK_9) { if ((size_t)(sym - SDLK_1) < E.docs.size()) set_active((int)(sym - SDLK_1)); touch(); return; }
+    if (alt && !ctrl && !shift && sym == SDLK_0) { set_active((int)E.docs.size() - 1); touch(); return; }
+    if (ctrl && (sym == SDLK_PAGEUP || sym == SDLK_PAGEDOWN) && shift && E.docs.size() > 1) {   /* move the tab itself */
+        int to = E.active + (sym == SDLK_PAGEUP ? -1 : 1);
+        if (to >= 0 && to < (int)E.docs.size()) { std::swap(E.docs[(size_t)E.active], E.docs[(size_t)to]); E.active = to; E.tab_reveal = true; }
+        touch();
+        return;
+    }
+    if (ctrl && !alt && (sym == SDLK_LEFT || sym == SDLK_RIGHT)) { d.break_group(); d.move_to(sym == SDLK_LEFT ? word_left(d, d.cur) : word_right(d, d.cur), shift, false); E.follow = true; touch(); return; }
+    if (ctrl && !shift && (sym == SDLK_BACKSPACE || sym == SDLK_DELETE)) {
+        if (!d.has_sel()) { size_t o = sym == SDLK_BACKSPACE ? word_left(d, d.cur) : word_right(d, d.cur); d.anchor = o; }
+        d.erase_back();   /* with a selection set, Backspace removes exactly it */
+        E.follow = true; touch(); return;
+    }
+    if (ctrl && (sym == SDLK_RETURN || sym == SDLK_KP_ENTER)) { line_open(d, !shift); E.follow = true; touch(); return; }
+    if (ctrl && !shift && sym == SDLK_g) { do_action(A_GOTO); touch(); return; }
+    if (ctrl && !shift && sym == SDLK_l) { size_t l = d.buf.line_of(d.cur); size_t e = l + 1 < d.buf.lines() ? d.buf.line_start(l + 1) : d.buf.size(); set_sel(d, d.buf.line_start(l), e); touch(); return; }
+    if (ctrl && shift && sym == SDLK_k) { line_delete(d); E.follow = true; touch(); return; }
+    if (ctrl && !shift && sym == SDLK_SLASH) { toggle_comment(d); E.follow = true; touch(); return; }
+    if (ctrl && !shift && (sym == SDLK_RIGHTBRACKET || sym == SDLK_LEFTBRACKET)) { indent_lines(d, sym == SDLK_LEFTBRACKET); E.follow = true; touch(); return; }
+    if (ctrl && !shift && sym == SDLK_d) { select_next_occurrence(d); E.follow = true; touch(); return; }
+    if (ctrl && shift && sym == SDLK_t) { do_action(A_REOPEN); touch(); return; }
+    if (sym == SDLK_TAB && !ctrl && (shift || (d.has_sel() && d.buf.line_of(d.sel_lo()) != d.buf.line_of(d.sel_hi())))) { indent_lines(d, shift); E.follow = true; touch(); return; }
+    if (sym == SDLK_F3 && !E.find_q.empty()) { find_from(d.sel_hi()); E.follow = true; touch(); return; }
     switch (sym) {
     case SDLK_LEFT: { d.break_group(); size_t p = d.has_sel() && !shift ? d.sel_lo() : d.prev_char(d.cur); d.move_to(p, shift, false); break; }
     case SDLK_RIGHT: { d.break_group(); size_t p = d.has_sel() && !shift ? d.sel_hi() : d.next_char(d.cur); d.move_to(p, shift, false); break; }
@@ -2593,8 +2901,6 @@ void key_down(const SDL_KeyboardEvent &k) {
     case SDLK_b: if (ctrl) do_action(A_TOGGLE_SIDEBAR); else return; return;
     case SDLK_e: if (ctrl && shift) do_action(A_VIEW_EXPLORER); else return; return;
     case SDLK_g: if (ctrl && shift) do_action(A_VIEW_GIT); else return; return;
-    case SDLK_l: if (ctrl && shift) do_action(A_LANG); else return; return;
-    case SDLK_t: if (ctrl && shift) do_action(A_THEME); else return; return;
     case SDLK_BACKQUOTE: if (ctrl) do_action(shift ? A_TERM_NEW : A_TERM_TOGGLE); else return; return;
     case SDLK_i: if (ctrl && shift) do_action(A_STATS); else return; return;
     default: return;
@@ -2608,7 +2914,7 @@ void click_hit(const Hit &h) {
     E.term_focus = term_hit && E.term_open;
     if (term_hit && h.kind == H_ACT) E.term_focus = true;
     switch (h.kind) {
-    case H_TAB: set_active(h.id); E.mode = M_EDIT; break;
+    case H_TAB: set_active(h.id); E.mode = M_EDIT; E.tab_press = h.id; E.tab_press_x = E.mx; E.tab_dragging = false; break;
     case H_TABCLOSE: E.mode = M_EDIT; close_tab(h.id); break;
     case H_BOX: do_action(E.mode == M_FIND ? A_NONE : A_FIND); break;
     case H_ACT: if (h.id != A_TOG_CASE && h.id != A_TOG_REGEX && h.id != A_TOG_WORD) E.mode = M_EDIT; do_action(h.id); break;
@@ -2760,6 +3066,11 @@ void handle_event(const SDL_Event &e) {
         }
         if (E.mode == M_FILEDLG) { E.fd.scroll = std::max(0, E.fd.scroll - e.wheel.y * 3); redraw(); break; }
         if (E.mode == M_PICK) { E.pick_scroll = std::max(0, E.pick_scroll - e.wheel.y * 3); redraw(); break; }
+        if (E.mx >= (float)L.ed_x && E.my >= (float)L.tab_y && E.my < (float)L.text_y && !splash()) {   /* over the tab strip: slide the tabs, keep the active one */
+            E.tab_scroll += (float)(e.wheel.x - e.wheel.y) * (float)S(70);
+            redraw();
+            break;
+        }
         if (E.side_open && E.mx < (float)L.side_x1 && E.my >= (float)L.menu_h && E.my < (float)L.bar_y) {
             E.side_scroll = std::max(0.f, E.side_scroll - (float)e.wheel.y * (float)S(66));
             redraw();
@@ -2815,7 +3126,30 @@ void handle_event(const SDL_Event &e) {
     case SDL_MOUSEMOTION:
         if (g_scripted && e.motion.which != SCRIPT_MOUSE) break;   /* --script drives the pointer; the real one (xvfb parks it mid-window) is ignored */
         E.mx = (float)e.motion.x * E.scale; E.my = (float)e.motion.y * E.scale;
-        if (E.sb_drag) sb_to_pointer();
+        if (E.tab_press >= 0 && (e.motion.state & SDL_BUTTON_LMASK)) {
+            Layout L = layout();
+            if (!E.tab_dragging && std::fabs(E.mx - E.tab_press_x) > (float)S(6)) E.tab_dragging = true;
+            if (E.tab_dragging) {
+                if (E.mx < (float)L.ed_x + (float)S(30)) E.tab_scroll -= (float)S(16);   /* near an edge the strip follows the pointer */
+                else if (E.mx > (float)E.W - (float)S(30)) E.tab_scroll += (float)S(16);
+                float px = E.mx - (float)L.ed_x + E.tab_scroll;   /* pointer in strip coordinates */
+                int to = E.tab_press;
+                for (size_t i = 0; i < E.tab_x.size(); i++) if (px >= E.tab_x[i] && px < E.tab_x[i] + E.tab_w[i]) to = (int)i;
+                if (px < 0) to = 0;
+                if (!E.tab_x.empty() && px >= E.tab_x.back() + E.tab_w.back()) to = (int)E.tab_x.size() - 1;
+                if (to != E.tab_press && to >= 0 && to < (int)E.docs.size()) {
+                    auto &v = E.docs;
+                    if (to > E.tab_press) std::rotate(v.begin() + E.tab_press, v.begin() + E.tab_press + 1, v.begin() + to + 1);
+                    else std::rotate(v.begin() + to, v.begin() + E.tab_press, v.begin() + E.tab_press + 1);
+                    if (E.active == E.tab_press) E.active = to;
+                    else if (E.tab_press < E.active && to >= E.active) E.active--;
+                    else if (E.tab_press > E.active && to <= E.active) E.active++;
+                    if (E.confirm_idx == E.tab_press) E.confirm_idx = to;
+                    E.tab_press = to;
+                }
+                redraw();
+            }
+        } else if (E.sb_drag) sb_to_pointer();
         else if (E.split_drag) {
             Layout L = layout();
             int maxl = (int)((float)(L.bar_y - L.text_y - S(100)) / E.scale);
@@ -2844,6 +3178,8 @@ void handle_event(const SDL_Event &e) {
         if (E.split_drag) { E.split_drag = false; settings_save(); }
         E.sb_drag = false;
         E.dragging = false;
+        E.tab_press = -1;
+        if (E.tab_dragging) { E.tab_dragging = false; redraw(); }
         break;
     case SDL_WINDOWEVENT:
         if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESIZED) { SDL_GL_GetDrawableSize(E.win, &E.W, &E.H); redraw(); }
@@ -2900,6 +3236,39 @@ void run_script(const char *script) {
         if (step.compare(0, 5, "open:") == 0) { open_path(step.substr(5)); frame_if_timed(); continue; }
         if (step.compare(0, 5, "text:") == 0) { text_input(step.c_str() + 5); frame_if_timed(); continue; }
         if (step.compare(0, 5, "menu:") == 0) { open_menu(atoi(step.c_str() + 5)); frame_if_timed(); continue; }
+        if (step.compare(0, 6, "wheel:") == 0) {   /* wheel:x,y,dy over a point (test hook) */
+            int x = 0, y = 0, dy = 0;
+            sscanf(step.c_str() + 6, "%d,%d,%d", &x, &y, &dy);
+            E.mx = (float)x; E.my = (float)y;
+            SDL_Event ev = {};
+            ev.type = SDL_MOUSEWHEEL; ev.wheel.y = dy;
+            handle_event(ev);
+            build_frame();
+            frame_if_timed();
+            continue;
+        }
+        if (step.compare(0, 5, "drag:") == 0) {   /* press at x0,y0, move to x1,y1 in steps with the button held, release */
+            int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+            sscanf(step.c_str() + 5, "%d,%d,%d,%d", &x0, &y0, &x1, &y1);
+            build_frame();   /* the hit boxes must be those of the current state */
+            SDL_Event dn = {};
+            dn.type = SDL_MOUSEBUTTONDOWN; dn.button.button = SDL_BUTTON_LEFT; dn.button.clicks = 1; dn.button.x = (int)((float)x0 / E.scale); dn.button.y = (int)((float)y0 / E.scale);
+            handle_event(dn);
+            build_frame();
+            for (int i = 1; i <= 8; i++) {
+                SDL_Event mv = {};
+                mv.type = SDL_MOUSEMOTION; mv.motion.which = SCRIPT_MOUSE; mv.motion.state = SDL_BUTTON_LMASK;
+                mv.motion.x = (int)((float)(x0 + (x1 - x0) * i / 8) / E.scale); mv.motion.y = (int)((float)(y0 + (y1 - y0) * i / 8) / E.scale);
+                handle_event(mv);
+                build_frame();
+            }
+            SDL_Event up = {};
+            up.type = SDL_MOUSEBUTTONUP;
+            handle_event(up);
+            build_frame();
+            frame_if_timed();
+            continue;
+        }
         if (step.compare(0, 6, "mouse:") == 0 || step.compare(0, 6, "click:") == 0 || step.compare(0, 7, "dclick:") == 0) {
             int x = 0, y = 0;
             bool dbl = step[0] == 'd';

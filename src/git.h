@@ -21,4 +21,21 @@ struct GitInfo {
 bool git_installed();
 GitInfo git_query(const std::string &dir);            /* runs `git status`; call on open, save and refresh, not every frame */
 std::string git_diff(const std::string &root, const std::string &path, bool staged);   /* unified diff text for one file */
+
+/* ---- history, blame and writing ---- */
+struct GitCommit { std::string hash, subject, author, refs; long date = 0; int parents = 1; };
+struct GitFile { char status; std::string path; };          /* status: M A D R, path is the new name */
+struct GitBlame { std::string hash, author, summary; long time = 0; };   /* one entry per line; hash all zeros = not committed yet */
+
+/* the file as it is in a revision: "HEAD", a hash, or ":" for the index; empty when it does not exist there */
+std::string git_show(const std::string &root, const std::string &rev, const std::string &path);
+std::vector<GitCommit> git_log(const std::string &root, int n, const std::string &path);          /* path empty = whole branch */
+std::vector<GitFile> git_commit_files(const std::string &root, const std::string &hash);
+std::vector<GitFile> git_compare_files(const std::string &root, const std::string &a, const std::string &b);
+bool git_blame(const std::string &root, const std::string &path, std::vector<GitBlame> &out);     /* false: untracked or no history */
+bool git_stage(const std::string &root, const std::string &path);
+bool git_unstage(const std::string &root, const std::string &path);
+bool git_stage_all(const std::string &root);
+bool git_commit(const std::string &root, const std::string &message, std::string *err, bool all_if_nothing_staged);
+std::string git_ago(long t, long now);                        /* "3 days ago" */
 #endif

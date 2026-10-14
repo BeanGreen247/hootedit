@@ -37,6 +37,8 @@ A narrow rail on the left holds the **pin** button and three rotated tabs. Pinne
 
 With no file open and nothing typed, the window shows the Hootedit start screen and no tab strip. The start screen has the owl logo as a faint watermark above the name, tinted from the active theme. It is drawn from vector shapes at run time (`src/icons.cpp`, about 6 ms at 1x and 28 ms on a 2x display, once per size), with no image file. A double click on the start screen, or on the strip, opens an empty tab. Once tabs exist, a double click on the empty space to the right of the last one opens another empty tab, and Ctrl+N does the same. Closing the last tab brings the start screen back. Line numbers are centered in the gutter, and nothing under the status bar can be clicked.
 
+Tabs keep their natural width and the strip scrolls when they do not fit. The mouse wheel over the strip slides it without changing the active tab; switching tabs (click, Ctrl+Tab, Alt+1..9) scrolls just enough to show the active one. Drag a tab to reorder it (the strip follows the pointer near its edges), or press Ctrl+Shift+PgUp / Ctrl+Shift+PgDn to move the active tab. Ctrl+Shift+T brings back the last closed tab.
+
 `hootedit FOLDER` opens a folder; `hootedit FILE` uses the file's repository (or its folder) as the workspace.
 
 ## Search
@@ -110,8 +112,21 @@ The same themes as Lestrix: Xylonic Dark and Light, Graphite, Nord, Gruvbox, Sol
 | Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V | Select all, copy, cut, paste |
 | Shift + arrows / Home / End / PgUp / PgDn, mouse drag | Select |
 | Ctrl+F | Find in file (Alt+R regex, Alt+C case, Enter next, Esc leave) |
-| Ctrl+Shift+L, or click the language name | Language picker (type to filter; "Auto Detect" first) |
-| Ctrl+Shift+T | Color theme picker |
+| Ctrl+K M, or click the language name | Language picker (type to filter; "Auto Detect" first) |
+| Ctrl+K Ctrl+T | Color theme picker |
+| Ctrl+K Ctrl+O, Ctrl+K Ctrl+W, Ctrl+K Ctrl+S | Open folder, close all tabs without unsaved edits, save all |
+| Alt+1 .. Alt+9, Alt+0 | Go to tab N, to the last tab |
+| Ctrl+Shift+T | Reopen the last closed tab |
+| Ctrl+Shift+PgUp, Ctrl+Shift+PgDn | Move the tab left / right |
+| Ctrl+G | Go to line (also `:42` in Ctrl+P) |
+| Ctrl+Left / Right, Ctrl+Backspace / Delete | Move by word, delete a word |
+| Alt+Up / Down, Shift+Alt+Up / Down | Move the line(s), copy the line(s) |
+| Ctrl+Shift+K, Ctrl+L | Delete the line, select the line |
+| Ctrl+Enter, Ctrl+Shift+Enter | New line below, above |
+| Ctrl+/ | Toggle a line comment (by language) |
+| Ctrl+], Ctrl+[, Tab / Shift+Tab over several lines | Indent, outdent |
+| Ctrl+D | Select the word, then the next occurrence |
+| F3 | Next find match |
 | Ctrl+Shift+I | Statistics panel: caches and the latest operation timings |
 | Mouse wheel | Scroll (over the sidebar it scrolls the list) |
 
