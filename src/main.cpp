@@ -1708,9 +1708,9 @@ void remote_connect_now(int pi) {
     std::string pw = c.pw, root = remote_root(p);
     auto res = std::make_shared<std::vector<RemoteEntry>>();
     job_start(g_rjob, "Connecting to " + p.name, [p, pw, root, res](std::string &err) {
-        int rc = remote_connect(p, pw, &err);
-        if (rc == 0 && (p.proto == "ssh" || p.proto == "sftp")) rc = remote_list(p, pw, root, *res, &err);
-        else if (rc == 0) rc = remote_list(p, pw, root, *res, &err);
+        int rc = 0;
+        if (p.proto == "ssh" || p.proto == "sftp") rc = remote_connect(p, pw, &err);
+        if (rc == 0) rc = remote_list(p, pw, root, *res, &err);   /* ftp and smb have no session: the first listing is the login check */
         return rc;
     }, [pi, root, res, p](int code, const std::string &err) {
         if (pi >= (int)g_rem.conns.size()) return;
@@ -2553,8 +2553,8 @@ void draw_remote_view(float rail, float sw, float cx, float cw, float list_top, 
         }
     }
     ry += (float)S(8);
-    if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "Right-click a connection for more. Saving a file uploads it.", C_UI_FAINT, cw);
-    ry += rowh;
+    if (visible(rowh)) { draw_text(E.ui, cx, ui_base(ry, rowh), "Right-click a connection for more.", C_UI_FAINT, cw); draw_text(E.ui, cx, ui_base(ry + rowh, rowh), "Saving a file uploads it.", C_UI_FAINT, cw); }
+    ry += rowh * 2;
 }
 
 void draw_sidebar(const Layout &L) {
