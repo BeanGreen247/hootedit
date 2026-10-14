@@ -1474,7 +1474,8 @@ void build_frame() {
             if (line >= d.buf.lines()) break;
             char num[24];
             snprintf(num, sizeof num, "%zu", line + 1);
-            float x = (float)(L.ed_x + S(20));   /* left aligned */
+            float colw = (float)(L.text_x - L.ed_x - S(18));   /* the number column: the gutter without the space before the text */
+            float x = (float)L.ed_x + (colw - (float)(strlen(num) * (size_t)E.cw)) / 2;   /* centered, so 1, 42 and 1337 share one axis */
             draw_text(E.font, x, (float)(L.text_y + row * E.rowh + E.rowasc), num, line == cl ? C_GUTTER_CUR : C_GUTTER, (float)E.W);
         }
         if (E.blink_on && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows) {
