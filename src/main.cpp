@@ -5594,6 +5594,7 @@ int main(int argc, char **argv) {
         Doc &d = D();
         size_t nl = d.buf.lines();
         E.timing = true;
+        SDL_GL_SetSwapInterval(0);   /* with vsync on, the wait for the display lands in build_frame and hides the real cost */
         for (int pass = 0; pass < 2; pass++) {
             E.t_top = E.t_rows = E.t_gutter = E.t_status = E.t_flush = 0;
             double sum_build = 0, sum_full = 0, worst = 0;
@@ -5605,16 +5606,21 @@ int main(int argc, char **argv) {
                 double c1 = now_s();
                 r_end(E.r);
                 SDL_GL_SwapWindow(E.win);
+                uint8_t sync[4];
+                glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sync);   /* waits for the GPU, so the frame time is the time to finished pixels */
                 double c2 = now_s();
                 sum_build += c1 - c0; sum_full += c2 - c0;
                 if (c1 - c0 > worst) worst = c1 - c0;
             }
-            printf("bench pass %d (%s): build_frame %.1f us avg, worst %.1f us; with GL submit+swap %.1f us (software GL)\n", pass + 1,
-                   pass == 0 ? "cold caches" : "warm row cache", sum_build / bench * 1e6, worst * 1e6, sum_full / bench * 1e6);
+            printf("bench pass %d (%s): build_frame %.1f us avg, worst %.1f us; with GL submit+swap+finish %.1f us (%s)\n", pass + 1,
+                   pass == 0 ? "cold caches" : "warm row cache", sum_build / bench * 1e6, worst * 1e6, sum_full / bench * 1e6, E.gl_desc);
             printf("  per frame: tab row %.1f us, text rows (hash+lookup+push, no GL) %.1f us, clip flush (GL) %.1f us, editor area incl. rows %.1f us, status bar %.1f us\n",
                    E.t_top / bench * 1e6, E.t_rows / bench * 1e6, E.t_flush / bench * 1e6, E.t_gutter / bench * 1e6, E.t_status / bench * 1e6);
         }
         printf("%s\n", cache_stats_text().c_str());
+        if (g_job.th.joinable()) g_job.th.join();   /* a joinable thread at exit would abort and lose the numbers */
+        if (g_rjob.th.joinable()) g_rjob.th.join();
+        askpass_stop();
         return 0;
     }
     SDL_Event ev;
