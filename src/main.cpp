@@ -205,7 +205,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -409,6 +409,7 @@ struct GutterCache {
     bool blame_tried = false, blame_ok = false;
 };
 std::unordered_map<const Doc *, GutterCache> g_gutter;
+struct Peek { const Doc *doc = nullptr; int b0 = -1; } g_peek;   /* the inline diff of one change under its lines, opened from a change bar */
 
 void gutter_invalidate() { for (auto &kv : g_gutter) { kv.second.base_stale = true; kv.second.computed = false; kv.second.blame_tried = false; kv.second.blame_ok = false; } }
 /* no file and nothing typed: the start screen shows, with no tab strip */
@@ -3271,6 +3272,99 @@ void sb_to_pointer() {
     redraw();
 }
 
+/* The peek: the HEAD lines of a change (red) and the lines now in the buffer (green) in a panel under the changed lines, with Revert, Open Diff and next / previous change */
+void draw_peek(const Layout &L, Doc &d) {
+    if (g_peek.doc != &d || E.mode != M_EDIT) return;
+    GutterCache *gc = gutter_for(d);
+    size_t hk = 0;
+    bool found = false;
+    if (gc) for (; hk < gc->hunks.size(); hk++) if (gc->hunks[hk].b0 == g_peek.b0) { found = true; break; }
+    if (!found) { g_peek.doc = nullptr; return; }
+    const DiffHunk h = gc->hunks[hk];
+    const int cap = 10;
+    int nd = std::min(h.an, cap), na = std::min(h.bn, cap);
+    int n = 1 + nd + na + (h.an > cap || h.bn > cap ? 1 : 0);
+    long endrow = (long)(h.bn > 0 ? h.b0 + h.bn : h.b0) - (long)d.top;
+    if (endrow < 0 || endrow > L.rows) return;
+    float x = (float)L.text_x - (float)S(16), w = (float)E.W - x - (float)S(12), rh = (float)E.rowh;
+    float y = (float)(L.text_y) + (float)endrow * rh, ymax = (float)(L.text_y + L.rows * E.rowh);
+    float ph = (float)n * rh;
+    if (y + ph > ymax) y = std::max((float)L.text_y, ymax - ph);
+    r_rect(E.r, x, y, w, ph, ui_mix(C_EDITOR, C_FG, 0.05));
+    r_rect(E.r, x, y, w, 1, C_ACCENT);
+    r_rect(E.r, x, y + ph - 1, w, 1, C_BORDER);
+    hit(x, y, w, ph, H_PEEK, 0);   /* swallows clicks, so they do not move the cursor underneath */
+    /* header */
+    std::string cnt = sfmt("Change %zu of %zu", hk + 1, gc->hunks.size());
+    draw_text(E.ui, x + (float)S(10), ui_base(y, rh), cnt.c_str(), C_UI_DIM, w * 0.4f);
+    float rx = x + w - (float)S(6);
+    auto btn = [&](int id, const char *label, Icon ic) {
+        float tw = label ? text_width(E.ui, label) : 0.f;
+        float bw = (float)S(8) + (float)S(16) + (label ? tw + (float)S(4) : 0.f);
+        float bx = rx - bw;
+        if (hovered(H_PEEK, id)) r_rect(E.r, bx, y + 1, bw, rh - 1, C_HOVER);
+        draw_icon(ic, bx + (float)S(4), y + (rh - (float)S(16)) / 2, S(16), C_UI);
+        if (label) draw_text(E.ui, bx + (float)S(24), ui_base(y, rh), label, C_UI_DIM, tw + 2);
+        hit(bx, y + 1, bw, rh - 1, H_PEEK, id);
+        rx = bx - (float)S(2);
+    };
+    btn(3, nullptr, IC_CLOSE);
+    btn(2, "Open Diff", IC_OPEN_FILE);
+    btn(1, "Revert", IC_UNDO);
+    btn(5, nullptr, IC_ARROW_D);
+    btn(4, nullptr, IC_ARROW_U);
+    /* the lines */
+    float ly = y + rh;
+    const float tx = x + (float)S(28);
+    const int cols = std::max(1, (int)((x + w - tx - (float)S(8)) / (float)E.cw));
+    auto line = [&](const std::string &t, bool add) {
+        r_rect(E.r, x, ly, w, rh, add ? C_DIFF_ADD : C_DIFF_DEL);
+        draw_text(E.font, x + (float)S(10), ly + (float)E.rowasc, add ? "+" : "-", add ? C_GUT_ADD : C_GUT_DEL, (float)S(16));
+        r_clip(E.r, (int)tx, (int)ly, (int)(x + w - tx), E.rowh);
+        std::string shown = t.size() > (size_t)cols * 4 ? t.substr(0, (size_t)cols * 4) : t;
+        draw_text(E.font, tx, ly + (float)E.rowasc, shown.c_str(), C_FG, x + w - tx - (float)S(6));
+        r_clip_off(E.r);
+        ly += rh;
+    };
+    for (int i = 0; i < nd; i++) line(gc->base_lines[(size_t)(h.a0 + i)], false);
+    std::string t;
+    for (int i = 0; i < na; i++) { d.buf.line_text((size_t)(h.b0 + i), t); line(t, true); }
+    if (h.an > cap || h.bn > cap) draw_text(E.ui, tx, ui_base(ly, rh), sfmt("%d more lines not shown", std::max(h.an - cap, 0) + std::max(h.bn - cap, 0)).c_str(), C_UI_FAINT, w);
+}
+
+void peek_revert(Doc &d) {
+    GutterCache *gc = gutter_for(d);
+    if (!gc) return;
+    for (const DiffHunk &h : gc->hunks) {
+        if (h.b0 != g_peek.b0) continue;
+        std::string ins;
+        for (int i = 0; i < h.an; i++) ins += gc->base_lines[(size_t)(h.a0 + i)] + "\n";
+        size_t nl = d.buf.lines(), size = d.buf.size();
+        size_t pos = (size_t)h.b0 < nl ? d.buf.line_start((size_t)h.b0) : size;
+        size_t end = (size_t)(h.b0 + h.bn) < nl ? d.buf.line_start((size_t)(h.b0 + h.bn)) : size;
+        std::string last;
+        if (size) d.buf.copy(size - 1, 1, last);
+        bool no_eol = size && last != "\n";
+        if (end == size && no_eol && !ins.empty()) {   /* the buffer's last line has no newline: keep it that way */
+            if (h.bn == 0) ins = "\n" + ins;
+            ins.pop_back();
+        }
+        d.break_group();
+        d.replace(pos, end - pos, ins.data(), ins.size());
+        d.break_group();
+        g_peek.doc = nullptr;
+        E.status_msg = "change reverted (Ctrl+Z undoes it)";
+        return;
+    }
+}
+
+void peek_open_diff(Doc &d, int b0) {
+    std::string rel = rel_to_root(d.path);
+    if (rel.empty()) return;
+    Doc &nd = open_diff_spec(rel, ":", "WORK", "Index", "Working Tree", base_name(rel) + " (Working Tree)", "Unstaged changes: the index against the file on disk");
+    if (nd.dv) { DiffView &v = *nd.dv; for (size_t k = 0; k < v.m.hunks.size(); k++) if (v.m.hunks[k].b0 + std::max(v.m.hunks[k].bn, 1) > b0) { v.cur_change = (int)k; break; } v.top = -1; }   /* top = -1: scroll to cur_change when drawn */
+}
+
 void build_frame() {
     Layout L = layout();
     Doc &d = D();
@@ -3500,6 +3594,7 @@ void build_frame() {
             int c = col_of(t, cb) - d.left;
             if (c >= 0 && c <= L.cols) r_rect(E.r, (float)(L.text_x + c * E.cw), (float)(L.text_y + (long)(cl - d.top) * E.rowh), std::max(1.f, 1.5f * E.scale), (float)E.rowh, C_CURSOR);
         }
+        draw_peek(L, d);
     }
     double tm3 = E.timing ? now_s() : 0;
 
@@ -4903,6 +4998,7 @@ void key_down(const SDL_KeyboardEvent &k) {
         touch();
         return;
     }
+    if (g_peek.doc == &d && sym == SDLK_ESCAPE) { g_peek.doc = nullptr; touch(); return; }
     if (d.dv && diff_key(k, ctrl, shift)) return;
     if (ctrl && !alt && (sym == SDLK_LEFT || sym == SDLK_RIGHT)) { d.break_group(); d.move_to(sym == SDLK_LEFT ? word_left(d, d.cur) : word_right(d, d.cur), shift, false); E.follow = true; touch(); return; }
     if (ctrl && !shift && (sym == SDLK_BACKSPACE || sym == SDLK_DELETE)) {
@@ -5119,12 +5215,30 @@ void click_hit(const Hit &h) {
         if (bl) { GitBlame b = *bl; open_blame_commit(b, rel_to_root(d.path)); }
         break;
     }
-    case H_GUTTER: {   /* a click on a change bar opens the working-tree diff of the file at that change */
+    case H_GUTTER: {   /* a click on a change bar opens or closes the inline peek of that change */
         Doc &d = D();
-        std::string rel = rel_to_root(d.path);
-        if (rel.empty()) break;
-        Doc &nd = open_diff_spec(rel, ":", "WORK", "Index", "Working Tree", base_name(rel) + " (Working Tree)", "Unstaged changes: the index against the file on disk");
-        if (nd.dv) { DiffView &v = *nd.dv; for (size_t k = 0; k < v.m.hunks.size(); k++) if (v.m.hunks[k].b0 + std::max(v.m.hunks[k].bn, 1) > h.id) { v.cur_change = (int)k; break; } v.top = -1; }   /* top = -1: scroll to cur_change when drawn */
+        if (g_peek.doc == &d && g_peek.b0 == h.id) g_peek.doc = nullptr; else { g_peek.doc = &d; g_peek.b0 = h.id; }
+        break;
+    }
+    case H_PEEK: {
+        Doc &d = D();
+        if (g_peek.doc != &d || h.id == 0) break;
+        GutterCache *gc = gutter_for(d);
+        if (h.id == 3) g_peek.doc = nullptr;
+        else if (h.id == 1) peek_revert(d);
+        else if (h.id == 2) { int b0 = g_peek.b0; g_peek.doc = nullptr; peek_open_diff(d, b0); }
+        else if ((h.id == 4 || h.id == 5) && gc) {
+            for (size_t k = 0; k < gc->hunks.size(); k++) if (gc->hunks[k].b0 == g_peek.b0) {
+                size_t to = h.id == 5 ? k + 1 : k;
+                if (h.id == 4) { if (k == 0) break; to = k - 1; }
+                if (to >= gc->hunks.size()) break;
+                g_peek.b0 = gc->hunks[to].b0;
+                size_t ln = std::min((size_t)gc->hunks[to].b0, d.buf.lines() - 1);
+                d.break_group(); d.move_to(d.buf.line_start(ln), false, false);
+                E.follow = true;
+                break;
+            }
+        }
         break;
     }
     case H_DIFFFOLD: {
