@@ -319,3 +319,52 @@ int remote_put(const RemoteProfile &p, const std::string &pw, const std::string 
     if (c != 0 && err) { size_t nl = o.find('\n'); *err = o.empty() ? "upload failed" : o.substr(0, nl); }
     return c;
 }
+
+int remote_op_one(const RemoteProfile &p, const std::string &pw, RemoteOp op, const std::string &path, const std::string &to, std::string *err);
+
+int remote_op(const RemoteProfile &p, const std::string &pw, RemoteOp op, const std::string &path, const std::string &to, std::string *err) {
+    if (op == ROP_RMDIR && (p.proto == "sftp" || p.proto == "ftp" || p.proto == "ftps")) {   /* no recursive delete in these protocols: empty the folder first */
+        std::vector<RemoteEntry> kids;
+        int rc = remote_list(p, pw, path, kids, err);
+        for (size_t i = 0; rc == 0 && i < kids.size(); i++) {
+            std::string child = path.empty() || path == "." ? kids[i].name : path.back() == '/' ? path + kids[i].name : path + "/" + kids[i].name;
+            rc = remote_op(p, pw, kids[i].dir ? ROP_RMDIR : ROP_DELETE, child, "", err);
+        }
+        if (rc != 0) return rc;
+    }
+    return remote_op_one(p, pw, op, path, to, err);
+}
+
+int remote_op_one(const RemoteProfile &p, const std::string &pw, RemoteOp op, const std::string &path, const std::string &to, std::string *err) {
+    std::string o, empty = op == ROP_NEWFILE && p.proto != "ssh" ? secret_file("") : "";   /* sftp, smb and ftp cannot upload /dev/null: they need a real empty file */
+    int c;
+    if (p.proto == "ssh") {
+        std::string cmd = op == ROP_NEWFILE ? "set -o noclobber; : > " + q(path) : op == ROP_MKDIR ? "mkdir -- " + q(path) : op == ROP_RENAME ? "[ ! -e " + q(to) + " ] && mv -- " + q(path) + " " + q(to) : op == ROP_DELETE ? "rm -- " + q(path) : "rm -rf -- " + q(path);
+        c = run(askpass_env() + "ssh " + ssh_opts(p, false) + " " + q(target(p)) + " " + q(cmd), &o);
+    } else if (p.proto == "sftp") {
+        std::string cmd = op == ROP_NEWFILE ? "put " + q(empty) + " " + q(path) : op == ROP_MKDIR ? "mkdir " + q(path) : op == ROP_RENAME ? "rename " + q(path) + " " + q(to) : op == ROP_DELETE ? "rm " + q(path) : "rmdir " + q(path);
+        c = run("printf '%s\\n' " + q(cmd) + " | " + askpass_env() + "sftp -q -b - " + ssh_opts(p, true) + " " + q(target(p)), &o, false);
+    } else if (p.proto == "smb") {
+        std::string share, rest, share2, rest2;
+        if (!smb_split(path, &share, &rest) || rest.empty() || (op == ROP_RENAME && !smb_split(to, &share2, &rest2))) { if (err) *err = "choose a folder inside a share"; unlink(empty.c_str()); return -1; }
+        if (path.find('"') != std::string::npos || to.find('"') != std::string::npos) { if (err) *err = "a double quote in the name is not supported on smb"; unlink(empty.c_str()); return -1; }
+        std::string cmd = op == ROP_NEWFILE ? "put \"" + empty + "\" \"" + rest + "\"" : op == ROP_MKDIR ? "mkdir \"" + rest + "\"" : op == ROP_RENAME ? "rename \"" + rest + "\" \"" + rest2 + "\"" : op == ROP_DELETE ? "rm \"" + rest + "\"" : "deltree \"" + rest + "\"";
+        c = run(smb_cmd(p, smb_auth(p, pw), share, cmd), &o);
+    } else {   /* ftp, ftps: quote commands before a throwaway listing of the root, or an upload of nothing for a new file */
+        std::string cfg = curl_cfg(p, pw);
+        std::string base = "curl -sS --connect-timeout 12 --max-time 40 -K " + q(cfg) + " ";
+        if (op == ROP_NEWFILE) c = run(base + "-T " + q(empty) + " " + q(url(p, path)), &o);
+        else {
+            std::string quote = op == ROP_MKDIR ? "-Q " + q("MKD " + path) : op == ROP_RENAME ? "-Q " + q("RNFR " + path) + " -Q " + q("RNTO " + to) : op == ROP_DELETE ? "-Q " + q("DELE " + path) : "-Q " + q("RMD " + path);
+            c = run(base + quote + " -o /dev/null " + q(url(p, "/")), &o);
+        }
+        unlink(cfg.c_str());
+    }
+    if (!empty.empty()) unlink(empty.c_str());
+    if (c != 0 && err) {
+        while (!o.empty() && (o.back() == '\n' || o.back() == '\r')) o.pop_back();
+        size_t nl = p.proto == "sftp" ? o.rfind('\n') : o.find('\n');   /* sftp echoes the command first: the reason is the last line */
+        *err = o.empty() ? "the operation failed" : p.proto == "sftp" && nl != std::string::npos ? o.substr(nl + 1) : o.substr(0, nl);
+    }
+    return c;
+}

@@ -236,6 +236,7 @@ struct GitUi {
 struct Dialog {
     std::string title, detail, text, placeholder;
     bool input = false, mask = false;
+    bool fresh = false;                  /* the prefilled text is selected: the next key replaces it */
     std::vector<std::string> btns;
     int focus = 0;
     std::function<void(int, const std::string &)> done;
@@ -1052,7 +1053,7 @@ void dlg_show(const std::string &title, const std::string &detail, std::vector<s
     Dialog &d = E.dlg;
     d.mask = mask;
     d.title = title; d.detail = detail; d.btns = std::move(btns); d.done = std::move(done);
-    d.input = input; d.text = text; d.placeholder = ph; d.focus = 0;
+    d.input = input; d.text = text; d.placeholder = ph; d.focus = 0; d.fresh = input && !text.empty() && !mask;
     E.mode = M_DIALOG;
     redraw();
 }
@@ -1198,7 +1199,12 @@ void draw_dialog() {
         r_rect(E.r, px + pad + 1, y + 1, iw - 2, (float)S(28), C_FIELD);
         float pen = px + pad + (float)S(8);
         if (d.text.empty()) draw_text(E.ui, pen, ui_base(y, (float)S(30)), d.placeholder.c_str(), C_UI_FAINT, iw - (float)S(16));
-        else { std::string shown = d.mask ? std::string(d.text.size() > 40 ? 40 : d.text.size(), '*') : d.text; pen = draw_text(E.ui, pen, ui_base(y, (float)S(30)), shown.c_str(), C_UI, iw - (float)S(16)); }
+        else {
+            std::string shown = d.mask ? std::string(d.text.size() > 40 ? 40 : d.text.size(), '*') : d.text;
+            float p0 = pen;
+            if (d.fresh) r_rect(E.r, p0, y + (float)S(4), std::min(iw - (float)S(16), text_width(E.ui, shown.c_str())), (float)S(22), C_SELROW);
+            pen = draw_text(E.ui, pen, ui_base(y, (float)S(30)), shown.c_str(), C_UI, iw - (float)S(16));
+        }
         if (E.blink_on) r_rect(E.r, pen + 1, y + (float)S(6), std::max(1.f, E.scale), (float)S(18), C_CURSOR);
         y += (float)S(36);
     }
@@ -1696,6 +1702,59 @@ void remote_list_dir(int pi, const std::string &path, bool then_open = true) {
     });
 }
 
+std::string remote_parent(const std::string &path) {
+    size_t sl = path.rfind('/');
+    return sl == std::string::npos ? "." : sl == 0 ? "/" : path.substr(0, sl);
+}
+std::string remote_join(const std::string &dir, const std::string &name) { return dir == "." || dir.empty() ? name : dir.back() == '/' ? dir + name : dir + "/" + name; }
+
+/* run one change on the server in the background, then list the folder it touched again */
+void remote_change(int pi, RemoteOp op, const std::string &path, const std::string &to, const std::string &done) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    if (g_rjob.running) { E.status_msg = "another remote operation is running"; return; }
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string pw = g_rem.conns[(size_t)pi].pw;
+    job_start(g_rjob, "Working on " + p.name, [p, pw, op, path, to](std::string &err) { return remote_op(p, pw, op, path, to, &err); }, [pi, op, path, to, done](int code, const std::string &err) {
+        if (code != 0) { remote_error("The server could not complete this", err); return; }
+        if (pi >= (int)g_rem.conns.size()) return;
+        RConn &c = g_rem.conns[(size_t)pi];
+        for (auto &f : g_rem.files) if (f.second.prof == pi && op == ROP_RENAME && f.second.remote == path) f.second.remote = to;   /* an open tab keeps saving to the new name */
+        for (auto it = c.dirs.begin(); it != c.dirs.end();) { if (op == ROP_DELETE || op == ROP_RMDIR || op == ROP_RENAME) { if (it->first == path || it->first.compare(0, path.size() + 1, path + "/") == 0) { c.expanded.erase(it->first); it = c.dirs.erase(it); continue; } } ++it; }
+        std::string par = remote_parent(op == ROP_RENAME ? to : path);
+        c.dirs.erase(par);
+        if (op == ROP_RENAME && remote_parent(path) != par) c.dirs.erase(remote_parent(path));
+        E.status_msg = done;
+        remote_list_dir(pi, par, false);
+    });
+}
+
+void remote_ask_name(int pi, const std::string &dir, RemoteOp op) {
+    bool dirq = op == ROP_MKDIR;
+    dlg_show(dirq ? "New folder in " + dir : "New file in " + dir, "Created on the server right away.", {"Create", "Cancel"}, [pi, dir, op, dirq](int i, const std::string &t) {
+        std::string n = trim_nl(t);
+        if (i != 0 || n.empty()) return;
+        if (n.find('/') != std::string::npos) { remote_error("Not a valid name", "A name cannot contain a slash."); return; }
+        remote_change(pi, op, remote_join(dir, n), "", dirq ? "folder created" : "file created");
+    }, true, "", dirq ? "folder name" : "file name");
+}
+
+void remote_ask_rename(int pi, const std::string &path, bool is_dir) {
+    std::string cur = path.substr(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1);
+    dlg_show("Rename " + cur, "The new name on the server.", {"Rename", "Cancel"}, [pi, path, is_dir](int i, const std::string &t) {
+        std::string n = trim_nl(t);
+        if (i != 0 || n.empty()) return;
+        if (n.find('/') != std::string::npos) { remote_error("Not a valid name", "A name cannot contain a slash."); return; }
+        remote_change(pi, ROP_RENAME, path, remote_join(remote_parent(path), n), is_dir ? "folder renamed" : "file renamed");
+    }, true, cur, "new name");
+}
+
+void remote_ask_delete(int pi, const std::string &path, bool is_dir) {
+    std::string cur = path.substr(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1);
+    dlg_show(is_dir ? "Are you sure you want to delete the folder '" + cur + "' and its contents?" : "Are you sure you want to delete '" + cur + "'?", "It is removed on the server. This action is irreversible!", {"Delete", "Cancel"}, [pi, path, is_dir](int i, const std::string &) {
+        if (i == 0) remote_change(pi, is_dir ? ROP_RMDIR : ROP_DELETE, path, "", is_dir ? "folder deleted" : "file deleted");
+    });
+}
+
 void remote_connect_now(int pi) {
     if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
     RConn &c = g_rem.conns[(size_t)pi];
@@ -1830,7 +1889,7 @@ void remote_menu(int pi, const std::string &path, int kind, float x, float y) {
     bool ssh = p.proto == "ssh" || p.proto == "sftp";
     if (kind == 0) {
         std::vector<CtxItem> v = {ci(c.connected ? "Reconnect" : "Connect", [pi] { if (g_rem.conns[(size_t)pi].connected) remote_disconnect_now(pi); remote_connect(pi); }),
-                                  ci("Disconnect", [pi] { remote_disconnect_now(pi); }, "", c.connected), ci("Refresh", [pi] { RConn &k = g_rem.conns[(size_t)pi]; k.dirs.clear(); k.expanded.clear(); remote_connect_now(pi); }, "", c.connected), ci_sep(),
+                                  ci("Disconnect", [pi] { remote_disconnect_now(pi); }, "", c.connected), ci("New File...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_NEWFILE); }, "", c.connected), ci("New Folder...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_MKDIR); }, "", c.connected), ci("Refresh", [pi] { RConn &k = g_rem.conns[(size_t)pi]; k.dirs.clear(); k.expanded.clear(); remote_connect_now(pi); }, "", c.connected), ci_sep(),
                                   ci("Open SSH Terminal", [pi] { remote_open_terminal(pi); }, "", ssh), ci_sep(),
                                   ci("Edit Connections File", [] { const char *x2 = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME"); open_path((x2 && *x2 ? std::string(x2) : std::string(h ? h : ".") + "/.config") + "/hootedit/remotes.ini"); }),
                                   ci("Remove Connection", [pi] {
@@ -1844,9 +1903,12 @@ void remote_menu(int pi, const std::string &path, int kind, float x, float y) {
                                       }); })};
         ctx_show(x, y, std::move(v));
     } else if (kind == 1) {
-        ctx_show(x, y, {ci("Refresh", [pi, path] { g_rem.conns[(size_t)pi].dirs.erase(path); remote_list_dir(pi, path); }), ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
+        ctx_show(x, y, {ci("New File...", [pi, path] { remote_ask_name(pi, path, ROP_NEWFILE); }), ci("New Folder...", [pi, path] { remote_ask_name(pi, path, ROP_MKDIR); }), ci_sep(),
+                        ci("Rename...", [pi, path] { remote_ask_rename(pi, path, true); }), ci("Delete", [pi, path] { remote_ask_delete(pi, path, true); }), ci_sep(),
+                        ci("Refresh", [pi, path] { g_rem.conns[(size_t)pi].dirs.erase(path); remote_list_dir(pi, path); }), ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
     } else if (kind == 2) {
-        ctx_show(x, y, {ci("Open", [pi, path] { remote_open_file(pi, path); }), ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
+        ctx_show(x, y, {ci("Open", [pi, path] { remote_open_file(pi, path); }), ci_sep(), ci("Rename...", [pi, path] { remote_ask_rename(pi, path, false); }), ci("Delete", [pi, path] { remote_ask_delete(pi, path, false); }), ci_sep(),
+                        ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
     }
 }
 
@@ -4612,8 +4674,8 @@ void key_down(const SDL_KeyboardEvent &k) {
         else if (sym == SDLK_TAB) d.focus = (d.focus + (shift ? n - 1 : 1)) % std::max(1, n);
         else if (sym == SDLK_LEFT && !d.input) d.focus = (d.focus + n - 1) % std::max(1, n);
         else if (sym == SDLK_RIGHT && !d.input) d.focus = (d.focus + 1) % std::max(1, n);
-        else if (d.input && sym == SDLK_BACKSPACE) pop_utf8(d.text);
-        else if (d.input && sym == SDLK_v && ctrl) { char *c = SDL_GetClipboardText(); if (c) { d.text += c; SDL_free(c); } }
+        else if (d.input && sym == SDLK_BACKSPACE) { if (d.fresh) { d.text.clear(); d.fresh = false; } else pop_utf8(d.text); }
+        else if (d.input && sym == SDLK_v && ctrl) { char *c = SDL_GetClipboardText(); if (c) { if (d.fresh) { d.text.clear(); d.fresh = false; } d.text += c; SDL_free(c); } }
         else if (d.input && sym == SDLK_u && ctrl) d.text.clear();
         touch();
         return;
@@ -5143,7 +5205,7 @@ void text_input(const char *s) {
         if (!(SDL_GetModState() & (KMOD_CTRL | KMOD_ALT))) { begin_op("terminal key"); tcore_text(cur_term()->core, s); touch(); }
         return;
     }
-    if (E.mode == M_DIALOG) { if (E.dlg.input) { E.dlg.text += s; touch(); } return; }
+    if (E.mode == M_DIALOG) { if (E.dlg.input) { if (E.dlg.fresh) { E.dlg.text.clear(); E.dlg.fresh = false; } E.dlg.text += s; touch(); } return; }
     if (E.mode == M_CTX) return;
     if (E.mode == M_EDIT && D().dv) return;   /* diff tabs are read only */
     if (E.mode == M_EDIT) begin_op("keystroke");

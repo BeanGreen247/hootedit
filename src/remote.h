@@ -30,6 +30,9 @@ void remote_disconnect(const RemoteProfile &p);
 int remote_list(const RemoteProfile &p, const std::string &pw, const std::string &dir, std::vector<RemoteEntry> &out, std::string *err);
 int remote_get(const RemoteProfile &p, const std::string &pw, const std::string &remote, const std::string &local, std::string *err);
 int remote_put(const RemoteProfile &p, const std::string &pw, const std::string &local, const std::string &remote, std::string *err);
+enum RemoteOp { ROP_NEWFILE, ROP_MKDIR, ROP_RENAME, ROP_DELETE, ROP_RMDIR };
+/* new file, new folder, rename (path -> to), delete a file, delete a folder with its contents (sftp, ftp: empty folders only) */
+int remote_op(const RemoteProfile &p, const std::string &pw, RemoteOp op, const std::string &path, const std::string &to, std::string *err);
 std::string remote_ssh_line(const RemoteProfile &p);                      /* "ssh -p 22 user@host" for a terminal */
 std::string remote_label(const RemoteProfile &p);                         /* "user@host:22" */
 #endif
