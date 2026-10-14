@@ -345,6 +345,8 @@ struct Ed {
     std::vector<Hit> hits;
     int hover_kind = 0, hover_id = -1;
     float mx = -1, my = -1;
+    double tip_at = 0;                                   /* when the pointer has rested long enough for a tooltip, 0 = none pending */
+    bool tip_on = false;
     std::string title_last;
     bool blank_tab = false;                          /* the placeholder document has been turned into a real empty tab (double click or Ctrl+N) */
     float hit_floor = 1e9f;                          /* hit boxes are cut off at this y: nothing behind the status bar can be clicked */
@@ -2137,6 +2139,10 @@ void remote_row_click(int idx) {
     } else if (r.kind == 2) remote_open_file(r.prof, r.path);
 }
 
+void tip_poll() {
+    if (E.tip_at > 0 && now_s() >= E.tip_at) { E.tip_at = 0; E.tip_on = true; redraw(); }
+}
+
 void askpass_poll() {
     if (E.mode == M_DIALOG) return;
     AskReq r;
@@ -3670,6 +3676,39 @@ void peek_open_diff(Doc &d, int b0) {
     if (nd.dv) { DiffView &v = *nd.dv; for (size_t k = 0; k < v.m.hunks.size(); k++) if (v.m.hunks[k].b0 + std::max(v.m.hunks[k].bn, 1) > b0) { v.cur_change = (int)k; break; } v.top = -1; }   /* top = -1: scroll to cur_change when drawn */
 }
 
+/* A rested pointer over a line number, or over the faint blame text of the cursor line, shows who changed the line and why */
+void draw_blame_tip(const Layout &L, Doc &d) {
+    if (!E.tip_on || E.mode != M_EDIT) return;
+    if (E.my < (float)L.text_y || E.my >= (float)(L.text_y + L.rows * E.rowh)) return;
+    size_t line = d.top + (size_t)((E.my - (float)L.text_y) / (float)E.rowh);
+    if (line >= d.buf.lines()) return;
+    bool in_gutter = E.mx >= (float)L.ed_x && E.mx < (float)L.text_x - (float)S(18);
+    bool on_note = false;
+    if (!in_gutter && E.g.blame_inline && line == d.buf.line_of(d.cur) && !d.has_sel()) {
+        std::string t;
+        d.buf.line_text(line, t);
+        float x0 = (float)L.text_x + (float)((col_of(t, t.size()) - d.left + 4) * E.cw);
+        on_note = E.mx >= x0;
+    }
+    if (!in_gutter && !on_note) return;
+    const GitBlame *bl = blame_for(d, line);
+    if (!bl) return;
+    std::string l1 = bl->summary.empty() ? std::string("Uncommitted changes") : bl->summary;
+    bool unc = bl->hash.find_first_not_of('0') == std::string::npos;
+    std::string l2 = unc ? "You, not committed yet" : bl->author + ", " + git_ago(bl->time, (long)time(nullptr)) + "  (" + bl->hash.substr(0, 7) + ")";
+    std::string l3 = unc ? "" : "Click the line's blame text to open the commit";
+    float w = std::max(text_width(E.ui, l1.c_str()), std::max(text_width(E.ui, l2.c_str()), text_width(E.ui, l3.c_str()))) + (float)S(24);
+    w = std::min(w, (float)E.W - (float)S(20));
+    float lh = (float)S(22), h = lh * (l3.empty() ? 2 : 3) + (float)S(10);
+    float x = std::min(E.mx + (float)S(12), (float)E.W - w - (float)S(8)), y = E.my + (float)S(18);
+    if (y + h > (float)(L.text_y + L.rows * E.rowh)) y = E.my - h - (float)S(8);
+    r_rect(E.r, x - 1, y - 1, w + 2, h + 2, C_BORDER);
+    r_rect(E.r, x, y, w, h, C_CHROME);
+    draw_text(E.ui, x + (float)S(12), ui_base(y + (float)S(5), lh), l1.c_str(), C_UI, w - (float)S(24), FS_BOLD);
+    draw_text(E.ui, x + (float)S(12), ui_base(y + (float)S(5) + lh, lh), l2.c_str(), C_UI_DIM, w - (float)S(24));
+    if (!l3.empty()) draw_text(E.ui, x + (float)S(12), ui_base(y + (float)S(5) + 2 * lh, lh), l3.c_str(), C_UI_FAINT, w - (float)S(24));
+}
+
 void build_frame() {
     Layout L = layout();
     Doc &d = D();
@@ -3910,6 +3949,7 @@ void build_frame() {
         }
         draw_peek(L, d);
         draw_conflict_actions(L, d);
+        draw_blame_tip(L, d);
     }
     double tm3 = E.timing ? now_s() : 0;
 
@@ -5850,6 +5890,8 @@ void handle_event(const SDL_Event &e) {
     case SDL_MOUSEMOTION:
         if (g_scripted && e.motion.which != SCRIPT_MOUSE) break;   /* --script drives the pointer; the real one (xvfb parks it mid-window) is ignored */
         E.mx = (float)e.motion.x * E.scale; E.my = (float)e.motion.y * E.scale;
+        if (E.tip_on) { E.tip_on = false; redraw(); }
+        E.tip_at = now_s() + 0.5;
         if (E.tab_press >= 0 && (e.motion.state & SDL_BUTTON_LMASK)) {
             Layout L = layout();
             if (!E.tab_dragging && std::fabs(E.mx - E.tab_press_x) > (float)S(6)) E.tab_dragging = true;
@@ -5948,7 +5990,7 @@ void run_script(const char *script) {
         if (step.compare(0, 4, "wait") == 0) {   /* wait:MS lets background work (a search) finish, then polls and draws */
             double until = now_s() + atof(step.c_str() + (step[5] == '~' ? 6 : 5)) / 1000.0;
             while (now_s() < until && (E.s_active && !E.sstat.done)) { search_poll(); SDL_Delay(1); }
-            while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { git_job_poll(); job_poll(g_rjob); askpass_poll(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
+            while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { git_job_poll(); job_poll(g_rjob); askpass_poll(); tip_poll(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
             search_poll(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
             continue;
         }
@@ -6168,6 +6210,7 @@ int main(int argc, char **argv) {
         if (g_job.running || g_rjob.running) due = std::min(due, E.now + 0.2);
         if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, E.last_blink + 0.53);
         if (E.side_close_at > 0) due = std::min(due, E.side_close_at);
+        if (E.tip_at > 0) due = std::min(due, E.tip_at);
         if (E.follow_fleet && !E.fleet_watch) due = std::min(due, E.next_fleet ? E.next_fleet : E.now + 1.0);
         double left = due - E.now;
         int wait = left < 0.001 ? 1 : left > 5.0 ? 5000 : (int)(left * 1000.0) + 1;
@@ -6180,6 +6223,7 @@ int main(int argc, char **argv) {
         git_job_poll();
         job_poll(g_rjob);
         askpass_poll();
+        tip_poll();
         terms_pump();
         if (E.follow_fleet && !E.fleet_watch) E.fleet_watch = fleetwm_watch_start();
         if (fleetwm_watch_take() || (E.follow_fleet && E.now >= E.next_fleet)) {
