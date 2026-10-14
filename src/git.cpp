@@ -134,10 +134,11 @@ std::string git_show(const std::string &root, const std::string &rev, const std:
     return run("git -C " + shq(root) + " show " + shq((rev == ":" ? std::string(":") : rev + ":") + path));
 }
 
-std::vector<GitCommit> git_log(const std::string &root, int n, const std::string &path) {
+std::vector<GitCommit> git_log(const std::string &root, int n, const std::string &path, bool graph) {
     std::vector<GitCommit> v;
     /* fields split by 0x1f, records by 0x1e; the path form follows renames so a moved file keeps its history */
     std::string cmd = "git -C " + shq(root) + " log -n " + std::to_string(n) + " --decorate=short --format=%H%x1f%an%x1f%at%x1f%P%x1f%D%x1f%s%x1e";
+    if (graph) cmd += " --topo-order HEAD --branches --remotes";
     if (!path.empty()) cmd += " --follow -- " + shq(path);
     std::string out = run(cmd);
     for (const std::string &rec : lines_of(out, 0x1e)) {
@@ -149,6 +150,7 @@ std::vector<GitCommit> git_log(const std::string &root, int n, const std::string
         c.hash = f[0]; c.author = f[1]; c.date = atol(f[2].c_str());
         c.parents = f[3].empty() ? 0 : 1;
         for (char ch : f[3]) if (ch == ' ') c.parents++;
+        c.parent_hashes = lines_of(f[3], ' ');
         c.refs = f[4]; c.subject = f[5];
         v.push_back(c);
     }

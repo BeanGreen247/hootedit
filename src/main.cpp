@@ -217,6 +217,9 @@ struct GitUi {
     std::string msg;                                   /* the commit message being typed */
     bool open_staged = true, open_changes = true, open_graph = true, open_tl = true, open_merge = true;
     std::vector<GitCommit> log;                        /* the branch history, newest first */
+    struct Lane { int col = 0; std::vector<uint8_t> top, bot; std::vector<int> conv, out; };   /* the graph drawing of one commit row, see graph_lanes */
+    std::vector<Lane> lanes;
+    int lane_cols = 1;
     int log_sel = -1;                                  /* the expanded commit, or -1 */
     std::vector<GitFile> sel_files;                    /* its files, or the files that differ between two commits */
     std::string cmp_a, cmp_b;                          /* set while sel_files is a comparison of two commits */
@@ -718,12 +721,58 @@ void git_ui_timeline() {
     if (!rel.empty()) g.tl = git_log(E.git.root, 60, rel);
 }
 
+/* Lanes for the history graph: each lane waits for the hash of the commit it leads to. A commit takes the lane that waits for it
+ * (new one if none does), its first parent continues in that lane, other parents get a lane of their own (or join one that
+ * already waits for them), and further lanes that waited for the same commit end here. */
+void graph_lanes(GitUi &g) {
+    g.lanes.assign(g.log.size(), GitUi::Lane());
+    std::vector<std::string> L;
+    size_t maxc = 1;
+    for (size_t i = 0; i < g.log.size(); i++) {
+        const GitCommit &c = g.log[i];
+        GitUi::Lane &r = g.lanes[i];
+        int col = -1;
+        for (size_t k = 0; k < L.size(); k++) if (L[k] == c.hash) { col = (int)k; break; }
+        r.top.assign(L.size(), 0);
+        for (size_t k = 0; k < L.size(); k++) r.top[k] = L[k].empty() ? 0 : 1;
+        if (col < 0) {
+            for (size_t k = 0; k < L.size(); k++) if (L[k].empty()) { col = (int)k; break; }
+            if (col < 0) { col = (int)L.size(); L.push_back(""); }
+            r.top.resize(L.size(), 0);
+            r.top[(size_t)col] = 0;   /* a branch tip: nothing comes in from above */
+        } else {
+            for (size_t k = 0; k < L.size(); k++) if ((int)k != col && L[k] == c.hash) { r.conv.push_back((int)k); L[k].clear(); }
+        }
+        r.col = col;
+        L[(size_t)col].clear();
+        for (size_t pi = 0; pi < c.parent_hashes.size(); pi++) {
+            const std::string &ph = c.parent_hashes[pi];
+            if (pi == 0) { L[(size_t)col] = ph; continue; }   /* the first parent keeps the lane; lanes that wait for the same commit join up when it is reached */
+            int at = -1;
+            for (size_t k = 0; k < L.size(); k++) if (L[k] == ph) { at = (int)k; break; }
+            if (at < 0) {
+                for (size_t k = 0; k < L.size(); k++) if (L[k].empty() && (int)k != col) { at = (int)k; break; }
+                if (at < 0) { at = (int)L.size(); L.push_back(""); }
+                L[(size_t)at] = ph;
+            }
+            r.out.push_back(at);
+        }
+        r.bot.assign(L.size(), 0);
+        for (size_t k = 0; k < L.size(); k++) r.bot[k] = L[k].empty() ? 0 : 1;
+        r.top.resize(L.size(), 0);
+        maxc = std::max(maxc, L.size());
+        while (!L.empty() && L.back().empty()) L.pop_back();
+    }
+    g.lane_cols = (int)std::min<size_t>(maxc, 5);
+}
+
 void git_ui_reload() {
     GitUi &g = E.g;
     if (!E.git.repo) { g.log.clear(); g.tl.clear(); g.tl_path.clear(); g.log_sel = -1; g.sel_files.clear(); return; }
     if (E.view != V_GIT) { g.tl_path = "\x01"; return; }   /* loaded when the tab is shown */
     std::string keep = g.log_sel >= 0 && (size_t)g.log_sel < g.log.size() ? g.log[(size_t)g.log_sel].hash : std::string();
-    g.log = git_log(E.git.root, 120, "");
+    g.log = git_log(E.git.root, 120, "", true);
+    graph_lanes(g);
     g.log_sel = -1;
     if (!keep.empty() && g.cmp_a.empty()) for (size_t i = 0; i < g.log.size(); i++) if (g.log[i].hash == keep) g.log_sel = (int)i;
     if (g.log_sel < 0) { g.sel_files.clear(); g.cmp_a.clear(); g.cmp_b.clear(); }
@@ -2653,6 +2702,15 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
     section(2, "GRAPH", g.open_graph, (int)g.log.size(), -1);
     if (g.open_graph) {
         const float gh = (float)S(24);
+        const float lw = (float)S(10), lx0 = cx + (float)S(6), th = std::max(1.f, (float)S(2));
+        const float textx = lx0 + (float)g.lane_cols * lw + (float)S(2);
+        const uint32_t pal[5] = {C_GUT_MOD, C_GUT_ADD, C_GIT_MOD, C_ACCENT, C_GUT_DEL};
+        auto lane_x = [&](int k) { return lx0 + (float)std::min(k, 4) * lw; };
+        auto through = [&](size_t i, float y, float h) {   /* the lanes that continue below commit i, drawn over a row of height h */
+            if (i >= g.lanes.size()) return;
+            const GitUi::Lane &ln = g.lanes[i];
+            for (size_t k = 0; k < ln.bot.size() && k < 5; k++) if (ln.bot[k]) r_rect(E.r, lane_x((int)k) - th / 2, y, th, h, pal[k % 5]);
+        };
         for (size_t i = 0; i < g.log.size(); i++) {
             const GitCommit &c = g.log[i];
             bool sel = (int)i == g.log_sel, marked = !g.mark_hash.empty() && c.hash == g.mark_hash;
@@ -2660,13 +2718,28 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
                 if (sel) r_rect(E.r, full_x, ry, full_w, gh, C_SELROW);
                 else if (hovered(H_GITLOG, (int)i)) r_rect(E.r, full_x, ry, full_w, gh, C_HOVER);
                 if (marked) r_rect(E.r, full_x, ry, (float)S(2), gh, C_ACCENT);
-                float lx = cx + (float)S(6);
-                r_rect(E.r, lx - (float)S(1), ry + (i == 0 ? gh / 2 : 0.f), (float)S(2), i + 1 == g.log.size() ? gh / 2 : (i == 0 ? gh / 2 : gh), C_GUT_MOD);
-                draw_dot(lx, ry + gh / 2, S(11), i == 0 ? C_ACCENT : C_GUT_MOD);
-                if (i == 0 || c.parents > 1) draw_dot(lx, ry + gh / 2, S(5), sel ? C_SELROW : C_CHROME);   /* HEAD and merges are hollow */
+                const GitUi::Lane &ln = g.lanes[i];
+                auto has = [](const std::vector<int> &v, int k) { return std::find(v.begin(), v.end(), k) != v.end(); };
+                const float mid = ry + gh / 2;
+                for (size_t k = 0; k < std::max(ln.top.size(), ln.bot.size()) && k < 5; k++) {
+                    if ((int)k == ln.col) continue;
+                    bool t = k < ln.top.size() && ln.top[k], b = k < ln.bot.size() && ln.bot[k], cv = has(ln.conv, (int)k), ou = has(ln.out, (int)k);
+                    float x = lane_x((int)k), x2 = lane_x(ln.col);
+                    uint32_t col = pal[k % 5];
+                    if (t && b && !cv && !ou) r_rect(E.r, x - th / 2, ry, th, gh, col);
+                    if (cv) { r_rect(E.r, x - th / 2, ry, th, gh / 2, col); r_rect(E.r, std::min(x, x2), mid - th / 2, std::fabs(x2 - x) + th / 2, th, col); }
+                    if (ou) { r_rect(E.r, x - th / 2, mid, th, gh / 2, col); r_rect(E.r, std::min(x, x2), mid - th / 2, std::fabs(x2 - x) + th / 2, th, col); }
+                }
+                float cxl = lane_x(ln.col);
+                uint32_t ccol = pal[(size_t)ln.col % 5];
+                if (!ln.top.empty() && (size_t)ln.col < ln.top.size() && ln.top[(size_t)ln.col]) r_rect(E.r, cxl - th / 2, ry, th, gh / 2, ccol);
+                if ((size_t)ln.col < ln.bot.size() && ln.bot[(size_t)ln.col]) r_rect(E.r, cxl - th / 2, mid, th, gh / 2, ccol);
+                bool head = c.refs.find("HEAD") != std::string::npos;
+                draw_dot(cxl, mid, S(11), head ? C_ACCENT : ccol);
+                if (head || c.parents > 1) draw_dot(cxl, mid, S(5), sel ? C_SELROW : C_CHROME);   /* HEAD and merges are hollow */
                 float pr = right;
                 git_ref_pills(c.refs, &pr, ry + (gh - (float)S(16)) / 2, (float)S(16), cx + cw * 0.35f);
-                draw_text(E.ui, cx + (float)S(20), ui_base(ry, gh), c.subject.c_str(), C_UI, pr - cx - (float)S(24), i == 0 ? FS_BOLD : FS_REGULAR);
+                draw_text(E.ui, textx, ui_base(ry, gh), c.subject.c_str(), C_UI, pr - textx - (float)S(4), head ? FS_BOLD : FS_REGULAR);
                 hit(full_x, ry, full_w, gh, H_GITLOG, (int)i);
             }
             ry += gh;
@@ -2675,25 +2748,25 @@ void draw_git_view(float rail, float sw, float cx, float cw, float list_top, flo
                 if (visible(mh)) {
                     std::string meta = g.cmp_a.empty() ? sfmt("%s  %s, %s", c.hash.substr(0, 7).c_str(), c.author.c_str(), git_ago(c.date, (long)time(nullptr)).c_str())
                                                        : sfmt("comparing %s with %s", g.cmp_a.substr(0, 7).c_str(), g.cmp_b.substr(0, 7).c_str());
-                    draw_text(E.ui, cx + (float)S(20), ui_base(ry, mh), meta.c_str(), C_UI_FAINT, cw - (float)S(20));
-                    r_rect(E.r, cx + (float)S(5), ry, (float)S(2), mh, C_GUT_MOD);
+                    draw_text(E.ui, textx, ui_base(ry, mh), meta.c_str(), C_UI_FAINT, right - textx);
+                    through(i, ry, mh);
                 }
                 ry += mh;
                 for (size_t k = 0; k < g.sel_files.size(); k++) {
                     const GitFile &f = g.sel_files[k];
                     if (visible(rowh)) {
                         if (hovered(H_GITCFILE, (int)k)) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
-                        r_rect(E.r, cx + (float)S(5), ry, (float)S(2), rowh, C_GUT_MOD);
+                        through(i, ry, rowh);
                         std::string base = base_name(f.path), dir = f.path.size() > base.size() ? f.path.substr(0, f.path.size() - base.size() - 1) : std::string();
                         float lim = right - (float)S(22);
-                        float pen = draw_text(E.ui, cx + (float)S(20), ui_base(ry, rowh), base.c_str(), status_color(f.status), lim - cx - (float)S(20));
+                        float pen = draw_text(E.ui, textx, ui_base(ry, rowh), base.c_str(), status_color(f.status), lim - textx);
                         if (!dir.empty() && pen + (float)S(30) < lim) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir.c_str(), C_UI_FAINT, lim - pen - (float)S(8));
                         draw_text(E.ui, right - (float)S(8) - text_width(E.ui, status_letter(f.status)), ui_base(ry, rowh), status_letter(f.status), status_color(f.status), (float)S(20), FS_BOLD);
                         hit(full_x, ry, full_w, rowh, H_GITCFILE, (int)k);
                     }
                     ry += rowh;
                 }
-                if (g.sel_files.empty()) { if (visible(mh)) draw_text(E.ui, cx + (float)S(20), ui_base(ry, mh), "no file changes", C_UI_FAINT, cw); ry += mh; }
+                if (g.sel_files.empty()) { if (visible(mh)) draw_text(E.ui, textx, ui_base(ry, mh), "no file changes", C_UI_FAINT, cw); ry += mh; }
             }
         }
         if (g.log.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "No commits yet", C_UI_FAINT, cw); ry += rowh; }
