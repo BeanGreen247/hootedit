@@ -2914,9 +2914,16 @@ int main(int argc, char **argv) {
     if (E.docs.empty()) new_doc();
     if (workspace.empty()) { char cwd[1024]; workspace = getcwd(cwd, sizeof cwd) ? cwd : "."; }
     signal(SIGUSR1, on_usr1);
+    /* the window class is what a panel uses to match a window to its menu entry and icon; a terminal that exports its own SDL class (Lestrix does) would
+     * otherwise make every program started from it look like that terminal. Set ours explicitly before SDL_Init, which reads it once, then take it out of the environment again so the shells
+     * and external terminals we start do not inherit it. */
+    setenv("SDL_VIDEO_X11_WMCLASS", "hootedit", 1);
+    setenv("SDL_VIDEO_WAYLAND_WMCLASS", "hootedit", 1);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) { fprintf(stderr, "hootedit: SDL: %s\n", SDL_GetError()); return 1; }
     bool ok = false;
     for (GlKind k : {GLK_CORE, GLK_ES3, GLK_ES2}) if ((ok = gl_init(k, win_w, win_h))) break;
+    unsetenv("SDL_VIDEO_X11_WMCLASS");
+    unsetenv("SDL_VIDEO_WAYLAND_WMCLASS");
     if (!ok) { fprintf(stderr, "hootedit: no usable OpenGL context\n"); return 1; }
     E.font = font_open("monospace", 14.0 * E.scale, true);
     E.ui = font_open("sans", 13.0 * E.scale, false);

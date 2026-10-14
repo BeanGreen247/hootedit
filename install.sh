@@ -104,6 +104,11 @@ SUDO=(); [ ! -w "$probe" ] && SUDO=(sudo)
 run "${SUDO[@]}" meson install -C build --no-rebuild
 run "${SUDO[@]}" install -D -m 644 data/hootedit.desktop "$PREFIX/share/applications/hootedit.desktop"
 command -v update-desktop-database >/dev/null && run "${SUDO[@]}" update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
+# A stale icon-theme.cache (left by an earlier program in this prefix; -t because the prefix has no index.theme of its own) hides new icons from the menu and panel: GTK trusts it while it is newer than the folder.
+ICONDIR="$PREFIX/share/icons/hicolor"
+if [ -f "$ICONDIR/icon-theme.cache" ] && command -v gtk-update-icon-cache >/dev/null; then
+  run "${SUDO[@]}" gtk-update-icon-cache -q -f -t "$ICONDIR" || true
+fi
 echo "installed: $PREFIX/bin/hootedit"
 echo "remove it any time with: ./install.sh --uninstall   (or ./uninstall.sh)"
 case ":$PATH:" in *":$PREFIX/bin:"*) ;; *) echo "note: add $PREFIX/bin to your PATH to run 'hootedit' from a shell." ;; esac

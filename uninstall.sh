@@ -36,4 +36,11 @@ for p in "${PREFIXES[@]}"; do
     if [ -w "$p/share/applications" ]; then update-desktop-database "$p/share/applications" 2>/dev/null || true; else sudo update-desktop-database "$p/share/applications" 2>/dev/null || true; fi
   fi
 done
+for p in "${PREFIXES[@]}"; do   # keep an existing icon cache honest about the icon that just went away
+  ICONDIR="$p/share/icons/hicolor"
+  if [ "$DRY" = 0 ] && [ "$removed" -gt 0 ] && [ -f "$ICONDIR/icon-theme.cache" ] && command -v gtk-update-icon-cache >/dev/null; then
+    SUDO=(); [ -w "$ICONDIR" ] || SUDO=(sudo)
+    "${SUDO[@]}" gtk-update-icon-cache -q -f -t "$ICONDIR" 2>/dev/null || true
+  fi
+done
 [ "$removed" -gt 0 ] && echo "Hootedit was removed." || echo "Hootedit is not installed in: ${PREFIXES[*]}"

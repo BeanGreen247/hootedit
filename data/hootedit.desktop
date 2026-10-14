@@ -8,3 +8,4 @@ Terminal=false
 Categories=Utility;TextEditor;Development;
 MimeType=text/plain;text/x-c;text/x-c++src;text/x-python;application/json;text/markdown;
 StartupNotify=false
+StartupWMClass=hootedit
