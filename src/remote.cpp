@@ -368,3 +368,46 @@ int remote_op_one(const RemoteProfile &p, const std::string &pw, RemoteOp op, co
     }
     return c;
 }
+
+std::vector<SshHost> remote_ssh_hosts() {
+    std::vector<SshHost> out;
+    const char *h = getenv("HOME");
+    FILE *f = fopen((std::string(h ? h : ".") + "/.ssh/config").c_str(), "r");
+    if (!f) return out;
+    std::vector<size_t> cur;   /* the entries the lines below belong to */
+    std::vector<std::string> user, host, port;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        std::string l = line;
+        while (!l.empty() && isspace((unsigned char)l.back())) l.pop_back();
+        size_t b = l.find_first_not_of(" \t");
+        if (b == std::string::npos || l[b] == '#') continue;
+        l = l.substr(b);
+        size_t sp = l.find_first_of(" \t=");
+        if (sp == std::string::npos) continue;
+        std::string key = l.substr(0, sp), val = l.substr(l.find_first_not_of(" \t=", sp) == std::string::npos ? l.size() : l.find_first_not_of(" \t=", sp));
+        for (char &c : key) c = (char)tolower((unsigned char)c);
+        if (key == "host") {
+            cur.clear();
+            size_t pos = 0;
+            while (pos < val.size()) {
+                size_t e = val.find_first_of(" \t", pos);
+                if (e == std::string::npos) e = val.size();
+                std::string n = val.substr(pos, e - pos);
+                pos = val.find_first_not_of(" \t", e) == std::string::npos ? val.size() : val.find_first_not_of(" \t", e);
+                if (n.empty() || n.find_first_of("*?!") != std::string::npos) continue;
+                cur.push_back(out.size());
+                out.push_back({n, ""});
+                user.push_back(""); host.push_back(""); port.push_back("");
+            }
+        } else if (key == "match") cur.clear();
+        else for (size_t k : cur) {
+            if (key == "hostname" && host[k].empty()) host[k] = val;
+            else if (key == "user" && user[k].empty()) user[k] = val;
+            else if (key == "port" && port[k].empty()) port[k] = val;
+        }
+    }
+    fclose(f);
+    for (size_t k = 0; k < out.size(); k++) out[k].detail = (user[k].empty() ? "" : user[k] + "@") + (host[k].empty() ? out[k].name : host[k]) + (port[k].empty() ? "" : ":" + port[k]);
+    return out;
+}

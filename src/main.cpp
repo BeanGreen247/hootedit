@@ -1843,34 +1843,54 @@ void remote_push_changed() {
     }
 }
 
+void remote_ask_folder(RemoteProfile p) {
+    bool smb = p.proto == "smb";
+    dlg_show(smb ? "Share and folder" : "Remote folder to open", smb ? "For example /share/projects" : "Leave empty for the home folder (ssh, sftp) or the root (ftp)", {"Add", "Cancel"}, [p](int i2, const std::string &t2) {
+        if (i2 != 0) return;
+        RemoteProfile q = p;
+        q.path = trim_nl(t2);
+        g_rem.profiles.push_back(q);
+        g_rem.conns.push_back(RConn());
+        remote_save(g_rem.profiles);
+        remote_connect((int)g_rem.profiles.size() - 1);
+    }, true, "", smb ? "/share" : "/path (optional)");
+}
+
+void remote_ask_address(const std::string &proto) {
+    const char *ph = proto == "smb" ? "user@server  (guest if empty)" : "user@host   or   user@host:port";
+    dlg_show("New " + proto + " connection", "Server address", {"Next", "Cancel"}, [proto](int i, const std::string &t) {
+        std::string a = trim_nl(t);
+        if (i != 0 || a.empty()) return;
+        RemoteProfile p;
+        p.proto = proto;
+        size_t at = a.find('@');
+        if (at != std::string::npos) { p.user = a.substr(0, at); a = a.substr(at + 1); }
+        size_t col = a.rfind(':');
+        if (col != std::string::npos && a.find(']') == std::string::npos) { p.port = atoi(a.c_str() + col + 1); a = a.substr(0, col); }
+        p.host = a;
+        p.name = a;
+        remote_ask_folder(p);
+    }, true, "", ph);
+}
+
 void remote_new_connection() {
     remote_ensure();
     std::vector<Ed::PItem> items = {{"SSH (shell and files)", 0, false}, {"SFTP", 1, false}, {"FTP", 2, false}, {"FTPS (FTP over TLS)", 3, false}, {"SMB / Samba share", 4, false}};
     pick_custom("Select the connection type", items, [](const Ed::PItem &it) {
         static const char *protos[5] = {"ssh", "sftp", "ftp", "ftps", "smb"};
         std::string proto = protos[it.id];
-        const char *ph = proto == "smb" ? "user@server  (guest if empty)" : "user@host   or   user@host:port";
-        dlg_show("New " + std::string(protos[it.id]) + " connection", "Server address", {"Next", "Cancel"}, [proto](int i, const std::string &t) {
-            std::string a = trim_nl(t);
-            if (i != 0 || a.empty()) return;
+        std::vector<SshHost> hosts = it.id < 2 ? remote_ssh_hosts() : std::vector<SshHost>();
+        if (hosts.empty()) { remote_ask_address(proto); return; }
+        /* hosts from ~/.ssh/config: ssh applies the user, port and key of the entry itself */
+        std::vector<Ed::PItem> hi;
+        for (size_t k = 0; k < hosts.size(); k++) hi.push_back({hosts[k].name + "    " + hosts[k].detail, (int)k, false});
+        hi.push_back({"Enter an address...", -1, false});
+        pick_custom("Select a host from ~/.ssh/config", hi, [proto, hosts](const Ed::PItem &h) {
+            if (h.id < 0) { remote_ask_address(proto); return; }
             RemoteProfile p;
-            p.proto = proto;
-            size_t at = a.find('@');
-            if (at != std::string::npos) { p.user = a.substr(0, at); a = a.substr(at + 1); }
-            size_t col = a.rfind(':');
-            if (col != std::string::npos && a.find(']') == std::string::npos) { p.port = atoi(a.c_str() + col + 1); a = a.substr(0, col); }
-            p.host = a;
-            p.name = a;
-            dlg_show(proto == "smb" ? "Share and folder" : "Remote folder to open", proto == "smb" ? "For example /share/projects" : "Leave empty for the home folder (ssh, sftp) or the root (ftp)", {"Add", "Cancel"}, [p](int i2, const std::string &t2) {
-                if (i2 != 0) return;
-                RemoteProfile q = p;
-                q.path = trim_nl(t2);
-                g_rem.profiles.push_back(q);
-                g_rem.conns.push_back(RConn());
-                remote_save(g_rem.profiles);
-                remote_connect((int)g_rem.profiles.size() - 1);
-            }, true, "", proto == "smb" ? "/share" : "/path (optional)");
-        }, true, "", ph);
+            p.proto = proto; p.host = hosts[(size_t)h.id].name; p.name = p.host;
+            remote_ask_folder(p);
+        });
     });
 }
 
