@@ -411,3 +411,32 @@ std::vector<SshHost> remote_ssh_hosts() {
     for (size_t k = 0; k < out.size(); k++) out[k].detail = (user[k].empty() ? "" : user[k] + "@") + (host[k].empty() ? out[k].name : host[k]) + (port[k].empty() ? "" : ":" + port[k]);
     return out;
 }
+
+int remote_grep(const RemoteProfile &p, const std::string &dir, const std::string &pattern, std::vector<RemoteHit> &out, std::string *err) {
+    out.clear();
+    if (p.proto != "ssh" && p.proto != "sftp") { if (err) *err = "searching needs an ssh or sftp connection"; return -1; }
+    bool lower = true;   /* smart case: a pattern without capitals ignores case */
+    for (unsigned char c : pattern) if (isupper(c)) lower = false;
+    std::string cmd = std::string("grep -rIn -F") + (lower ? "i" : "") + " --exclude-dir=.git --exclude-dir=node_modules -e " + q(pattern) + " -- " + q(dir.empty() ? "." : dir) + " 2>/dev/null | head -n 300";
+    std::string o;
+    int c = run(askpass_env() + "ssh " + ssh_opts(p, false) + " " + q(target(p)) + " " + q(cmd), &o);
+    size_t pos = 0;
+    while (pos < o.size()) {
+        size_t nl = o.find('\n', pos);
+        if (nl == std::string::npos) nl = o.size();
+        std::string l = o.substr(pos, nl - pos);
+        pos = nl + 1;
+        for (size_t i = 0; i + 2 < l.size(); i++) {   /* "path:12:text": the first ":digits:" splits it, so a colon in the path still works */
+            if (l[i] != ':' || !isdigit((unsigned char)l[i + 1])) continue;
+            size_t j = i + 1;
+            while (j < l.size() && isdigit((unsigned char)l[j])) j++;
+            if (j >= l.size() || l[j] != ':') continue;
+            std::string t = l.substr(j + 1);
+            size_t b = t.find_first_not_of(" \t");
+            out.push_back({l.substr(0, i), atoi(l.c_str() + i + 1), b == std::string::npos ? "" : t.substr(b, 160)});
+            break;
+        }
+    }
+    if (c != 0 && c != 1 && out.empty() && err) { size_t nl = o.find('\n'); *err = o.empty() ? "the search failed" : o.substr(0, nl); return c; }
+    return 0;
+}

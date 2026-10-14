@@ -1755,6 +1755,29 @@ void remote_ask_delete(int pi, const std::string &path, bool is_dir) {
     });
 }
 
+void remote_open_file(int pi, const std::string &path, int line = 0);
+void goto_line(const std::string &q);
+
+void remote_search(int pi, const std::string &dir) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    dlg_show("Search in " + dir, "Text to find in the files below this folder, searched on the server with grep (case is ignored unless you type a capital).", {"Search", "Cancel"}, [pi, dir](int i, const std::string &t) {
+        std::string pat = trim_nl(t);
+        if (i != 0 || pat.empty() || g_rjob.running) return;
+        RemoteProfile p = g_rem.profiles[(size_t)pi];
+        auto res = std::make_shared<std::vector<RemoteHit>>();
+        job_start(g_rjob, "Searching " + p.name, [p, dir, pat, res](std::string &err) { return remote_grep(p, dir, pat, *res, &err); }, [pi, dir, res](int code, const std::string &err) {
+            if (code != 0) { remote_error("The search failed", err); return; }
+            if (res->empty()) { E.status_msg = "no matches"; return; }
+            std::vector<Ed::PItem> items;
+            for (size_t k = 0; k < res->size(); k++) { const RemoteHit &h = (*res)[k]; std::string rel = h.path.compare(0, dir.size() + 1, dir + "/") == 0 ? h.path.substr(dir.size() + 1) : h.path; items.push_back({rel + ":" + std::to_string(h.line) + "    " + h.text, (int)k, false}); }
+            pick_custom(std::to_string(res->size()) + (res->size() >= 300 ? "+" : "") + " matches", items, [pi, res](const Ed::PItem &it) {
+                const RemoteHit &h = (*res)[(size_t)it.id];
+                remote_open_file(pi, h.path, h.line);
+            });
+        });
+    }, true, "", "text");
+}
+
 void remote_connect_now(int pi) {
     if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
     RConn &c = g_rem.conns[(size_t)pi];
@@ -1807,17 +1830,18 @@ void remote_disconnect_now(int pi) {
     E.status_msg = "disconnected from " + p.name;
 }
 
-void remote_open_file(int pi, const std::string &path) {
+void remote_open_file(int pi, const std::string &path, int line) {
     if (pi < 0 || (size_t)pi >= g_rem.conns.size() || g_rjob.running) return;
     RemoteProfile p = g_rem.profiles[(size_t)pi];
     std::string pw = g_rem.conns[(size_t)pi].pw, local = remote_cache_path(p, path);
-    job_start(g_rjob, "Downloading " + base_name(path), [p, pw, path, local](std::string &err) { return remote_get(p, pw, path, local, &err); }, [pi, path, local](int code, const std::string &err) {
+    job_start(g_rjob, "Downloading " + base_name(path), [p, pw, path, local](std::string &err) { return remote_get(p, pw, path, local, &err); }, [pi, path, local, line](int code, const std::string &err) {
         if (code != 0) { remote_error("Cannot open " + base_name(path), err); return; }
         struct stat st;
         long mt = stat(local.c_str(), &st) == 0 ? (long)st.st_mtime : 0;
         g_rem.files[local] = {pi, path, mt};
         if (!E.pinned) open_side(false);
         open_path(local);
+        if (line > 0) goto_line(std::to_string(line));
         E.status_msg = "opened " + path + " (saving uploads it)";
     });
 }
@@ -1909,7 +1933,7 @@ void remote_menu(int pi, const std::string &path, int kind, float x, float y) {
     bool ssh = p.proto == "ssh" || p.proto == "sftp";
     if (kind == 0) {
         std::vector<CtxItem> v = {ci(c.connected ? "Reconnect" : "Connect", [pi] { if (g_rem.conns[(size_t)pi].connected) remote_disconnect_now(pi); remote_connect(pi); }),
-                                  ci("Disconnect", [pi] { remote_disconnect_now(pi); }, "", c.connected), ci("New File...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_NEWFILE); }, "", c.connected), ci("New Folder...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_MKDIR); }, "", c.connected), ci("Refresh", [pi] { RConn &k = g_rem.conns[(size_t)pi]; k.dirs.clear(); k.expanded.clear(); remote_connect_now(pi); }, "", c.connected), ci_sep(),
+                                  ci("Disconnect", [pi] { remote_disconnect_now(pi); }, "", c.connected), ci("New File...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_NEWFILE); }, "", c.connected), ci("New Folder...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_MKDIR); }, "", c.connected), ci("Search...", [pi] { remote_search(pi, remote_root(g_rem.profiles[(size_t)pi])); }, "", c.connected && ssh), ci("Refresh", [pi] { RConn &k = g_rem.conns[(size_t)pi]; k.dirs.clear(); k.expanded.clear(); remote_connect_now(pi); }, "", c.connected), ci_sep(),
                                   ci("Open SSH Terminal", [pi] { remote_open_terminal(pi); }, "", ssh), ci_sep(),
                                   ci("Edit Connections File", [] { const char *x2 = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME"); open_path((x2 && *x2 ? std::string(x2) : std::string(h ? h : ".") + "/.config") + "/hootedit/remotes.ini"); }),
                                   ci("Remove Connection", [pi] {
@@ -1925,6 +1949,7 @@ void remote_menu(int pi, const std::string &path, int kind, float x, float y) {
     } else if (kind == 1) {
         ctx_show(x, y, {ci("New File...", [pi, path] { remote_ask_name(pi, path, ROP_NEWFILE); }), ci("New Folder...", [pi, path] { remote_ask_name(pi, path, ROP_MKDIR); }), ci_sep(),
                         ci("Rename...", [pi, path] { remote_ask_rename(pi, path, true); }), ci("Delete", [pi, path] { remote_ask_delete(pi, path, true); }), ci_sep(),
+                        ci("Search in Folder...", [pi, path] { remote_search(pi, path); }, "", ssh), ci_sep(),
                         ci("Refresh", [pi, path] { g_rem.conns[(size_t)pi].dirs.erase(path); remote_list_dir(pi, path); }), ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
     } else if (kind == 2) {
         ctx_show(x, y, {ci("Open", [pi, path] { remote_open_file(pi, path); }), ci_sep(), ci("Rename...", [pi, path] { remote_ask_rename(pi, path, false); }), ci("Delete", [pi, path] { remote_ask_delete(pi, path, false); }), ci_sep(),

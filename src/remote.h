@@ -33,6 +33,10 @@ int remote_put(const RemoteProfile &p, const std::string &pw, const std::string 
 struct SshHost { std::string name, detail; };   /* a Host entry of ~/.ssh/config; detail is user@hostname:port as far as the file says */
 std::vector<SshHost> remote_ssh_hosts();
 
+struct RemoteHit { std::string path; int line = 0; std::string text; };
+/* text search below a folder, run by grep on the server over ssh (ssh and sftp connections): at most 300 matches, no binary files, .git and node_modules skipped */
+int remote_grep(const RemoteProfile &p, const std::string &dir, const std::string &pattern, std::vector<RemoteHit> &out, std::string *err);
+
 enum RemoteOp { ROP_NEWFILE, ROP_MKDIR, ROP_RENAME, ROP_DELETE, ROP_RMDIR };
 /* new file, new folder, rename (path -> to), delete a file, delete a folder with its contents (sftp, ftp: empty folders only) */
 int remote_op(const RemoteProfile &p, const std::string &pw, RemoteOp op, const std::string &path, const std::string &to, std::string *err);
