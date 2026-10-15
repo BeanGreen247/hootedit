@@ -16,7 +16,7 @@
  * itself. No UI here: the host draws the mode label, the block cursor and the command line. */
 class Vim {
 public:
-    enum Mode { INSERT, NORMAL, VISUAL, VLINE };
+    enum Mode { INSERT, NORMAL, REPLACE, VISUAL, VLINE, VBLOCK };   /* everything below VISUAL edits like normal text */
     Mode mode = NORMAL;
 
     /* host callbacks */
@@ -36,6 +36,10 @@ public:
     void reset(bool enabled) { mode = enabled ? NORMAL : INSERT; clear_pending(); cmd_kind = 0; cmd.clear(); }
     void text(Doc &d, const std::string &s);   /* one typed key (or utf-8 char), not in insert mode */
     void escape(Doc &d);                       /* Esc / Ctrl+[ in any mode */
+    bool typing() const { return mode == INSERT || mode == REPLACE; }
+    void type_char(Doc &d, const std::string &ch);   /* one typed character in insert or replace mode */
+    bool backspace(Doc &d);                          /* replace mode: restores the overwritten character; false = not handled */
+    bool block_rect(const Doc &d, size_t *l0, size_t *l1, int *c0, int *c1) const;   /* the Ctrl+V block, for drawing */
     void typed(const std::string &s) { if (recording) ins_rec += s; if (macro_rec && !macro_play) macro_buf.push_back({1, s}); }   /* insert-mode text, remembered for "." */
     void erased() { if (recording && !ins_rec.empty()) ins_rec.pop_back(); if (macro_rec && !macro_play) macro_buf.push_back({3, std::string()}); }
     void after_history(Doc &d);                 /* after undo / redo from outside */
@@ -106,5 +110,12 @@ private:
     void sur_wrap(Doc &d, R r, const std::string &c);
     void play_macro(Doc &d, char name, int n);
     void save_vis(Doc &d);
+    bool block(Doc &d, const std::string &k);
+    void paste_block(Doc &d, bool after, int n);
+
+    size_t bl_anchor = 0;
+    bool bl_eol = false, reg_block = false;
+    struct Blk { bool on = false; size_t l0 = 0, l1 = 0; int c0 = 0, c1 = 0; char kind = 0; bool eol = false; } blk;
+    std::vector<std::string> repl_stack;
 };
 #endif

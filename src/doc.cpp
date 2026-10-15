@@ -99,9 +99,12 @@ void Doc::push(Op &&op) {
     if (undo_.size() < save_point_) save_point_ = (size_t)-1;   /* content can never match the saved file again by size alone */
     if (group_open_ && !undo_.empty() && undo_.size() != save_point_) {
         Op &p = undo_.back();
-        bool pure_ins = op.del.empty() && p.del.empty();
+        bool pure_ins = op.del.empty();
         bool pure_del = op.ins.empty() && p.ins.empty();
         if (pure_ins && op.pos == p.pos + p.ins.size() && op.ins.find('\n') == std::string::npos) { p.ins += op.ins; p.cur_after = op.cur_after; return; }
+        if (!op.del.empty() && !op.ins.empty() && !p.del.empty() && !p.ins.empty() && op.pos == p.pos + p.ins.size() && op.ins.find('\n') == std::string::npos && op.del.find('\n') == std::string::npos) {   /* overwrite run (vim R) */
+            p.del += op.del; p.ins += op.ins; p.cur_after = op.cur_after; return;
+        }
         if (pure_del && op.pos + op.del.size() == p.pos) { p.pos = op.pos; p.del = op.del + p.del; p.cur_after = op.cur_after; return; }   /* backspace run */
         if (pure_del && op.pos == p.pos) { p.del += op.del; p.cur_after = op.cur_after; return; }                                           /* delete run */
     }

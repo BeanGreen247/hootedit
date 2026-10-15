@@ -71,10 +71,38 @@ std::string indent_unit(const Doc &d) {
 }
 char swapcase(char c) { return isupper((unsigned char)c) ? (char)tolower((unsigned char)c) : (char)toupper((unsigned char)c); }
 
+int col_at(const Doc &d, size_t pos) { size_t l = d.buf.line_of(pos); return d.col_of_byte(l, pos - ls(d, l)); }
+
+/* the position in line l at display column col; short = the line ends before it */
+size_t pos_at_col(const Doc &d, size_t l, int col, bool *short_line = nullptr) {
+    size_t p = ls(d, l), e = lend(d, l);
+    while (p < e && d.col_of_byte(l, p - ls(d, l)) < col) p = d.next_char(p);
+    if (short_line) *short_line = p >= e && d.col_of_byte(l, e - ls(d, l)) < col;
+    return p;
+}
+
+void geom(const Doc &d, size_t anchor, size_t cur, bool eol, size_t *l0, size_t *l1, int *c0, int *c1) {
+    size_t la = d.buf.line_of(anchor), lc = d.buf.line_of(cur);
+    int ca = col_at(d, anchor), cc = col_at(d, cur);
+    *l0 = std::min(la, lc); *l1 = std::max(la, lc);
+    *c0 = std::min(ca, cc); *c1 = eol ? 1 << 28 : std::max(ca, cc);
+}
+
+/* bytes of line l inside columns c0..c1: [a, b); false when the line ends before c0 */
+bool brange(const Doc &d, size_t l, int c0, int c1, size_t *a, size_t *b) {
+    size_t e = lend(d, l);
+    size_t p = pos_at_col(d, l, c0);
+    if (p >= e) return false;
+    size_t q = p;
+    while (q < e && d.col_of_byte(l, q - ls(d, l)) <= c1) q = d.next_char(q);
+    *a = p; *b = q;
+    return true;
+}
+
 }  // namespace
 
 std::string Vim::label() const {
-    const char *m = mode == INSERT ? "-- INSERT --" : mode == NORMAL ? "-- NORMAL --" : mode == VISUAL ? "-- VISUAL --" : "-- VISUAL LINE --";
+    const char *m = mode == INSERT ? "-- INSERT --" : mode == NORMAL ? "-- NORMAL --" : mode == REPLACE ? "-- REPLACE --" : mode == VISUAL ? "-- VISUAL --" : mode == VLINE ? "-- VISUAL LINE --" : "-- VISUAL BLOCK --";
     std::string s = m;
     std::string p;
     if (opcount) p += std::to_string(opcount);
@@ -111,7 +139,7 @@ void Vim::yank(const std::string &t, bool line) {
     char rn = reg_name;
     reg_name = 0;
     if (rn == '_') return;   /* the black hole register */
-    reg = t; reg_line = line; reg_sys = t;
+    reg = t; reg_line = line; reg_sys = t; reg_block = false;
     if (rn >= 'a' && rn <= 'z') regs[rn] = {t, line};
     else if (rn >= 'A' && rn <= 'Z') { auto &r = regs[(char)tolower(rn)]; r.first += t; r.second = r.second || line; }
     if (set_clip && (rn == 0 || rn == '+' || rn == '*')) set_clip(t);
@@ -391,11 +419,13 @@ bool Vim::object(Doc &d, const std::string &k, R &r) {
 void Vim::apply(Doc &d, char o, R r) {
     d.break_group();
     size_t from, to;
+    bool last_line = false;
     std::string text;
     if (r.line) {
         r.b = std::min(r.b, d.buf.lines() - 1);
         from = ls(d, r.a);
         to = r.b + 1 < d.buf.lines() ? ls(d, r.b + 1) : d.buf.size();
+        last_line = r.b + 1 >= d.buf.lines();
         text = slice(d, from, to);
         if (text.empty() || text.back() != '\n') text += "\n";
     } else {
@@ -411,7 +441,7 @@ void Vim::apply(Doc &d, char o, R r) {
     if (o == 'd') {
         yank(text, r.line);
         size_t a = from;
-        if (r.line && to >= d.buf.size() && from > 0) a = from - 1;
+        if (r.line && last_line && from > 0) a = from - 1;
         d.replace(a, to - a, "", 0);
         if (r.line) { size_t l = std::min(r.a, d.buf.lines() - 1); setc(d, first_nb(d, l)); }
         else setc(d, from);
@@ -474,6 +504,7 @@ void Vim::paste(Doc &d, bool after, int n) {
     else if ((rn == '+' || rn == '*') && get_clip) { t = get_clip(); line = !t.empty() && t.back() == '\n'; }
     else if (get_clip) { std::string s = get_clip(); if (!s.empty() && s != reg_sys) { t = s; line = s.back() == '\n'; } }
     if (t.empty()) return;
+    if (reg_block && rn == 0 && t == reg) { paste_block(d, after, n); return; }
     d.break_group();
     size_t l = d.buf.line_of(d.cur);
     if (line) {
@@ -498,6 +529,7 @@ bool Vim::search_go(Doc &d, bool fwd, size_t from, size_t *pos) {
 }
 
 void Vim::save_vis(Doc &d) {
+    if (mode == VBLOCK) { vis_a = bl_anchor; vis_c = d.cur; vis_mode = VISUAL; vis_l0 = d.buf.line_of(std::min(bl_anchor, d.cur)); vis_l1 = d.buf.line_of(std::max(bl_anchor, d.cur)); return; }
     vis_a = d.anchor; vis_c = d.cur; vis_mode = mode;
     vis_l0 = d.buf.line_of(std::min(d.anchor, d.cur));
     vis_l1 = d.buf.line_of(std::max(d.anchor, d.cur));
@@ -581,11 +613,175 @@ void Vim::play_macro(Doc &d, char name, int n) {
     for (int i = 0; i < n; i++)
         for (const Ev &e : evs) {
             if (e.t == 0) text(d, e.s);
-            else if (e.t == 1) { typed(e.s); d.insert_text(e.s.data(), e.s.size()); }
+            else if (e.t == 1) type_char(d, e.s);
             else if (e.t == 2) escape(d);
-            else if (e.t == 3) { erased(); d.erase_back(); }
+            else if (e.t == 3) { if (!backspace(d)) { erased(); d.erase_back(); } }
         }
     macro_play = false;
+}
+
+
+void Vim::type_char(Doc &d, const std::string &ch) {
+    typed(ch);
+    if (mode == REPLACE) {
+        size_t l = d.buf.line_of(d.cur);
+        if (d.cur >= lend(d, l)) { d.insert_text(ch.data(), ch.size()); repl_stack.push_back(std::string()); }
+        else {
+            size_t n = d.next_char(d.cur);
+            std::string old = slice(d, d.cur, n);
+            d.replace(d.cur, n - d.cur, ch.data(), ch.size());
+            repl_stack.push_back(old);
+        }
+        return;
+    }
+    d.insert_text(ch.data(), ch.size());
+}
+
+bool Vim::backspace(Doc &d) {
+    if (mode != REPLACE) return false;
+    erased();
+    size_t l = d.buf.line_of(d.cur);
+    if (d.cur <= ls(d, l)) return true;
+    size_t p = d.prev_char(d.cur);
+    if (!repl_stack.empty()) {
+        std::string old = repl_stack.back();
+        repl_stack.pop_back();
+        d.replace(p, d.cur - p, old.data(), old.size());
+        d.cur = d.anchor = p;
+    } else d.cur = d.anchor = p;
+    return true;
+}
+
+bool Vim::block_rect(const Doc &d, size_t *l0, size_t *l1, int *c0, int *c1) const {
+    if (mode != VBLOCK) return false;
+    geom(d, bl_anchor, d.cur, bl_eol, l0, l1, c0, c1);
+    return true;
+}
+
+void Vim::paste_block(Doc &d, bool after, int n) {
+    std::vector<std::string> pieces;
+    size_t from = 0;
+    while (true) { size_t nl = reg.find('\n', from); pieces.push_back(reg.substr(from, nl == std::string::npos ? std::string::npos : nl - from)); if (nl == std::string::npos) break; from = nl + 1; }
+    size_t l = d.buf.line_of(d.cur);
+    int col = col_at(d, d.cur);
+    if (after && lend(d, l) > ls(d, l)) col += 1;
+    int w = 0;
+    for (const std::string &p : pieces) w = std::max(w, (int)p.size());
+    size_t last = l + pieces.size() - 1, lines = d.buf.lines();
+    std::string out, t;
+    for (size_t i = l; i <= last; i++) {
+        if (i < lines) d.buf.line_text(i, t); else t.clear();
+        const std::string &pc = pieces[i - l];
+        bool sh;
+        size_t p = i < lines ? pos_at_col(d, i, col, &sh) : ls(d, lines - 1);
+        size_t bi = i < lines ? p - ls(d, i) : 0;
+        if (i >= lines || sh) { int have = i < lines ? d.col_of_byte(i, t.size()) : 0; t.append((size_t)std::max(0, col - have), ' '); bi = t.size(); }
+        std::string ins;
+        for (int k = 0; k < n; k++) { ins += pc; if (k + 1 < n) ins.append((size_t)std::max(0, w - (int)pc.size()), ' '); }
+        bool tail = bi < t.size();
+        if (tail) ins.append((size_t)std::max(0, w - (int)pc.size()) * 0, ' ');
+        t.insert(bi, ins);
+        out += t;
+        if (i < last) out += '\n';
+    }
+    size_t s0 = ls(d, l), e0 = last < lines ? lend(d, last) : d.buf.size();
+    std::string prefix;
+    if (last >= lines) {   /* the block is taller than the file: new lines at the end */
+        size_t extra = last - (lines - 1);
+        (void)extra;
+    }
+    d.break_group();
+    d.replace(s0, e0 - s0, out.data(), out.size());
+    d.break_group();
+    d.cur = d.anchor = pos_at_col(d, l, col);
+    clamp(d);
+}
+
+bool Vim::block(Doc &d, const std::string &k) {
+    size_t l0, l1;
+    int c0, c1;
+    geom(d, bl_anchor, d.cur, bl_eol, &l0, &l1, &c0, &c1);
+    auto leave = [&] { clear_pending(); mode = NORMAL; d.anchor = d.cur; };
+    auto rebuild = [&](const std::function<void(size_t, std::string &, size_t, size_t, bool)> &f) {   /* f(line, text, byte a, byte b, in range) edits the line text in place */
+        std::string out, t;
+        for (size_t l = l0; l <= l1; l++) {
+            d.buf.line_text(l, t);
+            size_t a, b;
+            bool in = brange(d, l, c0, c1, &a, &b);
+            f(l, t, in ? a - ls(d, l) : 0, in ? b - ls(d, l) : 0, in);
+            out += t;
+            if (l < l1) out += '\n';
+        }
+        size_t s0 = ls(d, l0), e0 = lend(d, l1);
+        d.break_group();
+        d.replace(s0, e0 - s0, out.data(), out.size());
+        d.break_group();
+    };
+    auto pieces = [&]() {
+        std::string out;
+        for (size_t l = l0; l <= l1; l++) { size_t a, b; if (brange(d, l, c0, c1, &a, &b)) out += slice(d, a, b); if (l < l1) out += '\n'; }
+        return out;
+    };
+    auto cut = [&]() {
+        std::string p = pieces();
+        rebuild([](size_t, std::string &t, size_t a, size_t b, bool in) { if (in) t.erase(a, b - a); });
+        yank(p, false);
+        reg_block = true;
+    };
+    auto start_insert = [&](char kind) {
+        blk = {true, l0, l1, c0, c1, kind, bl_eol};
+        clear_pending();
+        mode = NORMAL;   /* enter_insert wants a non-visual mode for the cursor sync */
+        d.anchor = d.cur;
+        if (kind == 'A') {
+            if (bl_eol) setc(d, lend(d, l0));
+            else {
+                bool sh;
+                size_t p = pos_at_col(d, l0, c1 + 1, &sh);
+                if (sh) { std::string pad((size_t)(c1 + 1 - d.col_of_byte(l0, lend(d, l0) - ls(d, l0))), ' '); d.replace(lend(d, l0), 0, pad.data(), pad.size()); p = lend(d, l0); }
+                setc(d, p);
+            }
+        } else setc(d, pos_at_col(d, l0, c0));
+        enter_insert(d);
+    };
+    if (k == "\x16") { leave(); return true; }
+    if (k == "v") { clear_pending(); mode = VISUAL; d.anchor = bl_anchor; return true; }
+    if (k == "V") { clear_pending(); mode = VLINE; vline0 = d.buf.line_of(bl_anchor); vwant = d.want_col; vline_fix(d); return true; }
+    if (k == "o") { std::swap(bl_anchor, d.cur); d.anchor = d.cur; return true; }
+    if (k == "O") {
+        int ca = col_at(d, bl_anchor), cc = col_at(d, d.cur);
+        size_t la = d.buf.line_of(bl_anchor), lc = d.buf.line_of(d.cur);
+        bl_anchor = pos_at_col(d, la, cc);
+        d.cur = d.anchor = pos_at_col(d, lc, ca);
+        return true;
+    }
+    if (k == "d" || k == "x" || k == "X" || k == "D") { size_t keepc = c0; cut(); leave(); setc(d, pos_at_col(d, l0, (int)keepc)); clamp(d); return true; }
+    if (k == "y") { std::string p = pieces(); yank(p, false); reg_block = true; leave(); setc(d, pos_at_col(d, l0, c0)); return true; }
+    if (k == "c" || k == "s") { cut(); start_insert('c'); return true; }
+    if (k == "I") { start_insert('I'); return true; }
+    if (k == "A") { start_insert('A'); return true; }
+    if (k.size() == 2 && k[0] == 'r') {
+        std::string ch = k.substr(1);
+        rebuild([&](size_t, std::string &t, size_t a, size_t b, bool in) {
+            if (!in) return;
+            size_t cnt = 0;
+            for (size_t i = a; i < b;) { size_t n = 1; while (i + n < b && ((unsigned char)t[i + n] & 0xC0) == 0x80) n++; i += n; cnt++; }
+            std::string rep;
+            for (size_t i = 0; i < cnt; i++) rep += ch;
+            t.replace(a, b - a, rep);
+        });
+        leave(); setc(d, pos_at_col(d, l0, c0));
+        return true;
+    }
+    if (k == "~" || k == "u" || k == "U") {
+        char o = k[0];
+        rebuild([&](size_t, std::string &t, size_t a, size_t b, bool in) { if (in) for (size_t i = a; i < b; i++) t[i] = o == 'u' ? (char)tolower((unsigned char)t[i]) : o == 'U' ? (char)toupper((unsigned char)t[i]) : swapcase(t[i]); });
+        leave(); setc(d, pos_at_col(d, l0, c0));
+        return true;
+    }
+    if (k == ">" || k == "<") { leave(); apply(d, k[0], {l0, l1, true}); return true; }
+    if (k == ":") { save_vis(d); leave(); cmd_kind = ':'; cmd = "'<,'>"; return true; }
+    return false;
 }
 
 void Vim::vline_fix(Doc &d) {
@@ -620,10 +816,40 @@ void Vim::escape(Doc &d) {
     clear_pending();
     cmd_kind = 0;
     cmd.clear();
-    if (mode == INSERT) {
+    if (mode == INSERT || mode == REPLACE) {
         d.break_group();
         if (recording && !replaying) last_ins = ins_rec;
         recording = false;
+        repl_stack.clear();
+        if (blk.on) {   /* the text typed on the first line of a block insert goes into every other line */
+            blk.on = false;
+            size_t l0 = blk.l0, l1 = blk.l1;
+            if (l1 > l0 && !ins_rec.empty() && ins_rec.find('\n') == std::string::npos) {
+                std::string out, t;
+                for (size_t l = l0 + 1; l <= l1; l++) {
+                    d.buf.line_text(l, t);
+                    size_t e = lend(d, l) - ls(d, l), at_b = e;
+                    if (blk.kind == 'A' && !blk.eol) {
+                        bool sh;
+                        size_t p = pos_at_col(d, l, blk.c1 + 1, &sh);
+                        if (sh) t.append((size_t)(blk.c1 + 1 - d.col_of_byte(l, e)), ' ');
+                        at_b = sh ? t.size() : p - ls(d, l);
+                    } else if (blk.kind != 'A') {
+                        bool sh;
+                        size_t p = pos_at_col(d, l, blk.c0, &sh);
+                        if (sh) { out += t; if (l < l1) out += '\n'; continue; }
+                        at_b = p - ls(d, l);
+                    }
+                    t.insert(at_b, ins_rec);
+                    out += t;
+                    if (l < l1) out += '\n';
+                }
+                size_t s0 = ls(d, l0 + 1), e0 = lend(d, l1);
+                d.replace(s0, e0 - s0, out.data(), out.size());
+                d.break_group();
+            }
+            d.cur = d.anchor = pos_at_col(d, l0, blk.c0);
+        }
         mode = NORMAL;
         size_t l = d.buf.line_of(d.cur);
         if (d.cur > ls(d, l)) d.cur = d.anchor = d.prev_char(d.cur);
@@ -664,15 +890,15 @@ void Vim::dot(Doc &d) {
     std::vector<std::string> ks = last_keys;
     std::string ins = last_ins;
     for (const std::string &k : ks) text(d, k);
-    if (mode == INSERT) {
-        if (!ins.empty()) d.insert_text(ins.data(), ins.size());
+    if (typing()) {
+        for (size_t i = 0; i < ins.size();) { size_t n = 1; while (i + n < ins.size() && ((unsigned char)ins[i + n] & 0xC0) == 0x80) n++; type_char(d, ins.substr(i, n)); i += n; }
         escape(d);
     }
     replaying = false;
 }
 
 void Vim::text(Doc &d, const std::string &s) {
-    if (mode == INSERT || s.empty()) return;
+    if (typing() || s.empty()) return;
     size_t first = 1;
     while (first < s.size() && ((unsigned char)s[first] & 0xC0) == 0x80) first++;
     if (first < s.size()) {   /* a paste or an input method can deliver several characters at once */
@@ -862,6 +1088,8 @@ void Vim::normal(Doc &d, const std::string &k) {
     case 'p': case 'P': done_change(); reset(); paste(d, c == 'p', n); return;
     case 'u': reset(); d.undo(); after_history(d); return;
     case 'v': reset(); mode = VISUAL; d.anchor = d.cur; return;
+    case '\x16': reset(); mode = VBLOCK; bl_anchor = cur; bl_eol = false; d.anchor = d.cur; return;
+    case 'R': done_change(); reset(); mode = REPLACE; d.break_group(); recording = !replaying; ins_rec.clear(); repl_stack.clear(); return;
     case 'V': reset(); mode = VLINE; vline0 = l; vwant = d.want_col; vline_fix(d); return;
     case ':': reset(); cmd_kind = ':'; cmd.clear(); return;
     case '/': reset(); cmd_kind = '/'; cmd.clear(); return;
@@ -894,7 +1122,9 @@ void Vim::visual(Doc &d, const std::string &k) {
         d.anchor = d.cur;
         apply(d, o, r);
     };
-    if (k == "gu" || k == "gU" || k == "g~") { finish(k[1]); return; }
+    if (k == "\x16" && mode != VBLOCK) { bl_anchor = d.anchor; mode = VBLOCK; clear_pending(); d.anchor = d.cur; bl_eol = false; return; }
+    if (mode == VBLOCK && block(d, k)) return;
+    if (k == "gu" || k == "gU" || k == "g~") { if (mode != VBLOCK) finish(k[1]); return; }
     if (k.size() == 2 && (k[0] == 'i' || k[0] == 'a')) {
         R r{0, 0, false};
         clear_pending();
@@ -911,7 +1141,7 @@ void Vim::visual(Doc &d, const std::string &k) {
         }
         return;
     }
-    switch (c) {
+    if (mode != VBLOCK) switch (c) {
     case 'v': clear_pending(); if (mode == VISUAL) { mode = NORMAL; d.anchor = d.cur; clamp(d); } else { mode = VISUAL; } return;
     case 'V': clear_pending(); if (mode == VLINE) { mode = NORMAL; d.anchor = d.cur; clamp(d); } else { mode = VLINE; vline0 = d.buf.line_of(d.cur); vwant = d.want_col; vline_fix(d); } return;
     case 'o': clear_pending(); std::swap(d.anchor, d.cur); return;
@@ -956,6 +1186,7 @@ void Vim::visual(Doc &d, const std::string &k) {
     Mv m = motion(d, k, n, hc, false);
     clear_pending();
     if (!m.ok) return;
+    if (mode == VBLOCK) { setc(d, m.pos, m.vert); d.anchor = d.cur; if (!m.vert) bl_eol = k == "$"; return; }
     if (mode == VLINE) { d.cur = m.pos; if (!m.vert) vwant = d.want_col; vline_fix(d); if (!m.vert) { size_t l = d.buf.line_of(d.cur); d.want_col = d.col_of_byte(l, m.pos - ls(d, l)); vwant = d.want_col; } return; }
     setc(d, m.pos, m.vert);
 }

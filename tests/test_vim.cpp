@@ -17,7 +17,7 @@ struct T {
         v.page_rows = [] { return 20; };
         v.reset(true);
     }
-    void keys(const char *k) { for (const char *p = k; *p; p++) { if (*p == '\x1b') v.escape(d); else if (v.mode == Vim::INSERT) { d.insert_text(p, 1); v.typed(std::string(1, *p)); } else v.text(d, std::string(1, *p)); } }
+    void keys(const char *k) { for (const char *p = k; *p; p++) { if (*p == '\x1b') v.escape(d); else if (v.typing()) v.type_char(d, std::string(1, *p)); else v.text(d, std::string(1, *p)); } }
     std::string s() const { return all(d); }
 };
 
@@ -53,6 +53,20 @@ int main() {
     { T t("a\nb\nc\n"); t.keys("majjd'a"); CHECK(t.s() == ""); }
     { T t("n 9 x\n"); t.keys(""); t.v.increment(t.d, 1); CHECK(t.s() == "n 10 x\n"); }
     { T t("foo bar\n"); t.keys("$gex"); CHECK(t.s() == "fo bar\n"); }
+    { T t("abcdef\n"); t.keys("RXY\x1b"); CHECK(t.s() == "XYcdef\n"); t.keys("u"); CHECK(t.s() == "abcdef\n"); }
+    { T t("abc\n"); t.keys("$RXYZ\x1b"); CHECK(t.s() == "abXYZ\n"); }
+    { T t("abcdef\n"); t.keys("RXY"); t.v.backspace(t.d); t.keys("\x1b"); CHECK(t.s() == "Xbcdef\n"); }
+    { T t("abcdef\n"); t.keys("RXY\x1bl."); CHECK(t.s() == "XYXYef\n"); }
+    { T t("abcd\nefgh\nijkl\n"); t.keys("l\x16jld"); CHECK(t.s() == "ad\neh\nijkl\n"); }
+    { T t("abcd\nefgh\nijkl\n"); t.keys("l\x16jly$p"); CHECK(t.s() == "abcdbc\nefghfg\nijkl\n"); }
+    { T t("abcd\nefgh\nijkl\n"); t.keys("\x16jjIX\x1b"); CHECK(t.s() == "Xabcd\nXefgh\nXijkl\n"); }
+    { T t("abc\nde\nfgh\n"); t.keys("\x16jj$AX\x1b"); CHECK(t.s() == "abcX\ndeX\nfghX\n"); }
+    { T t("abcd\nefgh\n"); t.keys("l\x16jlcZ\x1b"); CHECK(t.s() == "aZd\neZh\n"); }
+    { T t("abcd\nefgh\n"); t.keys("\x16jlrx"); CHECK(t.s() == "xxcd\nxxgh\n"); }
+    { T t("abcd\nefgh\n"); t.keys("\x16jlU"); CHECK(t.s() == "ABcd\nEFgh\n"); }
+    { T t("ab\ncd\n"); t.keys("\x16jy"); t.keys("$p"); CHECK(t.s() == "aba\ncdc\n"); }
+    { T t("a\nb\n"); t.keys("jdd"); CHECK(t.s() == "a\n"); }   /* the buffer ends with a newline: that is not an extra line to join */
+    { T t("a\nb"); t.keys("jdd"); CHECK(t.s() == "a"); }
     if (fails == 0) printf("vim ok\n");
     return fails ? 1 : 0;
 }

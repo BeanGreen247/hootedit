@@ -81,6 +81,19 @@ has "vim surround" "text: (one) two three"
 run "act:vim;text:ix;escape;act:vim;text:ix;dump" a.txt
 has "vim off: keys type text" "vim: off"
 
+run "act:vim;text:l;ctrl+v;text:jld;dump" a.txt
+has "vim block delete" "text: o two three\nfr five\nsix\n"
+run "act:vim;text:RXY;escape;dump" a.txt
+has "vim replace mode" "text: XYe two three\nfour five\nsix\n"
+run "act:vim;text::;text:g/o/d;return;dump" a.txt
+has "vim :g/pat/d" "text: six\n"
+run "act:vim;text::;text:g/o/s/o/0/g;return;dump" a.txt
+has "vim :g with :s" "text: 0ne tw0 three\nf0ur five\nsix\n"
+run "act:vim;text::;text:v/o/d;return;dump" a.txt
+has "vim :v/pat/d" "text: one two three\nfour five\n"
+run "act:vim;text::;text:%normal Ax;return;dump" a.txt
+has "vim :normal over a range" "text: one two threex\nfour fivex\nsixx\n"
+
 # ---- outline ----
 run "act:outline;act:view_explorer;dump" t.c
 ok "outline lists the type" "outline: P line=3 depth=0 kind=C"
