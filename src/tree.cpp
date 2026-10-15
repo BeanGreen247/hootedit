@@ -59,6 +59,16 @@ void Tree::load_dir(const std::string &dir, int depth, std::vector<Row> &out, bo
         v.push_back({name, p, depth, dir, false});
     }
     closedir(d);
+    if (follow_links) {   /* tree view only: files git tracks as deleted still show, struck through */
+        for (const std::string &g : ghosts_) {
+            size_t sl = g.rfind('/');
+            if (sl == std::string::npos || g.compare(0, sl, dir) != 0 || sl != dir.size()) continue;
+            std::string nm = g.substr(sl + 1);
+            bool dup = false;
+            for (const Row &r : v) if (r.name == nm) { dup = true; break; }
+            if (!dup) v.push_back({nm, g, depth, false, false, true});
+        }
+    }
     std::sort(v.begin(), v.end(), [](const Row &a, const Row &b) { return a.dir != b.dir ? a.dir : lower(a.name) < lower(b.name); });
     out.insert(out.end(), v.begin(), v.end());
 }

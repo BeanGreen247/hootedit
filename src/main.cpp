@@ -49,6 +49,7 @@
 #include "lestrix/ui/uitheme.h"
 #include "syntax.h"
 #include "tree.h"
+#include "vim.h"
 
 static Uint32 g_ev_wake;
 static std::atomic<int> g_wake_pending;
@@ -181,14 +182,14 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
@@ -199,14 +200,14 @@ const std::vector<Menu> MENUS = {
               {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
-              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
     {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
                   {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
-    {"Help", {{"About Hootedit", "", A_ABOUT}}},
+    {"Help", {{"Keyboard Shortcuts", "Ctrl+K Ctrl+H", A_SHORTCUTS}, {"", "", A_NONE}, {"About Hootedit", "", A_ABOUT}}},
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -228,7 +229,7 @@ struct GitUi {
     std::string tl_path;
     std::string mark_hash, mark_label;                 /* "Select for compare": Ctrl+click marks, Shift+click compares with the mark */
     std::string err;                                   /* the last commit failure */
-    bool blame_inline = true;                          /* the faint "who changed this line" text after the cursor line */
+    bool blame_inline = false;                          /* the faint "who changed this line" text after the cursor line */
     double blame_t0 = 0;
     bool tree_view = false;                            /* the file lists as a folder tree instead of a flat list */
     std::set<std::string> collapsed;                   /* tree folders the user closed, as "<section>:<dir>" */
@@ -362,7 +363,10 @@ struct Ed {
     Tree tree;
     GitInfo git;
     View view = V_EXPLORER;
-    bool pinned = true, side_open = true, root_open = true;
+    bool pinned = true, side_open = true, root_open = true, opened_open = true, outline_open = true;
+    std::unordered_map<std::string, char> deco;        /* absolute path -> git status letter, for file and folder rows in the Explorer */
+    bool outline_on = false;                           /* Explorer shows the symbols of the active file (View > Outline, off by default) */
+    bool vim_on = false;                               /* modal editing */
     double side_close_at = 0;
     float side_scroll = 0;
     GitUi g;
@@ -507,6 +511,27 @@ std::string settings_path() {
     return dir + "/hootedit/settings.ini";
 }
 
+bool have_vim() {   /* the Vim Keys setting needs a vim on PATH (the toggle is greyed out without one) */
+    static int found = -1;
+    if (found < 0) {
+        found = 0;
+        const char *path = getenv("PATH");
+        std::string p = path ? path : "/usr/bin:/bin";
+        for (size_t a = 0; a <= p.size() && !found; ) {
+            size_t b = p.find(':', a);
+            if (b == std::string::npos) b = p.size();
+            std::string dir = p.substr(a, b - a);
+            for (const char *nm : {"vim", "nvim", "vi"}) if (!dir.empty() && access((dir + "/" + nm).c_str(), X_OK) == 0) { found = 1; break; }
+            a = b + 1;
+        }
+    }
+    return found == 1;
+}
+
+Vim g_vim;
+bool vim_active() { return E.vim_on && have_vim(); }
+void vim_reset() { g_vim.reset(vim_active()); }
+
 void settings_load() {
     FILE *f = fopen(settings_path().c_str(), "r");
     if (!f) return;
@@ -524,7 +549,8 @@ void settings_load() {
         else if (!strcmp(line, "terminal")) E.term_choice = v;
         else if (!strcmp(line, "git_smart_commit")) E.g.smart_commit = atoi(v);
         else if (!strcmp(line, "git_sync_confirm")) E.g.sync_confirm = atoi(v) != 0;
-        else if (!strcmp(line, "blame_inline")) E.g.blame_inline = atoi(v) != 0;
+        else if (!strcmp(line, "outline")) E.outline_on = atoi(v) != 0;
+        else if (!strcmp(line, "vim_keys")) E.vim_on = atoi(v) != 0;
         else if (!strcmp(line, "git_tree")) E.g.tree_view = atoi(v) != 0;
         else if (!strcmp(line, "panel_height")) E.panel_logical = std::max(80, std::min(1200, atoi(v)));
     }
@@ -540,7 +566,8 @@ void settings_save() {
     FILE *f = fopen(p.c_str(), "w");
     if (!f) return;
     fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : E.view == V_REMOTE ? "remote" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
-    fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\nblame_inline=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0, E.g.blame_inline ? 1 : 0);
+    fprintf(f, "outline=%d\nvim_keys=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0);
+    fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0);
     fclose(f);
 }
 
@@ -584,6 +611,38 @@ void git_follow_active() {
     if (dir != E.git_for) git_refresh();
 }
 
+char change_status(const GitChange &c) {
+    if (c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D')) return 'C';
+    if (c.x == '?') return '?';
+    return c.y != ' ' ? c.y : c.x;
+}
+
+/* what the Explorer shows from git: coloured names, a status letter, folders marked when something inside changed, deleted files as ghost rows */
+void git_deco_rebuild() {
+    E.deco.clear();
+    std::vector<std::string> ghosts;
+    if (E.git.repo) {
+        for (const GitChange &c : E.git.changes) {
+            std::string abs = E.git.root + "/" + c.path;
+            char st = change_status(c);
+            if (!c.path.empty() && c.path.back() == '/') abs.pop_back();   /* an untracked directory */
+            E.deco[abs] = st;
+            if (st == 'D') { struct stat sb; if (stat(abs.c_str(), &sb) != 0) ghosts.push_back(abs); }
+            char dc = st == 'C' ? 'C' : st == '?' ? '?' : 'M';
+            for (size_t sl = abs.rfind('/'); sl != std::string::npos && sl > E.git.root.size(); sl = abs.rfind('/', sl - 1)) {
+                std::string dir = abs.substr(0, sl);
+                auto it = E.deco.find(dir);
+                if (it == E.deco.end() || (it->second == '?' && dc != '?') || dc == 'C') E.deco[dir] = dc;
+                if (sl == 0) break;
+            }
+        }
+    }
+    std::sort(ghosts.begin(), ghosts.end());
+    std::vector<std::string> old = E.tree.ghosts();
+    std::sort(old.begin(), old.end());
+    if (old != ghosts) { E.tree.set_ghosts(ghosts); E.tree.refresh(); }
+}
+
 void git_refresh() {
     std::string ws = E.tree.root().empty() ? "." : E.tree.root();
     E.git = git_query(ws);
@@ -595,6 +654,7 @@ void git_refresh() {
     }
     E.quick_files.clear();
     E.sfiles.reset();                           /* the file list is rebuilt on the next search or quick open */
+    git_deco_rebuild();
     git_ui_reload();
     diff_reload_all();
     gutter_invalidate();
@@ -2998,6 +3058,101 @@ void draw_remote_view(float rail, float sw, float cx, float cw, float list_top, 
     ry += rowh * 2;
 }
 
+/* ---- outline: a cheap symbol scan of the active file (no parser): types, functions, markdown headings ---- */
+
+struct OItem { std::string name; size_t line; int depth; char kind; };
+
+struct OutlineCache { const Doc *d = nullptr; uint64_t rev = 0; std::vector<OItem> items; } g_outline;
+
+bool ident_ch(char c) { return isalnum((unsigned char)c) || c == '_' || c == '$' || c == ':' || c == '~' || c == '.'; }
+
+void outline_scan(const Doc &d, std::vector<OItem> &out) {
+    out.clear();
+    bool md = std::string(lang_name(d.lang)) == "Markdown";
+    static const char *mods[] = {"export ", "default ", "public ", "private ", "protected ", "static ", "async ", "pub ", "pub(crate) ", "final ", "abstract ", "inline ", "virtual ", "extern ", "unsafe ", "sealed ", "partial ", "open ", "override "};
+    static const char *types[] = {"class ", "struct ", "enum ", "union ", "namespace ", "interface ", "trait ", "impl ", "mod ", "module ", "object ", "protocol ", "extension ", "type "};
+    static const char *funcs[] = {"def ", "fn ", "func ", "function ", "function* ", "fun ", "sub ", "proc "};
+    static const char *ctl[] = {"if", "for", "while", "switch", "return", "else", "do", "case", "catch", "sizeof", "delete", "new", "throw", "using", "typedef", "goto", "elif", "with", "assert", "await", "yield", "not", "and", "or"};
+    std::vector<int> stack;   /* indents of the enclosing items: depth = how many are shallower */
+    std::string t;
+    size_t n = std::min<size_t>(d.buf.lines(), 30000);
+    for (size_t l = 0; l < n && out.size() < 3000; l++) {
+        if (d.buf.line_len(l) > 300) continue;
+        d.buf.line_text(l, t);
+        int ind = 0; size_t i = 0;
+        while (i < t.size() && (t[i] == ' ' || t[i] == '\t')) { ind += t[i] == '\t' ? 4 : 1; i++; }
+        if (i >= t.size()) continue;
+        std::string s = t.substr(i);
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\r' || s.back() == '\t')) s.pop_back();
+        if (s.empty()) continue;
+        auto push = [&](const std::string &name, char kind) {
+            while (!stack.empty() && stack.back() >= ind) stack.pop_back();
+            out.push_back({name, l, std::min<int>((int)stack.size(), 4), kind});
+            stack.push_back(ind);
+        };
+        if (md) {
+            if (s[0] != '#') continue;
+            size_t h = 0; while (h < s.size() && s[h] == '#') h++;
+            if (h > 6 || h >= s.size() || s[h] != ' ') continue;
+            out.push_back({s.substr(h + 1), l, (int)h - 1, 'H'});
+            continue;
+        }
+        if (s[0] == '#' || s[0] == '/' || s[0] == '*' || s[0] == '}' || s[0] == '"' || s[0] == '\'') continue;
+        std::string k = s;
+        for (bool again = true; again;) { again = false; for (const char *m : mods) { size_t ml = strlen(m); if (k.compare(0, ml, m) == 0) { k.erase(0, ml); again = true; } } }
+        auto take = [&](size_t from) { size_t e = from; while (e < k.size() && ident_ch(k[e])) e++; return k.substr(from, e - from); };
+        bool done = false;
+        for (const char *ty : types) {
+            size_t tl = strlen(ty);
+            if (k.compare(0, tl, ty) != 0) continue;
+            size_t from = tl;
+            if (k.compare(from, 6, "class ") == 0) from += 6; else if (k.compare(from, 7, "struct ") == 0) from += 7;
+            std::string nm;
+            if (!strcmp(ty, "impl ")) { nm = k.substr(from); size_t b = nm.find('{'); if (b != std::string::npos) nm.erase(b); while (!nm.empty() && nm.back() == ' ') nm.pop_back(); }
+            else nm = take(from);
+            if (nm.empty() || (k.back() == ';' && k.find('{') == std::string::npos)) { done = true; break; }
+            push(nm, 'C'); done = true; break;
+        }
+        if (done) continue;
+        for (const char *fn : funcs) {
+            size_t fl = strlen(fn);
+            if (k.compare(0, fl, fn) != 0) continue;
+            size_t from = fl;
+            if (k[from] == '(') { size_t c = k.find(')', from); if (c == std::string::npos) break; from = c + 1; while (from < k.size() && k[from] == ' ') from++; }   /* Go receiver */
+            std::string nm = take(from);
+            if (!nm.empty()) push(nm, 'F');
+            done = true; break;
+        }
+        if (done) continue;
+        /* C-like definitions: "type name(...) {", "Class::method(...) const", "name(...) {" inside a body */
+        char last = k.back();
+        if (!(isalpha((unsigned char)k[0]) || k[0] == '_' || k[0] == '~')) continue;
+        if (last == ';' || last == ',' || last == '=' || last == '(') continue;
+        size_t par = k.find('(');
+        if (par == std::string::npos || par == 0) continue;
+        if (k.find('=') < par || k.find('"') < par) continue;
+        size_t e = par; while (e > 0 && k[e - 1] == ' ') e--;
+        size_t b = e; while (b > 0 && ident_ch(k[b - 1])) b--;
+        if (b == e) continue;
+        std::string nm = k.substr(b, e - b);
+        bool ctlw = false;
+        size_t fw = 0; while (fw < k.size() && ident_ch(k[fw])) fw++;
+        std::string first = k.substr(0, fw);
+        for (const char *c : ctl) if (first == c) ctlw = true;
+        if (ctlw) continue;
+        bool typed = b > 0, scoped = nm.find("::") != std::string::npos;
+        bool ret_paren = last == ')' || last == '{' || k.find(") const") != std::string::npos || k.find(") noexcept") != std::string::npos || k.find(") override") != std::string::npos;
+        if (!ret_paren) continue;
+        if (!typed && !scoped && !(last == '{' && k.size() >= 3 && k[k.size() - 2] == ' ' && k[k.size() - 3] == ')' && k.find("=>") == std::string::npos && k.find('\'') == std::string::npos)) continue;
+        push(nm, 'F');
+    }
+}
+
+const std::vector<OItem> &outline_for(const Doc &d) {
+    if (g_outline.d != &d || g_outline.rev != d.buf.revision()) { g_outline.d = &d; g_outline.rev = d.buf.revision(); outline_scan(d, g_outline.items); }
+    return g_outline.items;
+}
+
 void draw_sidebar(const Layout &L) {
     float sw = (float)L.side_x1, top = (float)L.menu_h, bot = (float)L.bar_y;
     float rail = (float)S(29);
@@ -3157,11 +3312,67 @@ void draw_sidebar(const Layout &L) {
             hit(rail + 1, ry, sw - rail - 2, rowh, H_SIDEHIT, (int)i);
         }
     } else if (files_view) {
+        float orh = (float)S(24);
+        auto section = [&](const std::string &label, bool open, int id) {
+            float y0 = ry;
+            group(label, true, open, 0);
+            hit(rail + 1, y0, sw - rail - 2, (float)S(24), H_SECT, id);
+        };
+        if (E.docs.size() > 1 || !D().pristine()) {   /* OPEN EDITORS: every tab, with the unsaved mark and a close button */
+            section(sfmt("OPEN EDITORS  %zu", E.docs.size()), E.opened_open, 0);
+            if (E.opened_open) {
+                size_t rl = E.tree.root().size() + 1;
+                for (size_t i = 0; i < E.docs.size(); i++, ry += orh) {
+                    if (ry + orh < list_top || ry > bot) continue;
+                    const Doc &dd = *E.docs[i];
+                    bool cur = (int)i == E.active, hv = hovered(H_OPENED, (int)i) || hovered(H_TABCLOSE, 1000 + (int)i);
+                    if (cur) { r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_SELROW); r_rect(E.r, rail + 1, ry, (float)S(2), orh, C_ACCENT); }
+                    else if (hv) r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_HOVER);
+                    float cxr = sw - (float)S(30);
+                    std::string nm = dd.name();
+                    float pen = draw_text(E.ui, cx + (float)S(14), ui_base(ry, orh), nm.c_str(), cur ? C_ACCENT : C_UI, cxr - cx - (float)S(14), dd.preview ? FS_ITALIC : FS_REGULAR);
+                    if (!dd.path.empty() && !dd.title.size()) {
+                        std::string rel = dd.path.size() > rl && dd.path.compare(0, rl, E.tree.root() + "/") == 0 ? dd.path.substr(rl) : dd.path;
+                        size_t sl = rel.rfind('/');
+                        if (sl != std::string::npos && cxr - pen - (float)S(16) > (float)S(30)) draw_text(E.ui, pen + (float)S(8), ui_base(ry, orh), rel.substr(0, sl).c_str(), C_UI_FAINT, cxr - pen - (float)S(12));
+                    }
+                    bool mod = dd.modified();
+                    float ix = sw - (float)S(26), iy = ry + (orh - (float)S(16)) / 2;
+                    if (mod && !hovered(H_TABCLOSE, 1000 + (int)i)) draw_icon(IC_DOT, ix, iy, S(16), C_UI);
+                    else if (hv || cur) draw_icon(IC_CLOSE, ix, iy, S(16), hovered(H_TABCLOSE, 1000 + (int)i) ? C_UI : C_UI_DIM);
+                    hit(rail + 1, ry, sw - rail - 2 - (float)S(30), orh, H_OPENED, (int)i);
+                    hit(sw - (float)S(30), ry, (float)S(30), orh, H_TABCLOSE, 1000 + (int)i);
+                }
+            }
+        }
+        if (E.outline_on && !D().dv && !D().mv) {   /* OUTLINE: symbols of the active file, click to jump */
+            const std::vector<OItem> &oi = outline_for(D());
+            section(sfmt("OUTLINE  %zu", oi.size()), E.outline_open, 1);
+            if (E.outline_open) {
+                if (oi.empty()) { draw_text(E.ui, cx + (float)S(14), ui_base(ry, orh), "No symbols found", C_UI_FAINT, cw); ry += orh; }
+                size_t curline = D().buf.line_of(D().cur);
+                long here = -1;
+                for (size_t i = 0; i < oi.size(); i++) if (oi[i].line <= curline) here = (long)i;
+                for (size_t i = 0; i < oi.size(); i++, ry += orh) {
+                    if (ry + orh < list_top || ry > bot) continue;
+                    if ((long)i == here) { r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_SELROW); r_rect(E.r, rail + 1, ry, (float)S(2), orh, C_ACCENT); }
+                    else if (hovered(H_OUTLINE, (int)i)) r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_HOVER);
+                    const OItem &it = oi[i];
+                    float x = cx + (float)S(14 + 12 * it.depth);
+                    const char *tag = it.kind == 'C' ? "C" : it.kind == 'H' ? "#" : "f";
+                    uint32_t tc = it.kind == 'C' ? C_ORANGE : it.kind == 'H' ? C_UI_DIM : C_ACCENT;
+                    draw_text(E.ui, x, ui_base(ry, orh), tag, tc, (float)S(14), FS_BOLD);
+                    draw_text(E.ui, x + (float)S(16), ui_base(ry, orh), it.name.c_str(), (long)i == here ? C_ACCENT : C_UI, sw - x - (float)S(24));
+                    hit(rail + 1, ry, sw - rail - 2, orh, H_OUTLINE, (int)i);
+                }
+            }
+        }
         std::string name = E.tree.root_name();
         for (char &c : name) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
         group(name, true, E.root_open, H_ROOT);
         if (E.root_open) {
             const std::vector<Tree::Row> &rows = E.tree.rows();
+            const float tree_y0 = ry;
             for (size_t i = 0; i < rows.size(); i++, ry += rowh) {
                 if (ry + rowh < list_top || ry > bot) continue;
                 const Tree::Row &r = rows[i];
@@ -3174,8 +3385,42 @@ void draw_sidebar(const Layout &L) {
                 float tx = x + (float)S(r.dir ? 18 : 14);
                 if (r.dir) draw_icon(r.expanded ? IC_CHEV_D : IC_CHEV_R, x - (float)S(2), ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
                 else if (open_idx >= 0) draw_dot(x + (float)S(3), ry + rowh / 2, S(10), E.docs[(size_t)open_idx]->modified() ? C_ORANGE : C_GREEN);   /* open in a tab; orange = unsaved edits */
-                draw_text(E.ui, tx + (float)S(open_idx >= 0 && !r.dir ? 4 : 0), ui_base(ry, rowh), r.name.c_str(), cur ? C_ACCENT : C_UI, sw - tx - (float)S(8));
+                char gs = 0;
+                { auto di = E.deco.find(r.path); if (di != E.deco.end()) gs = di->second; }
+                if (r.ghost) gs = 'D';
+                uint32_t ncol = cur ? C_ACCENT : gs ? status_color(gs) : C_UI;
+                float badge_w = gs && !r.dir ? (float)S(22) : gs ? (float)S(18) : 0.f;
+                float nx = tx + (float)S(open_idx >= 0 && !r.dir ? 4 : 0);
+                float npen = draw_text(E.ui, nx, ui_base(ry, rowh), r.name.c_str(), ncol, sw - tx - (float)S(8) - badge_w);
+                if (r.ghost) r_rect(E.r, nx, ry + rowh / 2, std::max(0.f, npen - nx), std::max(1.f, E.scale), ncol);   /* struck through: deleted */
+                if (gs && !r.dir) draw_text(E.ui, sw - (float)S(18), ui_base(ry, rowh), status_letter(gs), ncol, (float)S(14), FS_BOLD);
+                else if (gs) draw_dot(sw - (float)S(14), ry + rowh / 2, S(8), ncol);
                 hit(rail + 1, ry, sw - rail - 2, rowh, H_TREE, (int)i);
+            }
+            /* sticky folders: the parents of the first visible row stay pinned under the filter box while you scroll a long folder */
+            if (tree_y0 < list_top && !rows.empty()) {
+                std::vector<size_t> chain;
+                for (int pass = 0; pass < 4; pass++) {
+                    size_t f = (size_t)std::max(0.f, std::ceil((list_top + (float)chain.size() * rowh - tree_y0) / rowh));
+                    if (f >= rows.size()) { chain.clear(); break; }
+                    std::vector<size_t> c2;
+                    int dpt = rows[f].depth;
+                    for (size_t j = f; j-- > 0 && dpt > 0;) if (rows[j].dir && rows[j].depth < dpt) { dpt = rows[j].depth; if (tree_y0 + (float)j * rowh < list_top + (float)c2.size() * 0.f) c2.push_back(j); }
+                    std::reverse(c2.begin(), c2.end());
+                    if (c2.size() > 3) c2.erase(c2.begin(), c2.end() - 3);
+                    if (c2.size() == chain.size()) { chain = c2; break; }
+                    chain = c2;
+                }
+                for (size_t k = 0; k < chain.size(); k++) {
+                    const Tree::Row &r = rows[chain[k]];
+                    float sy = list_top + (float)k * rowh, x = cx + (float)S(14 * r.depth);
+                    r_rect(E.r, rail + 1, sy, sw - rail - 2, rowh, C_CHROME);
+                    if (hovered(H_TREE, (int)chain[k])) r_rect(E.r, rail + 1, sy, sw - rail - 2, rowh, C_HOVER);
+                    draw_icon(IC_CHEV_D, x - (float)S(2), sy + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+                    draw_text(E.ui, x + (float)S(18), ui_base(sy, rowh), r.name.c_str(), C_UI, sw - x - (float)S(26), FS_BOLD);
+                    if (k + 1 == chain.size()) r_rect(E.r, rail + 1, sy + rowh - 1, sw - rail - 2, 1, C_BORDER);
+                    hit(rail + 1, sy, sw - rail - 2, rowh, H_TREE, (int)chain[k]);
+                }
             }
         }
         float content = (ry + E.side_scroll) - list_top;
@@ -4252,20 +4497,10 @@ void build_frame() {
                 }
             }
         }
-        if (E.g.blame_inline && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows && !d.has_sel()) {
-            if (const GitBlame *bl = blame_for(d, cl)) {
-                d.buf.line_text(cl, t);
-                int c0 = col_of(t, t.size()) - d.left + 4;
-                if (c0 >= 0 && c0 < L.cols) {
-                    std::string bt = blame_text(*bl);
-                    draw_text(E.ui, (float)(L.text_x + c0 * E.cw), (float)(L.text_y + (long)(cl - d.top) * E.rowh + E.rowasc), bt.c_str(), ui_mix(C_EDITOR, C_FG, 0.34), (float)(E.W - L.text_x - c0 * E.cw - S(16)));
-                }
-            }
-        }
         if (E.blink_on && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows) {
             d.buf.line_text(cl, t);
             int c = col_of(t, cb) - d.left;
-            if (c >= 0 && c <= L.cols) r_rect(E.r, (float)(L.text_x + c * E.cw), (float)(L.text_y + (long)(cl - d.top) * E.rowh), std::max(1.f, 1.5f * E.scale), (float)E.rowh, C_CURSOR);
+            if (c >= 0 && c <= L.cols) r_rect(E.r, (float)(L.text_x + c * E.cw), (float)(L.text_y + (long)(cl - d.top) * E.rowh), vim_active() && g_vim.block_cursor() ? (float)E.cw : std::max(1.f, 1.5f * E.scale), (float)E.rowh, vim_active() && g_vim.block_cursor() ? ui_mix(C_EDITOR, C_CURSOR, 0.75f) : C_CURSOR);
         }
         draw_peek(L, d);
         draw_conflict_actions(L, d);
@@ -4316,7 +4551,19 @@ void build_frame() {
         }
         std::string last = E.ops.empty() ? std::string() : (E.ops.back().brief.empty() ? E.ops.back().name : E.ops.back().brief) + "  " + fmt_ms(E.ops.back().ms);
         std::string left = E.status_msg.empty() ? (last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
+        if (vim_active() && !d.dv && !d.mv) {
+            std::string vl = g_vim.label();
+            float vw = draw_text(E.ui, lx, sy, vl.c_str(), g_vim.mode == Vim::INSERT ? C_GREEN : C_ACCENT, std::max(0.f, rx - lx), FS_BOLD);
+            lx = vw + (float)S(14);
+        }
         draw_text(E.ui, lx, sy, left.c_str(), E.status_msg.empty() ? C_UI_FAINT : C_UI_DIM, std::max(0.f, rx - lx));
+        if (vim_active() && g_vim.cmd_kind) {   /* the vim command line takes over the whole bar, like the last line of the terminal */
+            r_rect(E.r, 0, by0, (float)E.W, bh, C_CHROME);
+            r_rect(E.r, 0, by0, (float)E.W, 1, C_BORDER);
+            std::string cl = std::string(1, g_vim.cmd_kind) + g_vim.cmd;
+            float pen = draw_text(E.ui, (float)S(10), sy, cl.c_str(), C_UI, (float)E.W - (float)S(20));
+            if (E.blink_on) r_rect(E.r, pen + 1, by0 + (float)S(4), (float)S(8), bh - (float)S(8), C_CURSOR);
+        }
     }
     if (E.timing) { E.t_gutter += tm3 - tm1; E.t_status += now_s() - tm3; E.t_top += tm1 - tm0; }
 
@@ -4419,10 +4666,10 @@ void build_frame() {
         for (size_t i = 0; i < m.items.size(); i++) {
             const MenuItem &it = m.items[i];
             if (!it.label[0]) { r_rect(E.r, x + (float)S(8), y + sep / 2, iw - (float)S(16), 1, C_MENU_BORDER); y += sep; continue; }
-            bool enabled = it.act != A_NONE;
+            bool enabled = it.act != A_NONE && !(it.act == A_VIM && !have_vim());
             if (enabled && (int)i == E.menu_sel) r_rect(E.r, x + (float)S(3), y, iw - (float)S(6), ih, C_MENU_SEL);
             uint32_t col = enabled ? C_UI : C_UI_FAINT;
-            draw_text(E.ui, x + (float)S(26), ui_base(y, ih), it.label, col, iw);
+            draw_text(E.ui, x + (float)S(26), ui_base(y, ih), (it.act == A_VIM && !have_vim() ? std::string(it.label) + " (vim not installed)" : (it.act == A_VIM && E.vim_on ? std::string("\xE2\x9C\x93 ") + it.label : (it.act == A_OUTLINE && E.outline_on ? std::string("\xE2\x9C\x93 ") + it.label : std::string(it.label)))).c_str(), col, iw);
             float kw = text_width(E.ui, it.keys);
             draw_text(E.ui, x + iw - kw - (float)S(14), ui_base(y, ih), it.keys, C_UI_FAINT, kw + 2);
             if (enabled) hit(x, y, iw, ih, H_MENUITEM, (int)i);
@@ -5413,6 +5660,7 @@ void search_step(int dir) {   /* Up/Down in the results list: next or previous m
 }
 
 void command_palette();
+void show_shortcuts();
 void do_action(int act) {
     if ((D().dv || D().mv) && (act == A_CUT || act == A_PASTE || act == A_UNDO || act == A_REDO || act == A_SAVE || act == A_SAVEAS)) { E.status_msg = "diff tabs are read only"; redraw(); return; }
     Doc &d = D();
@@ -5465,6 +5713,9 @@ void do_action(int act) {
     case A_NEXT_TAB: set_active((E.active + 1) % (int)E.docs.size()); break;
     case A_PREV_TAB: set_active((E.active + (int)E.docs.size() - 1) % (int)E.docs.size()); break;
     case A_PALETTE: command_palette(); break;
+    case A_OUTLINE: E.outline_on = !E.outline_on; settings_save(); E.status_msg = E.outline_on ? "outline on (Files tab)" : "outline off"; break;
+    case A_SHORTCUTS: show_shortcuts(); break;
+    case A_VIM: if (!have_vim()) { E.status_msg = "vim is not installed: Vim Keys is unavailable"; break; } E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
     case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
     case A_REOPEN: reopen_closed_tab(); break;
@@ -5525,12 +5776,28 @@ void command_palette() {
     add("Git: Create Tag...", [] { git_tag_create(""); });
     add("Git: Add Remote...", [] { git_remote_add(); });
     add("Git: Remove Remote...", [] { git_remote_remove(); });
-    add("Git: Toggle Inline Blame Text", [] { E.g.blame_inline = !E.g.blame_inline; settings_save(); E.status_msg = E.g.blame_inline ? "inline blame on" : "inline blame off"; });
     add("Remote: New Connection...", [] { remote_new_connection(); });
     add("Remote: Open SSH Terminal", [] { if (!g_rem.profiles.empty()) { for (size_t i = 0; i < g_rem.conns.size(); i++) if (g_rem.conns[i].connected) { remote_open_terminal((int)i); return; } } E.status_msg = "connect to an ssh server in the Remote tab first"; });
     std::vector<Ed::PItem> items;
     for (size_t i = 0; i < cmds->size(); i++) items.push_back({(*cmds)[i].label, (int)i, false});
     pick_custom("Command Palette", items, [cmds](const Ed::PItem &it) { if ((size_t)it.id < cmds->size()) (*cmds)[(size_t)it.id].run(); });
+}
+
+/* Help > Keyboard Shortcuts: every shortcut in one filterable list; picking an entry that is a menu command runs it */
+void show_shortcuts() {
+    std::vector<Ed::PItem> items;
+    for (const Menu &m : MENUS)
+        for (const MenuItem &it : m.items)
+            if (it.label[0] && it.keys[0] && it.act != A_NONE) items.push_back({std::string(it.label) + "    " + it.keys, it.act + 1, false});
+    static const char *extra[] = {
+        "Select Next Occurrence    Ctrl+D", "Move Line Up / Down    Alt+Up / Alt+Down", "Copy Line Up / Down    Shift+Alt+Up / Down", "Delete Line    Ctrl+Shift+K",
+        "Insert Line Below / Above    Ctrl+Enter / Ctrl+Shift+Enter", "Select Line    Ctrl+L", "Toggle Line Comment    Ctrl+/", "Indent / Outdent    Ctrl+] / Ctrl+[",
+        "Go to Tab 1-9    Alt+1 ... Alt+9", "Recent Tabs    Ctrl+Tab", "Next Change in a Diff    F7", "Save All    Ctrl+K Ctrl+S", "Close All Tabs    Ctrl+K Ctrl+W",
+        "Keyboard Shortcuts    Ctrl+K Ctrl+H",
+        "Vim: normal mode    Esc", "Vim: insert    i a I A o O", "Vim: move    h j k l w b e 0 ^ $ gg G f t % { }", "Vim: edit    x dd D cc C yy p P u Ctrl+R . J r ~",
+        "Vim: operators    d y c > <  with motions and objects (diw ci\" da( yap)", "Vim: select    v V, then d y c > <", "Vim: command line    :w :q :wq :e file :42 /text n"};
+    for (const char *e : extra) items.push_back({e, 0, false});
+    pick_custom("Keyboard Shortcuts", items, [](const Ed::PItem &it) { if (it.id > 0) do_action(it.id - 1); });
 }
 
 void key_down(const SDL_KeyboardEvent &k) {
@@ -5719,8 +5986,29 @@ void key_down(const SDL_KeyboardEvent &k) {
     E.status_msg.clear();
     if (sym == SDLK_BACKSPACE || sym == SDLK_DELETE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER || sym == SDLK_LEFT || sym == SDLK_RIGHT || sym == SDLK_UP || sym == SDLK_DOWN) begin_op(sym == SDLK_BACKSPACE || sym == SDLK_DELETE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER ? "keystroke" : "cursor move");
     if (E.show_stats && sym == SDLK_ESCAPE) { E.show_stats = false; touch(); return; }
-    if (E.side_open && !E.pinned && sym == SDLK_ESCAPE) { open_side(false); touch(); return; }
     bool alt = k.keysym.mod & KMOD_ALT;
+    if (E.mode == M_EDIT && vim_active() && !d.dv && !d.mv && !E.chord_k) {
+        if (g_vim.cmd_kind) {
+            if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) g_vim.cmd_enter(d);
+            else if (sym == SDLK_ESCAPE) g_vim.cmd_cancel();
+            else if (sym == SDLK_BACKSPACE) g_vim.cmd_back();
+            else if (ctrl && sym == SDLK_u) g_vim.cmd.clear();
+            else if (ctrl && sym == SDLK_v) { char *c = SDL_GetClipboardText(); if (c) { g_vim.cmd_text(c); SDL_free(c); } }
+            E.follow = true; touch(); return;
+        }
+        if (sym == SDLK_ESCAPE || (ctrl && sym == SDLK_LEFTBRACKET)) { g_vim.escape(d); E.follow = true; touch(); return; }
+        if (g_vim.mode == Vim::INSERT) { if (sym == SDLK_BACKSPACE && !ctrl) g_vim.erased(); }
+        else if (!alt) {
+            if (ctrl && !shift && sym == SDLK_r) { d.redo(); g_vim.after_history(d); E.follow = true; touch(); return; }
+            if (ctrl && !shift && (sym == SDLK_d || sym == SDLK_u)) { g_vim.half_page(d, sym == SDLK_d ? 1 : -1); E.follow = true; touch(); return; }
+            if (!ctrl) {
+                const char *km = sym == SDLK_BACKSPACE ? "h" : sym == SDLK_DELETE ? "x" : (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) ? "+" : nullptr;
+                if (km) { g_vim.text(d, km); E.follow = true; touch(); return; }
+                if (sym == SDLK_TAB) return;
+            }
+        }
+    }
+    if (E.side_open && !E.pinned && sym == SDLK_ESCAPE) { open_side(false); touch(); return; }
     if (E.chord_k) {   /* the second key of Ctrl+K */
         E.chord_k = false;
         E.status_msg.clear();
@@ -5729,7 +6017,7 @@ void key_down(const SDL_KeyboardEvent &k) {
         else if (sym == SDLK_o && ctrl) do_action(A_OPEN_FOLDER);
         else if (sym == SDLK_w && ctrl) do_action(A_CLOSE_ALL);
         else if (sym == SDLK_m) do_action(A_LANG);
-        else if (sym == SDLK_b) { E.g.blame_inline = !E.g.blame_inline; settings_save(); E.status_msg = E.g.blame_inline ? "inline blame on" : "inline blame off"; }
+        else if (sym == SDLK_h && ctrl) do_action(A_SHORTCUTS);
         else if (sym == SDLK_s && ctrl) { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); after_save(); }
         touch();
         return;
@@ -5922,7 +6210,7 @@ void click_hit(const Hit &h) {
     if (term_hit && h.kind == H_ACT) E.term_focus = true;
     switch (h.kind) {
     case H_TAB: if (g_clicks >= 2 && h.id < (int)E.docs.size()) E.docs[(size_t)h.id]->preview = false; set_active(h.id); E.mode = M_EDIT; E.tab_press = h.id; E.tab_press_x = E.mx; E.tab_dragging = false; break;
-    case H_TABCLOSE: E.mode = M_EDIT; close_tab(h.id); break;
+    case H_TABCLOSE: E.mode = M_EDIT; close_tab(h.id >= 1000 ? h.id - 1000 : h.id); break;
     case H_BOX: do_action(E.mode == M_FIND ? A_NONE : A_FIND); break;
     case H_ACT: if (h.id != A_TOG_CASE && h.id != A_TOG_REGEX && h.id != A_TOG_WORD) E.mode = M_EDIT; do_action(h.id); break;
     case H_MENU: if (E.mode == M_MENU && E.menu_open == h.id) { E.mode = M_EDIT; E.menu_open = -1; } else open_menu(h.id); break;
@@ -5933,10 +6221,17 @@ void click_hit(const Hit &h) {
     case H_BTN_DISCARD: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_d; key_down(k); break; }
     case H_BTN_CANCEL: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_ESCAPE; key_down(k); break; }
     case H_ROOT: E.root_open = !E.root_open; break;
+    case H_SECT: if (h.id == 0) E.opened_open = !E.opened_open; else E.outline_open = !E.outline_open; break;
+    case H_OPENED: if (h.id < (int)E.docs.size()) { if (g_clicks >= 2) E.docs[(size_t)h.id]->preview = false; set_active(h.id); E.mode = M_EDIT; } break;
+    case H_OUTLINE: { const std::vector<OItem> &oi = outline_for(D()); if ((size_t)h.id < oi.size()) { E.mode = M_EDIT; goto_line(std::to_string(oi[(size_t)h.id].line + 1)); } break; }
     case H_TREE: {
         const std::vector<Tree::Row> &rows = E.tree.rows();
         if ((size_t)h.id >= rows.size()) break;
         if (rows[(size_t)h.id].dir) E.tree.toggle((size_t)h.id);
+        else if (rows[(size_t)h.id].ghost) {   /* a deleted file: show what was removed */
+            std::string p = rows[(size_t)h.id].path;
+            for (const GitChange &c : E.git.changes) if (E.git.root + "/" + c.path == p) { if (!E.pinned) open_side(false); open_change_diff(c, c.y == ' '); break; }
+        }
         else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2); }
         break;
     }
@@ -6154,6 +6449,11 @@ void text_input(const char *s) {
     }
     if (E.mode == M_CONFIRM || E.mode == M_MENU) return;
     if (SDL_GetModState() & KMOD_CTRL) return;
+    if (E.mode == M_EDIT && vim_active()) {
+        if (g_vim.cmd_kind) { g_vim.cmd_text(s); touch(); return; }
+        if (g_vim.mode != Vim::INSERT) { g_vim.text(D(), s); E.follow = true; touch(); return; }
+        g_vim.typed(s);
+    }
     D().insert_text(s, strlen(s));
     E.status_msg.clear();
     E.follow = true;
@@ -6502,6 +6802,58 @@ void run_script(const char *script) {
 
 }  // namespace
 
+/* vim mode: the engine lives in vim.cpp; this wires it to the clipboard, the find box, tabs and the ":" commands */
+void vim_search_next() {
+    Doc &d = D();
+    if (E.find_q.empty()) return;
+    if (find_from(d.next_char(d.cur))) { size_t p = d.sel_lo(); d.anchor = d.cur = p; E.follow = true; }
+}
+
+void vim_exec(char kind, const std::string &raw) {
+    Doc &d = D();
+    std::string c = raw;
+    while (!c.empty() && c.back() == ' ') c.pop_back();
+    size_t b = c.find_first_not_of(' ');
+    c = b == std::string::npos ? std::string() : c.substr(b);
+    if (kind == '/') {
+        if (c.empty()) return;
+        E.find_q = c;
+        E.find_msg.clear();
+        if (find_from(d.cur)) { size_t p = d.sel_lo(); d.anchor = d.cur = p; E.follow = true; }
+        else E.status_msg = "E486: Pattern not found: " + c;
+        return;
+    }
+    if (c.empty()) return;
+    bool digits = c.find_first_not_of("0123456789") == std::string::npos;
+    if (digits) { goto_line(c); return; }
+    if (c == "$") { goto_line(std::to_string(d.buf.lines())); return; }
+    std::string cmd = c, arg;
+    size_t sp = c.find(' ');
+    if (sp != std::string::npos) { cmd = c.substr(0, sp); arg = c.substr(sp + 1); }
+    bool bang = !cmd.empty() && cmd.back() == '!';
+    if (bang) cmd.pop_back();
+    if (cmd == "w" || cmd == "write") { if (d.path.empty() && arg.empty()) do_action(A_SAVEAS); else if (!arg.empty()) { std::string p = arg[0] == '/' ? arg : (E.tree.root().empty() ? arg : E.tree.root() + "/" + arg); E.status_msg = d.save(p.c_str()) ? "saved " + p : "SAVE FAILED: " + p; } else save_active(); }
+    else if (cmd == "q" || cmd == "quit" || cmd == "close") { if (bang) { E.confirm_idx = E.active; remove_doc(E.active); } else close_tab(E.active); }
+    else if (cmd == "wq" || cmd == "x" || cmd == "xit" || cmd == "exit") { save_active(); if (!D().modified()) close_tab(E.active); }
+    else if (cmd == "wa" || cmd == "wall") { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); after_save(); E.status_msg = "saved all"; }
+    else if (cmd == "qa" || cmd == "qall" || cmd == "wqa" || cmd == "xa") { if (cmd == "wqa" || cmd == "xa") { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); } if (bang) E.running = false; else request_quit(); }
+    else if (cmd == "e" || cmd == "edit" || cmd == "o" || cmd == "open") { if (arg.empty()) do_action(A_OPEN_FILE); else open_path(arg[0] == '/' ? arg : (E.tree.root().empty() ? arg : E.tree.root() + "/" + arg)); }
+    else if (cmd == "bn" || cmd == "bnext" || cmd == "tabn") do_action(A_NEXT_TAB);
+    else if (cmd == "bp" || cmd == "bprev" || cmd == "tabp") do_action(A_PREV_TAB);
+    else if (cmd == "noh" || cmd == "nohlsearch" || cmd == "set" || cmd == "syntax") {}
+    else if (cmd == "help" || cmd == "h") show_shortcuts();
+    else E.status_msg = "E492: Not an editor command: " + c;
+}
+
+void vim_init() {
+    g_vim.set_clip = [](const std::string &t) { SDL_SetClipboardText(t.c_str()); };
+    g_vim.get_clip = []() { std::string r; char *c = SDL_GetClipboardText(); if (c) { r = c; SDL_free(c); } return r; };
+    g_vim.exec = vim_exec;
+    g_vim.search_next = vim_search_next;
+    g_vim.page_rows = []() { return std::max(2, layout().rows); };
+    vim_reset();
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--askpass")) return askpass_client(argc >= 3 ? argv[2] : "");   /* git and ssh start us as their password helper */
     std::vector<const char *> args;
@@ -6525,6 +6877,7 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n"); return 2; }
     }
     settings_load();
+    vim_init();
     std::string workspace;
     for (const char *a : args) {
         struct stat st;

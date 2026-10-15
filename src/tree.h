@@ -12,7 +12,7 @@
  * a huge folder costs one readdir. Hidden like VS Code in the owner's settings: .git, node_modules, vendor, dist. */
 class Tree {
 public:
-    struct Row { std::string name, path; int depth; bool dir, expanded; };
+    struct Row { std::string name, path; int depth; bool dir, expanded; bool ghost = false; };   /* ghost: deleted on disk but git still tracks it */
 
     void set_root(const std::string &path);
     const std::string &root() const { return root_; }
@@ -20,6 +20,8 @@ public:
     const std::vector<Row> &rows() const { return rows_; }
     void toggle(size_t i);                    /* expand or collapse directory row i */
     void reveal(const std::string &path);     /* expand parents so `path` is visible */
+    void set_ghosts(std::vector<std::string> abs_paths) { ghosts_ = std::move(abs_paths); }   /* call refresh() after */
+    const std::vector<std::string> &ghosts() const { return ghosts_; }
     void refresh();                           /* re-read every expanded directory */
     long find(const std::string &path) const; /* row index or -1 */
 
@@ -31,5 +33,6 @@ private:
     void expand_at(size_t i);
     std::string root_;
     std::vector<Row> rows_;
+    std::vector<std::string> ghosts_;
 };
 #endif
