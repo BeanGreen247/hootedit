@@ -67,6 +67,8 @@ bool inside(Icon ic, float x, float y) {
     case IC_OPEN_FILE:   /* a sheet with a small arrow leaving it */
         return seg(x, y, 3.5f, 1.5f, 8.5f, 1.5f, 0.7f) || seg(x, y, 3.5f, 1.5f, 3.5f, 14.5f, 0.7f) || seg(x, y, 3.5f, 14.5f, 12.5f, 14.5f, 0.7f) || seg(x, y, 12.5f, 14.5f, 12.5f, 10, 0.7f) ||
                seg(x, y, 7, 9, 13.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 9.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 13.5f, 6.5f, 0.75f);
+    case IC_SIDEBAR:   /* a window frame with its left panel filled */
+        return seg(x, y, 2, 3, 14, 3, 0.7f) || seg(x, y, 2, 13, 14, 13, 0.7f) || seg(x, y, 2, 3, 2, 13, 0.7f) || seg(x, y, 14, 3, 14, 13, 0.7f) || (x > 2 && x < 6.2f && y > 3 && y < 13);
     case IC_GEAR: {   /* a ring with eight teeth: settings */
         float dx = x - 8, dy = y - 8, r = sqrtf(dx * dx + dy * dy), a = atan2f(dy, dx);
         if (ring(x, y, 8, 8, 4.4f, 1.7f)) return true;

@@ -213,7 +213,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL, H_SETCOG };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL, H_SETCOG, H_SIDETOG };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX, M_SETTINGS };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -4206,6 +4206,16 @@ void draw_menu_bar(const Layout &L, float *menu_end) {
         hit(x, 0, w, (float)L.menu_h, H_MENU, (int)i);
         x += w;
     }
+    /* top right, like VS Code: show or hide the sidebar, and the settings cog (reachable when the sidebar is closed) */
+    float bs = (float)S(26), isz = (float)S(16), by = ((float)L.menu_h - bs) / 2, bx = (float)E.W - (float)S(6) - bs;
+    for (int k = 0; k < 2; k++) {
+        int kind = k == 0 ? H_SETCOG : H_SIDETOG;
+        bool on = k == 0 ? E.mode == M_SETTINGS : E.side_open;
+        if (hovered(kind, 0)) r_rect(E.r, bx, by, bs, bs, C_HOVER);
+        draw_icon(k == 0 ? IC_GEAR : IC_SIDEBAR, bx + (bs - isz) / 2, by + (bs - isz) / 2, (int)isz, on ? C_ACCENT : C_UI_DIM);
+        hit(bx, 0, bs, (float)L.menu_h, kind, 0);
+        bx -= bs;
+    }
     *menu_end = x;
 }
 
@@ -7039,6 +7049,7 @@ void click_hit(const Hit &h) {
         else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2 && E.preview_tabs); }
         break;
     }
+    case H_SIDETOG: open_side(!E.side_open); break;
     case H_SETCOG: if (E.mode == M_SETTINGS) set_close(); else set_open(); break;
     case H_ACTIVITY: set_close(); show_view((View)h.id); break;
     case H_PIN: do_action(A_PIN); break;
@@ -7535,6 +7546,7 @@ void run_script(const char *script) {
             printf("text: %s\ncursor: %zu,%zu\nselection: %zu\nstatus: %s\nvim: %s\nfind: %s\nmode: %d\nsidebar: %d view=%d\n", esc(all).c_str(), cl + 1, dd.cur - dd.buf.line_start(cl) + 1, dd.sel_hi() - dd.sel_lo(),
                    E.status_msg.c_str(), vim_active() ? g_vim.label().c_str() : "off", E.find_q.c_str(), (int)E.mode, E.side_open ? 1 : 0, (int)E.view);
             for (const Tree::Row &r : E.tree.rows()) { auto di = E.deco.find(r.path); printf("row: %s depth=%d dir=%d ghost=%d deco=%c\n", r.name.c_str(), r.depth, r.dir ? 1 : 0, r.ghost ? 1 : 0, di == E.deco.end() ? '-' : di->second); }
+            printf("sidebar: %d\n", E.side_open ? 1 : 0);
             printf("settings: open=%d category=%d query=%s rows=%zu\n", g_set.open ? 1 : 0, g_set.cat, g_set.q.c_str(), g_set.rows.size());
             lint_kick(dd, true);
             if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());

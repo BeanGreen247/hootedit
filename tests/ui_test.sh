@@ -218,5 +218,10 @@ has "Ctrl+, opens the Settings page" "settings: open=1"
 run "wait:200;mouse:5,5;click:14,725;mouse:5,5;dump" typo.yaml
 has "the cog at the foot of the sidebar rail opens Settings" "settings: open=1"
 
+run "wait:200;mouse:5,5;click:979,14;mouse:5,5;wait:100;mouse:5,5;click:1005,14;mouse:5,5;dump" typo.yaml
+has "the settings cog at the top right works with the sidebar closed" "settings: open=1"
+run "wait:200;mouse:5,5;click:979,14;mouse:5,5;dump" typo.yaml
+has "the top right toggle closes the sidebar" "sidebar: 0"
+
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]
