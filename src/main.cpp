@@ -50,6 +50,7 @@
 #include "syntax.h"
 #include "tree.h"
 #include "vim.h"
+#include "outline.h"
 
 static Uint32 g_ev_wake;
 static std::atomic<int> g_wake_pending;
@@ -511,25 +512,8 @@ std::string settings_path() {
     return dir + "/hootedit/settings.ini";
 }
 
-bool have_vim() {   /* the Vim Keys setting needs a vim on PATH (the toggle is greyed out without one) */
-    static int found = -1;
-    if (found < 0) {
-        found = 0;
-        const char *path = getenv("PATH");
-        std::string p = path ? path : "/usr/bin:/bin";
-        for (size_t a = 0; a <= p.size() && !found; ) {
-            size_t b = p.find(':', a);
-            if (b == std::string::npos) b = p.size();
-            std::string dir = p.substr(a, b - a);
-            for (const char *nm : {"vim", "nvim", "vi"}) if (!dir.empty() && access((dir + "/" + nm).c_str(), X_OK) == 0) { found = 1; break; }
-            a = b + 1;
-        }
-    }
-    return found == 1;
-}
-
 Vim g_vim;
-bool vim_active() { return E.vim_on && have_vim(); }
+bool vim_active() { return E.vim_on; }
 void vim_reset() { g_vim.reset(vim_active()); }
 
 void settings_load() {
@@ -3088,93 +3072,7 @@ void draw_remote_view(float rail, float sw, float cx, float cw, float list_top, 
 
 /* ---- outline: a cheap symbol scan of the active file (no parser): types, functions, markdown headings ---- */
 
-struct OItem { std::string name; size_t line; int depth; char kind; };
-
 struct OutlineCache { const Doc *d = nullptr; uint64_t rev = 0; std::vector<OItem> items; } g_outline;
-
-bool ident_ch(char c) { return isalnum((unsigned char)c) || c == '_' || c == '$' || c == ':' || c == '~' || c == '.'; }
-
-void outline_scan(const Doc &d, std::vector<OItem> &out) {
-    out.clear();
-    bool md = std::string(lang_name(d.lang)) == "Markdown";
-    static const char *mods[] = {"export ", "default ", "public ", "private ", "protected ", "static ", "async ", "pub ", "pub(crate) ", "final ", "abstract ", "inline ", "virtual ", "extern ", "unsafe ", "sealed ", "partial ", "open ", "override "};
-    static const char *types[] = {"class ", "struct ", "enum ", "union ", "namespace ", "interface ", "trait ", "impl ", "mod ", "module ", "object ", "protocol ", "extension ", "type "};
-    static const char *funcs[] = {"def ", "fn ", "func ", "function ", "function* ", "fun ", "sub ", "proc "};
-    static const char *ctl[] = {"if", "for", "while", "switch", "return", "else", "do", "case", "catch", "sizeof", "delete", "new", "throw", "using", "typedef", "goto", "elif", "with", "assert", "await", "yield", "not", "and", "or"};
-    std::vector<int> stack;   /* indents of the enclosing items: depth = how many are shallower */
-    std::string t;
-    size_t n = std::min<size_t>(d.buf.lines(), 30000);
-    for (size_t l = 0; l < n && out.size() < 3000; l++) {
-        if (d.buf.line_len(l) > 300) continue;
-        d.buf.line_text(l, t);
-        int ind = 0; size_t i = 0;
-        while (i < t.size() && (t[i] == ' ' || t[i] == '\t')) { ind += t[i] == '\t' ? 4 : 1; i++; }
-        if (i >= t.size()) continue;
-        std::string s = t.substr(i);
-        while (!s.empty() && (s.back() == ' ' || s.back() == '\r' || s.back() == '\t')) s.pop_back();
-        if (s.empty()) continue;
-        auto push = [&](const std::string &name, char kind) {
-            while (!stack.empty() && stack.back() >= ind) stack.pop_back();
-            out.push_back({name, l, std::min<int>((int)stack.size(), 4), kind});
-            stack.push_back(ind);
-        };
-        if (md) {
-            if (s[0] != '#') continue;
-            size_t h = 0; while (h < s.size() && s[h] == '#') h++;
-            if (h > 6 || h >= s.size() || s[h] != ' ') continue;
-            out.push_back({s.substr(h + 1), l, (int)h - 1, 'H'});
-            continue;
-        }
-        if (s[0] == '#' || s[0] == '/' || s[0] == '*' || s[0] == '}' || s[0] == '"' || s[0] == '\'') continue;
-        std::string k = s;
-        for (bool again = true; again;) { again = false; for (const char *m : mods) { size_t ml = strlen(m); if (k.compare(0, ml, m) == 0) { k.erase(0, ml); again = true; } } }
-        auto take = [&](size_t from) { size_t e = from; while (e < k.size() && ident_ch(k[e])) e++; return k.substr(from, e - from); };
-        bool done = false;
-        for (const char *ty : types) {
-            size_t tl = strlen(ty);
-            if (k.compare(0, tl, ty) != 0) continue;
-            size_t from = tl;
-            if (k.compare(from, 6, "class ") == 0) from += 6; else if (k.compare(from, 7, "struct ") == 0) from += 7;
-            std::string nm;
-            if (!strcmp(ty, "impl ")) { nm = k.substr(from); size_t b = nm.find('{'); if (b != std::string::npos) nm.erase(b); while (!nm.empty() && nm.back() == ' ') nm.pop_back(); }
-            else nm = take(from);
-            if (nm.empty() || (k.back() == ';' && k.find('{') == std::string::npos)) { done = true; break; }
-            push(nm, 'C'); done = true; break;
-        }
-        if (done) continue;
-        for (const char *fn : funcs) {
-            size_t fl = strlen(fn);
-            if (k.compare(0, fl, fn) != 0) continue;
-            size_t from = fl;
-            if (k[from] == '(') { size_t c = k.find(')', from); if (c == std::string::npos) break; from = c + 1; while (from < k.size() && k[from] == ' ') from++; }   /* Go receiver */
-            std::string nm = take(from);
-            if (!nm.empty()) push(nm, 'F');
-            done = true; break;
-        }
-        if (done) continue;
-        /* C-like definitions: "type name(...) {", "Class::method(...) const", "name(...) {" inside a body */
-        char last = k.back();
-        if (!(isalpha((unsigned char)k[0]) || k[0] == '_' || k[0] == '~')) continue;
-        if (last == ';' || last == ',' || last == '=' || last == '(') continue;
-        size_t par = k.find('(');
-        if (par == std::string::npos || par == 0) continue;
-        if (k.find('=') < par || k.find('"') < par) continue;
-        size_t e = par; while (e > 0 && k[e - 1] == ' ') e--;
-        size_t b = e; while (b > 0 && ident_ch(k[b - 1])) b--;
-        if (b == e) continue;
-        std::string nm = k.substr(b, e - b);
-        bool ctlw = false;
-        size_t fw = 0; while (fw < k.size() && ident_ch(k[fw])) fw++;
-        std::string first = k.substr(0, fw);
-        for (const char *c : ctl) if (first == c) ctlw = true;
-        if (ctlw) continue;
-        bool typed = b > 0, scoped = nm.find("::") != std::string::npos;
-        bool ret_paren = last == ')' || last == '{' || k.find(") const") != std::string::npos || k.find(") noexcept") != std::string::npos || k.find(") override") != std::string::npos;
-        if (!ret_paren) continue;
-        if (!typed && !scoped && !(last == '{' && k.size() >= 3 && k[k.size() - 2] == ' ' && k[k.size() - 3] == ')' && k.find("=>") == std::string::npos && k.find('\'') == std::string::npos)) continue;
-        push(nm, 'F');
-    }
-}
 
 const std::vector<OItem> &outline_for(const Doc &d) {
     if (g_outline.d != &d || g_outline.rev != d.buf.revision()) { g_outline.d = &d; g_outline.rev = d.buf.revision(); outline_scan(d, g_outline.items); }
@@ -4694,10 +4592,10 @@ void build_frame() {
         for (size_t i = 0; i < m.items.size(); i++) {
             const MenuItem &it = m.items[i];
             if (!it.label[0]) { r_rect(E.r, x + (float)S(8), y + sep / 2, iw - (float)S(16), 1, C_MENU_BORDER); y += sep; continue; }
-            bool enabled = it.act != A_NONE && !(it.act == A_VIM && !have_vim());
+            bool enabled = it.act != A_NONE;
             if (enabled && (int)i == E.menu_sel) r_rect(E.r, x + (float)S(3), y, iw - (float)S(6), ih, C_MENU_SEL);
             uint32_t col = enabled ? C_UI : C_UI_FAINT;
-            draw_text(E.ui, x + (float)S(26), ui_base(y, ih), (it.act == A_VIM && !have_vim() ? std::string(it.label) + " (vim not installed)" : (it.act == A_VIM && E.vim_on ? std::string("\xE2\x9C\x93 ") + it.label : (it.act == A_OUTLINE && E.outline_on ? std::string("\xE2\x9C\x93 ") + it.label : std::string(it.label)))).c_str(), col, iw);
+            draw_text(E.ui, x + (float)S(26), ui_base(y, ih), ((it.act == A_VIM && E.vim_on) || (it.act == A_OUTLINE && E.outline_on) ? std::string("\xE2\x9C\x93 ") + it.label : std::string(it.label)).c_str(), col, iw);
             float kw = text_width(E.ui, it.keys);
             draw_text(E.ui, x + iw - kw - (float)S(14), ui_base(y, ih), it.keys, C_UI_FAINT, kw + 2);
             if (enabled) hit(x, y, iw, ih, H_MENUITEM, (int)i);
@@ -5743,7 +5641,7 @@ void do_action(int act) {
     case A_PALETTE: command_palette(); break;
     case A_OUTLINE: E.outline_on = !E.outline_on; settings_save(); E.status_msg = E.outline_on ? "outline on (Files tab)" : "outline off"; break;
     case A_SHORTCUTS: show_shortcuts(); break;
-    case A_VIM: if (!have_vim()) { E.status_msg = "vim is not installed: Vim Keys is unavailable"; break; } E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
+    case A_VIM: E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
     case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
     case A_REOPEN: reopen_closed_tab(); break;
@@ -6027,6 +5925,7 @@ void key_down(const SDL_KeyboardEvent &k) {
         if (sym == SDLK_ESCAPE || (ctrl && sym == SDLK_LEFTBRACKET)) { g_vim.escape(d); E.follow = true; touch(); return; }
         if (g_vim.mode == Vim::INSERT) { if (sym == SDLK_BACKSPACE && !ctrl) g_vim.erased(); }
         else if (!alt) {
+            if (ctrl && !shift && (sym == SDLK_a || sym == SDLK_x)) { g_vim.increment(d, sym == SDLK_a ? 1 : -1); E.follow = true; touch(); return; }
             if (ctrl && !shift && sym == SDLK_r) { d.redo(); g_vim.after_history(d); E.follow = true; touch(); return; }
             if (ctrl && !shift && (sym == SDLK_d || sym == SDLK_u)) { g_vim.half_page(d, sym == SDLK_d ? 1 : -1); E.follow = true; touch(); return; }
             if (!ctrl) {
@@ -6479,8 +6378,22 @@ void text_input(const char *s) {
     if (SDL_GetModState() & KMOD_CTRL) return;
     if (E.mode == M_EDIT && vim_active()) {
         if (g_vim.cmd_kind) { g_vim.cmd_text(s); touch(); return; }
-        if (g_vim.mode != Vim::INSERT) { g_vim.text(D(), s); E.follow = true; touch(); return; }
-        g_vim.typed(s);
+        if (!(D().dv || D().mv)) {   /* one event can carry several characters (a paste, an input method): each goes to vim or into the text, in order */
+            std::string all = s;
+            for (size_t i = 0; i < all.size();) {
+                size_t n = 1;
+                while (i + n < all.size() && ((unsigned char)all[i + n] & 0xC0) == 0x80) n++;
+                std::string ch = all.substr(i, n);
+                if (g_vim.cmd_kind) g_vim.cmd_text(ch);
+                else if (g_vim.mode != Vim::INSERT) g_vim.text(D(), ch);
+                else { g_vim.typed(ch); D().insert_text(ch.data(), ch.size()); }
+                i += n;
+            }
+            E.status_msg.clear();
+            E.follow = true;
+            touch();
+            return;
+        }
     }
     D().insert_text(s, strlen(s));
     E.status_msg.clear();
@@ -6731,6 +6644,21 @@ void run_script(const char *script) {
             continue;
         }
         E.ev_t0 = now_s();
+        if (step == "dump") {   /* prints the editor state, one "key: value" per line, for the UI tests */
+            auto esc = [](const std::string &t) { std::string o; for (char c : t) { if (c == '\n') o += "\\n"; else if (c == '\\') o += "\\\\"; else o += c; } return o; };
+            Doc &dd = D();
+            printf("active: %d\ntabs: %zu\n", E.active, E.docs.size());
+            for (size_t i = 0; i < E.docs.size(); i++) printf("tab %zu: %s preview=%d modified=%d\n", i, E.docs[i]->name().c_str(), E.docs[i]->preview ? 1 : 0, E.docs[i]->modified() ? 1 : 0);
+            std::string all;
+            dd.buf.copy(0, dd.buf.size(), all);
+            size_t cl = dd.buf.line_of(dd.cur);
+            printf("text: %s\ncursor: %zu,%zu\nselection: %zu\nstatus: %s\nvim: %s\nfind: %s\nmode: %d\nsidebar: %d view=%d\n", esc(all).c_str(), cl + 1, dd.cur - dd.buf.line_start(cl) + 1, dd.sel_hi() - dd.sel_lo(),
+                   E.status_msg.c_str(), vim_active() ? g_vim.label().c_str() : "off", E.find_q.c_str(), (int)E.mode, E.side_open ? 1 : 0, (int)E.view);
+            for (const Tree::Row &r : E.tree.rows()) { auto di = E.deco.find(r.path); printf("row: %s depth=%d dir=%d ghost=%d deco=%c\n", r.name.c_str(), r.depth, r.dir ? 1 : 0, r.ghost ? 1 : 0, di == E.deco.end() ? '-' : di->second); }
+            if (E.outline_on && !dd.dv && !dd.mv) for (const OItem &o : outline_for(dd)) printf("outline: %s line=%zu depth=%d kind=%c\n", o.name.c_str(), o.line + 1, o.depth, o.kind);
+            fflush(stdout);
+            continue;
+        }
         if (step.compare(0, 9, "hitcheck:") == 0) {   /* prints what a click at x,y would hit (test hook) */
             int x = 0, y = 0;
             sscanf(step.c_str() + 9, "%d,%d", &x, &y);
@@ -6831,10 +6759,91 @@ void run_script(const char *script) {
 }  // namespace
 
 /* vim mode: the engine lives in vim.cpp; this wires it to the clipboard, the find box, tabs and the ":" commands */
-void vim_search_next() {
+bool vim_find(const std::string &pat, size_t from, bool fwd, size_t *pos) {   /* regex search with wrap-around; case-insensitive unless the pattern has a capital */
     Doc &d = D();
-    if (E.find_q.empty()) return;
-    if (find_from(d.next_char(d.cur))) { size_t p = d.sel_lo(); d.anchor = d.cur = p; E.follow = true; }
+    Regex re;
+    bool icase = true;
+    for (unsigned char c : pat) if (c >= 'A' && c <= 'Z') icase = false;
+    std::string err;
+    if (!re.compile(pat, icase, &err) && !re.compile(Searcher::escape_literal(pat), icase, &err)) return false;
+    Matcher m(re);
+    size_t nl = d.buf.lines(), l0 = d.buf.line_of(std::min(from, d.buf.size()));
+    std::string t;
+    for (size_t i = 0; i <= nl; i++) {
+        size_t line = fwd ? (l0 + i) % nl : (l0 + nl - i % nl) % nl;
+        d.buf.line_text(line, t);
+        size_t base = d.buf.line_start(line), ms, me;
+        if (fwd) {
+            size_t start = i == 0 ? std::min(from - base, t.size() + 1) : 0;
+            if (start > t.size()) continue;
+            if (m.find(t.data(), t.size(), start, &ms, &me)) { *pos = base + ms; return true; }
+        } else {
+            long best = -1;
+            size_t f = 0;
+            while (f <= t.size() && m.find(t.data(), t.size(), f, &ms, &me)) {
+                if (i == 0 && base + ms >= from) break;
+                best = (long)ms;
+                f = ms + 1;
+            }
+            if (best >= 0) { *pos = base + (size_t)best; return true; }
+        }
+    }
+    return false;
+}
+
+/* ":[range]s/pat/rep/flags": & in the replacement is the whole match (the engine has no capture groups yet) */
+void vim_substitute(size_t l0, size_t l1, const std::string &c) {
+    Doc &d = D();
+    char dl = c[1];
+    std::vector<std::string> parts(1);
+    for (size_t i = 2; i < c.size(); i++) {
+        if (c[i] == '\\' && i + 1 < c.size()) { if (c[i + 1] == dl) { parts.back() += dl; i++; } else { parts.back() += c[i]; parts.back() += c[++i]; } }
+        else if (c[i] == dl && parts.size() < 3) parts.emplace_back();
+        else parts.back() += c[i];
+    }
+    if (parts.size() < 2) { E.status_msg = "E35: no previous pattern"; return; }
+    std::string pat = parts[0], rep = parts[1], flags = parts.size() > 2 ? parts[2] : "";
+    bool global = flags.find('g') != std::string::npos, icase = flags.find('i') != std::string::npos;
+    if (flags.find('I') == std::string::npos && !icase) { icase = true; for (unsigned char ch : pat) if (ch >= 'A' && ch <= 'Z') icase = false; }
+    Regex re;
+    std::string err;
+    if (!re.compile(pat, icase, &err)) { E.status_msg = "E486: invalid pattern: " + err; return; }
+    Matcher m(re);
+    std::string out, t;
+    size_t count = 0, lines_hit = 0;
+    l1 = std::min(l1, d.buf.lines() - 1);
+    for (size_t l = l0; l <= l1; l++) {
+        d.buf.line_text(l, t);
+        std::string o;
+        size_t from = 0;
+        bool hit_line = false;
+        while (from <= t.size()) {
+            size_t ms, me;
+            if (!m.find(t.data(), t.size(), from, &ms, &me)) break;
+            if (me == ms) { if (ms >= t.size()) break; o.append(t, from, ms + 1 - from); from = ms + 1; continue; }
+            o.append(t, from, ms - from);
+            for (size_t i = 0; i < rep.size(); i++) {
+                if (rep[i] == '&') o.append(t, ms, me - ms);
+                else if (rep[i] == '\\' && i + 1 < rep.size()) { char n2 = rep[++i]; if (n2 == 'n') o += '\n'; else if (n2 == 't') o += '\t'; else o += n2; }
+                else o += rep[i];
+            }
+            from = me;
+            count++;
+            hit_line = true;
+            if (!global) break;
+        }
+        if (from <= t.size()) o.append(t, from, std::string::npos);
+        if (hit_line) lines_hit++;
+        out += o;
+        if (l < l1) out += '\n';
+    }
+    if (!count) { E.status_msg = "E486: Pattern not found: " + pat; return; }
+    size_t a = d.buf.line_start(l0), b = d.buf.line_start(l1) + d.buf.line_len(l1);
+    d.break_group();
+    d.replace(a, b - a, out.data(), out.size());
+    d.anchor = d.cur = d.buf.line_start(std::min(l1, d.buf.lines() - 1));
+    d.break_group();
+    E.status_msg = sfmt("%zu substitution%s on %zu line%s", count, count == 1 ? "" : "s", lines_hit, lines_hit == 1 ? "" : "s");
 }
 
 void vim_exec(char kind, const std::string &raw) {
@@ -6843,15 +6852,39 @@ void vim_exec(char kind, const std::string &raw) {
     while (!c.empty() && c.back() == ' ') c.pop_back();
     size_t b = c.find_first_not_of(' ');
     c = b == std::string::npos ? std::string() : c.substr(b);
-    if (kind == '/') {
-        if (c.empty()) return;
-        E.find_q = c;
-        E.find_msg.clear();
-        if (find_from(d.cur)) { size_t p = d.sel_lo(); d.anchor = d.cur = p; E.follow = true; }
-        else E.status_msg = "E486: Pattern not found: " + c;
-        return;
-    }
+    if (kind == '!') { E.status_msg = raw; return; }
     if (c.empty()) return;
+    {   /* an optional range before the command: %  N  N,M  .  $  '<,'> */
+        size_t i = 0, nl = d.buf.lines(), cl = d.buf.line_of(d.cur), r0 = cl, r1 = cl;
+        bool ranged = false;
+        auto addr = [&](size_t &out) {
+            if (i >= c.size()) return false;
+            if (c[i] == '.') { out = cl; i++; return true; }
+            if (c[i] == '$') { out = nl - 1; i++; return true; }
+            if (c[i] == '\'' && i + 1 < c.size() && c[i + 1] == '<') { out = g_vim.vis_l0; i += 2; return true; }
+            if (c[i] == '\'' && i + 1 < c.size() && c[i + 1] == '>') { out = g_vim.vis_l1; i += 2; return true; }
+            if (isdigit((unsigned char)c[i])) { size_t n = 0; while (i < c.size() && isdigit((unsigned char)c[i])) n = n * 10 + (size_t)(c[i++] - '0'); out = n ? n - 1 : 0; return true; }
+            return false;
+        };
+        if (c[0] == '%') { r0 = 0; r1 = nl - 1; i = 1; ranged = true; }
+        else if (addr(r0)) { r1 = r0; ranged = true; if (i < c.size() && c[i] == ',') { i++; if (!addr(r1)) r1 = r0; } }
+        if (ranged) {
+            if (r1 < r0) std::swap(r0, r1);
+            std::string rest = c.substr(i);
+            while (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+            if (rest.empty()) { goto_line(std::to_string(std::min(r1, nl - 1) + 1)); return; }
+            if (rest.size() >= 2 && rest[0] == 's' && !isalnum((unsigned char)rest[1]) && rest[1] != ' ') { vim_substitute(r0, r1, rest); return; }
+            if (rest == "d" || rest == "delete") {
+                size_t a = d.buf.line_start(r0), b = r1 + 1 < nl ? d.buf.line_start(r1 + 1) : d.buf.size();
+                if (b == d.buf.size() && a > 0) a--;
+                d.break_group(); d.replace(a, b - a, "", 0); d.break_group();
+                d.anchor = d.cur = d.buf.line_start(std::min(r0, d.buf.lines() - 1));
+                return;
+            }
+            c = rest;
+        }
+    }
+    if (c.size() >= 2 && c[0] == 's' && !isalnum((unsigned char)c[1]) && c[1] != ' ') { size_t cl = d.buf.line_of(d.cur); vim_substitute(cl, cl, c); return; }
     bool digits = c.find_first_not_of("0123456789") == std::string::npos;
     if (digits) { goto_line(c); return; }
     if (c == "$") { goto_line(std::to_string(d.buf.lines())); return; }
@@ -6877,7 +6910,8 @@ void vim_init() {
     g_vim.set_clip = [](const std::string &t) { SDL_SetClipboardText(t.c_str()); };
     g_vim.get_clip = []() { std::string r; char *c = SDL_GetClipboardText(); if (c) { r = c; SDL_free(c); } return r; };
     g_vim.exec = vim_exec;
-    g_vim.search_next = vim_search_next;
+    g_vim.find = vim_find;
+    g_vim.on_search = [](const std::string &pat) { E.find_q = pat; E.find_regex = true; };
     g_vim.page_rows = []() { return std::max(2, layout().rows); };
     vim_reset();
 }

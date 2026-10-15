@@ -41,6 +41,18 @@ int main() {
     { T t("ab\n"); t.keys("rx"); CHECK(t.s() == "xb\n"); }
     { T t("ab\n"); t.keys(">>"); CHECK(t.s() == "    ab\n"); }
     { T t("a b\n"); t.keys("~~~"); CHECK(t.s() == "A B\n"); }
+    { T t("a b\n"); t.keys("gUiw"); CHECK(t.s() == "A b\n"); }
+    { T t("hello world\n"); t.keys("gUU"); CHECK(t.s() == "HELLO WORLD\n"); }
+    { T t("say \"hi\" ok\n"); t.keys("fhds\""); CHECK(t.s() == "say hi ok\n"); }
+    { T t("say \"hi\" ok\n"); t.keys("fhcs\"'"); CHECK(t.s() == "say 'hi' ok\n"); }
+    { T t("word\n"); t.keys("ysiw)"); CHECK(t.s() == "(word)\n"); }
+    { T t("word\n"); t.keys("yssb"); CHECK(t.s() == "(word)\n"); }
+    { T t("a\nb\n"); t.keys("qaA!\x1bjq"); CHECK(t.s() == "a!\nb\n"); t.keys("@a"); CHECK(t.s() == "a!\nb!\n"); }
+    { T t("a\nb\n"); t.keys("\"ayyj\"ap"); CHECK(t.s() == "a\nb\na\n"); }
+    { T t("x\ny\n\nz\n"); t.keys("dap"); CHECK(t.s() == "z\n"); }
+    { T t("a\nb\nc\n"); t.keys("majjd'a"); CHECK(t.s() == ""); }
+    { T t("n 9 x\n"); t.keys(""); t.v.increment(t.d, 1); CHECK(t.s() == "n 10 x\n"); }
+    { T t("foo bar\n"); t.keys("$gex"); CHECK(t.s() == "fo bar\n"); }
     if (fails == 0) printf("vim ok\n");
     return fails ? 1 : 0;
 }

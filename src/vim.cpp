@@ -82,6 +82,7 @@ std::string Vim::label() const {
     if (count) p += std::to_string(count);
     p += pend;
     if (!p.empty()) s += "   " + p;
+    if (macro_rec) s += std::string("   recording @") + macro_rec;
     return s;
 }
 
@@ -107,8 +108,13 @@ size_t Vim::vert(Doc &d, size_t from, long delta) {
 }
 
 void Vim::yank(const std::string &t, bool line) {
+    char rn = reg_name;
+    reg_name = 0;
+    if (rn == '_') return;   /* the black hole register */
     reg = t; reg_line = line; reg_sys = t;
-    if (set_clip) set_clip(t);
+    if (rn >= 'a' && rn <= 'z') regs[rn] = {t, line};
+    else if (rn >= 'A' && rn <= 'Z') { auto &r = regs[(char)tolower(rn)]; r.first += t; r.second = r.second || line; }
+    if (set_clip && (rn == 0 || rn == '+' || rn == '*')) set_clip(t);
 }
 
 void Vim::enter_insert(Doc &d) {
@@ -219,6 +225,47 @@ Vim::Mv Vim::motion(Doc &d, const std::string &k, int n, bool has_count, bool op
         }
         if (m.pos == cur) m.ok = false;
         m.incl = true;
+    } else if (s == "n" || s == "N") {
+        bool f = (s == "n") == last_fwd;
+        size_t pos = cur;
+        for (int i = 0; i < n; i++) if (!search_go(d, f, f ? d.next_char(pos) : pos, &pos)) { m.ok = false; return m; }
+        m.pos = pos;
+    } else if (s == "*" || s == "#") {
+        size_t le = lend(d, l), a = cur;
+        if (le == ls(d, l)) { m.ok = false; return m; }
+        if (a >= le) a = le - 1;
+        while (a < le && cls(at(d, a), false) != 1) a++;   /* the word under or after the cursor */
+        if (a >= le) { m.ok = false; return m; }
+        size_t b = a;
+        while (a > ls(d, l) && cls(at(d, a - 1), false) == 1) a--;
+        while (b < le && cls(at(d, b), false) == 1) b++;
+        last_pat = "\\b" + slice(d, a, b) + "\\b";
+        last_fwd = s == "*";
+        size_t pos = a;
+        for (int i = 0; i < n; i++) if (!search_go(d, last_fwd, last_fwd ? d.next_char(pos) : pos, &pos)) { m.ok = false; return m; }
+        if (on_search) on_search(last_pat);
+        m.pos = pos;
+    } else if (s == "H" || s == "M" || s == "L") {
+        long rows = page_rows ? page_rows() : 20, last = (long)d.buf.lines() - 1, top = std::min((long)d.top, last), tl;
+        if (s == "H") tl = std::min(top + n - 1, last);
+        else if (s == "M") tl = std::min(top + rows / 2, last);
+        else tl = std::max(0L, std::min(top + rows - 1, last) - (n - 1));
+        m.pos = first_nb(d, (size_t)tl);
+        m.line = true;
+    } else if (s == "ge" || s == "gE") {
+        size_t pos = cur;
+        for (int i = 0; i < n && pos > 0; i++) {
+            int c = cls(at(d, pos), s == "gE");
+            while (pos > 0 && c != 0 && cls(at(d, pos), s == "gE") == c) pos--;
+            while (pos > 0 && cls(at(d, pos), s == "gE") == 0) pos--;
+        }
+        m.pos = pos;
+        m.incl = true;
+    } else if (s.size() == 2 && (s[0] == '\'' || s[0] == '`')) {
+        auto it = marks.find(s[1]);
+        if (it == marks.end()) { m.ok = false; return m; }
+        m.pos = std::min(it->second, d.buf.size());
+        if (s[0] == '\'') { m.pos = first_nb(d, d.buf.line_of(m.pos)); m.line = true; }
     } else if (s == "}" || s == "{") {
         long tl = (long)l;
         long step = s == "}" ? 1 : -1;
@@ -271,6 +318,19 @@ bool Vim::object(Doc &d, const std::string &k, R &r) {
             else if (cl != 0) { while (a > a0 && cls(at(d, a - 1), big) == 0) a--; }
         }
         r = {a, b, false};
+        return true;
+    }
+    if (c == 'p') {
+        auto blank = [&](size_t x) { return d.buf.line_len(x) == 0; };
+        size_t a = l, b = l, nl = d.buf.lines();
+        bool bl = blank(l);
+        while (a > 0 && blank(a - 1) == bl) a--;
+        while (b + 1 < nl && blank(b + 1) == bl) b++;
+        if (!in) {
+            if (b + 1 < nl) { bool nb = blank(b + 1); size_t e = b + 1; while (e + 1 < nl && blank(e + 1) == nb) e++; b = e; }
+            else if (a > 0) { bool nb = blank(a - 1); size_t e = a - 1; while (e > 0 && blank(e - 1) == nb) e--; a = e; }
+        }
+        r = {a, b, true};
         return true;
     }
     if (c == '"' || c == '\'' || c == '`') {
@@ -407,7 +467,12 @@ void Vim::apply(Doc &d, char o, R r) {
 void Vim::paste(Doc &d, bool after, int n) {
     std::string t = reg;
     bool line = reg_line;
-    if (get_clip) { std::string s = get_clip(); if (!s.empty() && s != reg_sys) { t = s; line = s.back() == '\n'; } }
+    char rn = reg_name;
+    reg_name = 0;
+    if (rn == '_') return;
+    if (isalpha((unsigned char)rn)) { auto it = regs.find((char)tolower(rn)); if (it == regs.end()) return; t = it->second.first; line = it->second.second; }
+    else if ((rn == '+' || rn == '*') && get_clip) { t = get_clip(); line = !t.empty() && t.back() == '\n'; }
+    else if (get_clip) { std::string s = get_clip(); if (!s.empty() && s != reg_sys) { t = s; line = s.back() == '\n'; } }
     if (t.empty()) return;
     d.break_group();
     size_t l = d.buf.line_of(d.cur);
@@ -425,6 +490,102 @@ void Vim::paste(Doc &d, bool after, int n) {
     }
     clamp(d);
     d.break_group();
+}
+
+bool Vim::search_go(Doc &d, bool fwd, size_t from, size_t *pos) {
+    if (!find || last_pat.empty()) return false;
+    return find(last_pat, from, fwd, pos);
+}
+
+void Vim::save_vis(Doc &d) {
+    vis_a = d.anchor; vis_c = d.cur; vis_mode = mode;
+    vis_l0 = d.buf.line_of(std::min(d.anchor, d.cur));
+    vis_l1 = d.buf.line_of(std::max(d.anchor, d.cur));
+}
+
+void Vim::increment(Doc &d, int delta) {
+    size_t l = d.buf.line_of(d.cur), s0 = ls(d, l);
+    std::string t;
+    d.buf.line_text(l, t);
+    size_t i = d.cur - s0;
+    while (i > 0 && i <= t.size() && isdigit((unsigned char)t[i - 1]) && (i == t.size() || isdigit((unsigned char)t[i]))) i--;
+    if (i < t.size() && !isdigit((unsigned char)t[i])) { while (i < t.size() && !isdigit((unsigned char)t[i])) i++; }
+    if (i >= t.size()) return;
+    size_t b = i, e = i;
+    while (b > 0 && isdigit((unsigned char)t[b - 1])) b--;
+    while (e < t.size() && isdigit((unsigned char)t[e])) e++;
+    bool neg = b > 0 && t[b - 1] == '-';
+    long long v = atoll(t.substr(b, e - b).c_str());
+    if (neg) v = -v;
+    v += delta;
+    std::string out = std::to_string(v);
+    size_t from = neg ? b - 1 : b;
+    d.break_group();
+    d.replace(s0 + from, e - from, out.data(), out.size());
+    setc(d, s0 + from + out.size() - 1);
+    d.break_group();
+}
+
+namespace {
+void pair_of(const std::string &c, std::string &o, std::string &cl) {
+    switch (c.empty() ? 0 : c[0]) {
+    case '(': o = "( "; cl = " )"; break;
+    case ')': case 'b': o = "("; cl = ")"; break;
+    case '{': o = "{ "; cl = " }"; break;
+    case '}': case 'B': o = "{"; cl = "}"; break;
+    case '[': o = "[ "; cl = " ]"; break;
+    case ']': o = "["; cl = "]"; break;
+    case '<': case '>': o = "<"; cl = ">"; break;
+    default: o = cl = c; break;
+    }
+}
+}  // namespace
+
+void Vim::sur_wrap(Doc &d, R r, const std::string &c) {
+    size_t a, b;
+    if (r.line) { a = first_nb(d, r.a); b = lend(d, std::min(r.b, d.buf.lines() - 1)); }
+    else { a = r.a; b = r.b; }
+    std::string o, cl;
+    pair_of(c, o, cl);
+    std::string t = o + slice(d, a, b) + cl;
+    d.break_group();
+    d.replace(a, b - a, t.data(), t.size());
+    setc(d, a);
+    d.break_group();
+}
+
+void Vim::sur_key(Doc &d, const std::string &k) {
+    if (sur == 'Y') { sur = 0; sur_wrap(d, sur_r, k); return; }
+    if (sur == 'c' && sur_a.empty()) { sur_a = k; return; }
+    char kind = sur;
+    std::string from = kind == 'c' ? sur_a : k;
+    sur = 0;
+    sur_a.clear();
+    R r{0, 0, false};
+    if (!object(d, "a" + from, r) || r.b < r.a + 2) return;
+    std::string inner = slice(d, r.a + 1, r.b - 1), o, cl;
+    if (kind == 'c') { pair_of(k, o, cl); inner = o + inner + cl; }
+    d.break_group();
+    d.replace(r.a, r.b - r.a, inner.data(), inner.size());
+    setc(d, r.a);
+    d.break_group();
+}
+
+void Vim::play_macro(Doc &d, char name, int n) {
+    if (macro_play) return;
+    auto it = macros.find(name);
+    if (it == macros.end()) return;
+    last_macro = name;
+    std::vector<Ev> evs = it->second;
+    macro_play = true;
+    for (int i = 0; i < n; i++)
+        for (const Ev &e : evs) {
+            if (e.t == 0) text(d, e.s);
+            else if (e.t == 1) { typed(e.s); d.insert_text(e.s.data(), e.s.size()); }
+            else if (e.t == 2) escape(d);
+            else if (e.t == 3) { erased(); d.erase_back(); }
+        }
+    macro_play = false;
 }
 
 void Vim::vline_fix(Doc &d) {
@@ -451,6 +612,11 @@ void Vim::half_page(Doc &d, int dir) {
 }
 
 void Vim::escape(Doc &d) {
+    if (macro_rec && !macro_play) macro_buf.push_back({2, std::string()});
+    if (mode >= VISUAL) save_vis(d);
+    sur = 0;
+    sur_a.clear();
+    reg_name = 0;
     clear_pending();
     cmd_kind = 0;
     cmd.clear();
@@ -475,6 +641,20 @@ void Vim::cmd_enter(Doc &d) {
     std::string s = cmd;
     cmd_kind = 0;
     cmd.clear();
+    if (kind == '/' || kind == '?') {
+        if (!s.empty()) last_pat = s;
+        last_fwd = kind == '/';
+        if (last_pat.empty()) return;
+        size_t pos;
+        if (search_go(d, last_fwd, last_fwd ? d.next_char(d.cur) : d.cur, &pos)) {
+            marks['\''] = d.cur;
+            setc(d, pos);
+            if (mode == VLINE) vline_fix(d);
+            clamp(d);
+            if (on_search) on_search(last_pat);
+        } else if (exec) exec('!', "E486: Pattern not found: " + last_pat);
+        return;
+    }
     if (exec) exec(kind, s);
 }
 
@@ -504,6 +684,11 @@ void Vim::text(Doc &d, const std::string &s) {
         }
         return;
     }
+    if (sur == 'd' || sur == 'c' || sur == 'Y') { sur_key(d, s); return; }
+    if (macro_rec && !macro_play) {
+        if (idle() && s == "q") { macros[macro_rec] = macro_buf; macro_rec = 0; return; }
+        macro_buf.push_back({0, s});
+    }
     if (s == "." && idle()) { dot(d); return; }
     std::string k = s;
     if (!pend.empty()) { k = pend + s; pend.clear(); }
@@ -513,7 +698,7 @@ void Vim::text(Doc &d, const std::string &s) {
         char c = k[0];
         if (k.size() == 1 && ((c >= '1' && c <= '9') || (c == '0' && count > 0))) { count = count * 10 + (c - '0'); return; }
         bool objpfx = (c == 'i' || c == 'a') && (op || mode >= VISUAL);
-        if (k.size() == 1 && (c == 'g' || c == 'f' || c == 'F' || c == 't' || c == 'T' || c == 'r' || objpfx)) { pend = k; return; }
+        if (k.size() == 1 && (c == 'g' || c == 'f' || c == 'F' || c == 't' || c == 'T' || c == 'r' || c == 'z' || c == 'Z' || c == 'm' || c == '\'' || c == '`' || c == '@' || c == '"' || (c == 'q' && !macro_rec && idle()) || objpfx)) { pend = k; return; }
     }
     process(d, k);
 }
@@ -526,20 +711,26 @@ void Vim::normal(Doc &d, const std::string &k) {
     int n = count ? count : 1;
     bool hc = count > 0;
     size_t cur = d.cur, l = d.buf.line_of(cur), e = lend(d, l);
+    if (k.size() == 2 && k[0] == '"') { reg_name = k[1]; return; }
     if (op) {
         int total = (opcount ? opcount : 1) * n;
         bool thc = opcount || hc;
         char o = op;
         clear_pending();
         R r{0, 0, false};
-        if (k.size() == 1 && k[0] == o) {
-            r = {l, std::min(l + (size_t)total - 1, d.buf.lines() - 1), true};
-            apply(d, o, r);
+        auto finish_op = [&](R rr) {
+            if (o == 'S') { sur_r = rr; sur = 'Y'; return; }   /* ys: now wait for the surrounding character */
+            apply(d, o, rr);
             if (o != 'y') done_change();
+        };
+        if (k == "s" && (o == 'd' || o == 'c')) { sur = o; sur_a.clear(); return; }
+        if (k == "s" && o == 'y') { op = 'S'; return; }
+        if ((k.size() == 1 && k[0] == o) || (o == 'S' && k == "s") || (k.size() == 2 && k[0] == 'g' && k[1] == o)) {
+            finish_op({l, std::min(l + (size_t)total - 1, d.buf.lines() - 1), true});
             return;
         }
         if (k.size() == 2 && (k[0] == 'i' || k[0] == 'a')) {
-            if (object(d, k, r)) { apply(d, o, r); if (o != 'y') done_change(); }
+            if (object(d, k, r)) finish_op(r);
             return;
         }
         Mv m;
@@ -559,10 +750,25 @@ void Vim::normal(Doc &d, const std::string &k) {
             if (m.incl && b < d.buf.size()) b = d.next_char(b);
             r = {a, b, false};
         }
-        apply(d, o, r);
-        if (o != 'y') done_change();
+        if (m.ok && (k == "G" || k == "gg" || k == "%" || k == "n" || k == "N")) marks['\''] = cur;
+        finish_op(r);
         return;
     }
+    if (k == "gu" || k == "gU" || k == "g~") { op = k[1]; opcount = count; count = 0; return; }
+    if (k == "gv") { clear_pending(); mode = vis_mode; d.anchor = std::min(vis_a, d.buf.size()); d.cur = std::min(vis_c, d.buf.size()); if (mode == VLINE) { vline0 = d.buf.line_of(std::min(d.anchor, d.cur)); vwant = d.want_col; vline_fix(d); } return; }
+    if (k == "ZZ") { clear_pending(); if (exec) exec(':', "wq"); return; }
+    if (k == "ZQ") { clear_pending(); if (exec) exec(':', "q!"); return; }
+    if (k.size() == 2 && k[0] == 'z') {
+        clear_pending();
+        long rows = page_rows ? page_rows() : 20, ln = (long)l;
+        if (k[1] == 'z' || k[1] == '.') d.top = (size_t)std::max(0L, ln - rows / 2);
+        else if (k[1] == 't' || k[1] == '\r') d.top = (size_t)ln;
+        else if (k[1] == 'b' || k[1] == '-') d.top = (size_t)std::max(0L, ln - rows + 1);
+        return;
+    }
+    if (k.size() == 2 && k[0] == 'm') { clear_pending(); marks[k[1]] = cur; return; }
+    if (k.size() == 2 && k[0] == 'q') { clear_pending(); if (isalpha((unsigned char)k[1])) { macro_rec = k[1]; macro_buf.clear(); } return; }
+    if (k.size() == 2 && k[0] == '@') { int cnt = count ? count : 1; clear_pending(); char nm = k[1] == '@' ? last_macro : k[1]; if (nm) play_macro(d, nm, cnt); return; }
     char c = k[0];
     auto reset = [&] { clear_pending(); };
     switch (c) {
@@ -659,12 +865,13 @@ void Vim::normal(Doc &d, const std::string &k) {
     case 'V': reset(); mode = VLINE; vline0 = l; vwant = d.want_col; vline_fix(d); return;
     case ':': reset(); cmd_kind = ':'; cmd.clear(); return;
     case '/': reset(); cmd_kind = '/'; cmd.clear(); return;
-    case 'n': reset(); if (search_next) search_next(); return;
+    case '?': reset(); cmd_kind = '?'; cmd.clear(); return;
     default: break;
     }
     Mv m = motion(d, k, n, hc, false);
     reset();
     if (!m.ok) return;
+    if (k == "G" || k == "gg" || k == "%" || k == "n" || k == "N" || k == "*" || k == "#" || k == "{" || k == "}" || k[0] == '\'' || k[0] == '`') marks['\''] = cur;
     setc(d, m.pos, m.vert);
     clamp(d);
 }
@@ -681,15 +888,23 @@ void Vim::visual(Doc &d, const std::string &k) {
     };
     auto finish = [&](char o) {
         R r = sel();
+        save_vis(d);
         clear_pending();
         mode = NORMAL;
         d.anchor = d.cur;
         apply(d, o, r);
     };
+    if (k == "gu" || k == "gU" || k == "g~") { finish(k[1]); return; }
     if (k.size() == 2 && (k[0] == 'i' || k[0] == 'a')) {
         R r{0, 0, false};
         clear_pending();
-        if (object(d, k, r) && r.b > r.a) {
+        if (object(d, k, r) && r.line) {
+            mode = VLINE;
+            vline0 = r.a;
+            vwant = d.want_col;
+            d.cur = ls(d, std::min(r.b, d.buf.lines() - 1));
+            vline_fix(d);
+        } else if (r.b > r.a) {
             if (mode == VLINE) mode = VISUAL;
             d.anchor = r.a;
             d.cur = d.prev_char(r.b);
@@ -732,9 +947,10 @@ void Vim::visual(Doc &d, const std::string &k) {
         paste(d, after, 1);
         return;
     }
-    case ':': clear_pending(); cmd_kind = ':'; cmd.clear(); return;
+    case 'S': { R r = sel(); save_vis(d); clear_pending(); mode = NORMAL; d.anchor = d.cur; sur_r = r; sur = 'Y'; return; }
+    case ':': save_vis(d); clear_pending(); mode = NORMAL; d.anchor = d.cur; cmd_kind = ':'; cmd = "'<,'>"; return;
     case '/': clear_pending(); cmd_kind = '/'; cmd.clear(); return;
-    case 'n': clear_pending(); if (search_next) search_next(); return;
+    case '?': clear_pending(); cmd_kind = '?'; cmd.clear(); return;
     default: break;
     }
     Mv m = motion(d, k, n, hc, false);
