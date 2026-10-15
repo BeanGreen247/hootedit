@@ -36,6 +36,7 @@ public:
 
     std::shared_ptr<DiffView> dv;             /* set: this tab shows a diff, not text (read only) */
     std::shared_ptr<MergeView> mv;            /* set: this tab is the three-way merge editor of a conflicted file */
+    bool preview = false;                     /* italic preview tab (single click in the Explorer): replaced by the next preview until pinned */
     unsigned long used = 0;                   /* when the tab was last active, for Ctrl+Tab in most recently used order */
     std::string title;                        /* shown instead of the file name when set (diff views) */
     void load_text(const std::string &text);  /* replace everything, clean state, no undo history */

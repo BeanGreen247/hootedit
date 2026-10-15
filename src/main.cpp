@@ -390,7 +390,7 @@ struct Ed {
     CacheStats prev_cache = {};
     char hud[192] = "", hud_last[192] = "";
     /* operation timing: from the input event to the frame that shows its result being submitted to GL (vsync and scan-out are not included) */
-    struct OpRec { std::string name; double ms; int n; double build_ms; double work_ms; };
+    struct OpRec { std::string name; double ms; int n; double build_ms; double work_ms; std::string brief; };   /* brief: the name without the (details), for the status bar */
     double last_build_ms = 0, op_work = 0;
     std::vector<OpRec> ops;
     bool op_pending = false;
@@ -486,15 +486,15 @@ void begin_op(const std::string &name, const std::string &detail = "") {
     E.op_t0 = E.ev_t0 > 0 ? E.ev_t0 : now_s();
 }
 
-void record_op(const std::string &name, double ms, double build_ms = -1, double work_ms = -1) {
-    if (!E.ops.empty() && E.ops.back().name == name) { E.ops.back().ms = ms; E.ops.back().n++; E.ops.back().build_ms = build_ms; E.ops.back().work_ms = work_ms; }   /* repeated keystrokes keep one line */
-    else { E.ops.push_back({name, ms, 1, build_ms, work_ms}); if (E.ops.size() > 64) E.ops.erase(E.ops.begin()); }
+void record_op(const std::string &name, double ms, double build_ms = -1, double work_ms = -1, const std::string &brief = std::string()) {
+    if (!E.ops.empty() && E.ops.back().name == name) { E.ops.back().ms = ms; E.ops.back().n++; E.ops.back().build_ms = build_ms; E.ops.back().work_ms = work_ms; E.ops.back().brief = brief; }   /* repeated keystrokes keep one line */
+    else { E.ops.push_back({name, ms, 1, build_ms, work_ms, brief}); if (E.ops.size() > 64) E.ops.erase(E.ops.begin()); }
 }
 
 void end_op_if_pending() {
     if (!E.op_pending) return;
     double ms = (now_s() - E.op_t0) * 1000.0;
-    record_op(E.op_name + (E.op_detail.empty() ? "" : " (" + E.op_detail + ")"), ms, E.last_build_ms, E.op_work > 0 ? E.op_work : -1);
+    record_op(E.op_name + (E.op_detail.empty() ? "" : " (" + E.op_detail + ")"), ms, E.last_build_ms, E.op_work > 0 ? E.op_work : -1, E.op_name);
     E.op_pending = false;
     E.op_t0 = 0;
 }
@@ -623,8 +623,8 @@ void mru_end() {
     if (!E.docs.empty()) D().used = ++E.use_clock;
 }
 
-void open_path(const std::string &path) {
-    for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i]->path == path) { set_active((int)i); return; }
+void open_path(const std::string &path, bool preview = false) {   /* preview: a single click in the Explorer; the tab is italic and the next preview replaces it */
+    for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i]->path == path) { if (!preview) E.docs[i]->preview = false; set_active((int)i); return; }
     bool replace_first = E.docs.size() == 1 && D().pristine();
     Doc &d = new_doc(false);
     double t_open = now_s();
@@ -633,6 +633,10 @@ void open_path(const std::string &path) {
     E.op_work = 0;
     if (opened) { size_t sl = path.rfind('/'); E.op_work = 0; begin_op("open " + (sl == std::string::npos ? path : path.substr(sl + 1)), "map + index " + fmt_ms(t_open) + ", " + fmt_mb((double)d.buf.size()) + ", " + std::to_string(d.buf.lines()) + " lines"); E.op_work = t_open; }
     if (!opened) { E.docs.pop_back(); E.status_msg = "cannot open " + path; redraw(); return; }
+    if (preview) {
+        d.preview = true;
+        for (size_t i = 0; i + 1 < E.docs.size(); i++) if (E.docs[i]->preview && !E.docs[i]->modified()) { E.docs.erase(E.docs.begin() + (long)i); break; }
+    }
     if (replace_first) E.docs.erase(E.docs.begin());
     set_active((int)E.docs.size() - 1);
 }
@@ -2325,9 +2329,10 @@ const GitBlame *blame_for(Doc &d, size_t line) {
     return c->blame_ok && line < c->blame.size() ? &c->blame[line] : nullptr;
 }
 
-std::string blame_text(const GitBlame &b) {
+std::string blame_text(const GitBlame &b, bool summary = true) {   /* the status bar passes false: who and when only */
     if (b.hash.find_first_not_of('0') == std::string::npos) return "You, Uncommitted changes";
-    return b.author + ", " + git_ago(b.time, (long)time(nullptr)) + "  \xE2\x80\xA2  " + b.summary;
+    std::string who = b.author + ", " + git_ago(b.time, (long)time(nullptr));
+    return summary ? who + "  \xE2\x80\xA2  " + b.summary : who;
 }
 
 void open_blame_commit(const GitBlame &b, const std::string &path) {
@@ -4069,7 +4074,8 @@ void build_frame() {
             float ix = tx + (float)S(14);
             const Doc &dd = *E.docs[i];
             std::string nm = dd.name();
-            draw_text(E.ui, ix, ui_base(ty, th), nm.c_str(), act ? C_UI : C_UI_DIM, tw[i] - (float)S(46));
+            if (dd.preview && dd.modified()) E.docs[i]->preview = false;   /* typing in a preview keeps the tab */
+            draw_text(E.ui, ix, ui_base(ty, th), nm.c_str(), act ? C_UI : C_UI_DIM, tw[i] - (float)S(46), dd.preview ? FS_ITALIC : FS_REGULAR);
             bool mod = dd.modified(), hv = hovered(H_TABCLOSE, (int)i) || hovered(H_TAB, (int)i);
             float cx = tx + tw[i] - (float)S(26), cy = ty + (th - (float)S(16)) / 2;
             if (mod && !hovered(H_TABCLOSE, (int)i)) draw_icon(IC_DOT, cx, cy, S(16), C_UI);
@@ -4299,7 +4305,7 @@ void build_frame() {
             lx = pen + (float)S(18);
         }
         if (const GitBlame *bl = blame_for(d, cl)) {
-            std::string bt = blame_text(*bl);
+            std::string bt = blame_text(*bl, false);
             float bw2 = std::min(text_width(E.ui, bt.c_str()), std::max(0.f, rx - lx - (float)S(200)));
             if (bw2 > (float)S(60)) {
                 if (hovered(H_BLAME, 0)) r_rect(E.r, lx - (float)S(6), by0 + 1, bw2 + (float)S(12), bh - 1, C_HOVER);
@@ -4308,7 +4314,7 @@ void build_frame() {
                 lx += bw2 + (float)S(18);
             }
         }
-        std::string last = E.ops.empty() ? std::string() : E.ops.back().name + "  " + fmt_ms(E.ops.back().ms);
+        std::string last = E.ops.empty() ? std::string() : (E.ops.back().brief.empty() ? E.ops.back().name : E.ops.back().brief) + "  " + fmt_ms(E.ops.back().ms);
         std::string left = E.status_msg.empty() ? (last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
         draw_text(E.ui, lx, sy, left.c_str(), E.status_msg.empty() ? C_UI_FAINT : C_UI_DIM, std::max(0.f, rx - lx));
     }
@@ -5915,7 +5921,7 @@ void click_hit(const Hit &h) {
     E.term_focus = term_hit && E.term_open;
     if (term_hit && h.kind == H_ACT) E.term_focus = true;
     switch (h.kind) {
-    case H_TAB: set_active(h.id); E.mode = M_EDIT; E.tab_press = h.id; E.tab_press_x = E.mx; E.tab_dragging = false; break;
+    case H_TAB: if (g_clicks >= 2 && h.id < (int)E.docs.size()) E.docs[(size_t)h.id]->preview = false; set_active(h.id); E.mode = M_EDIT; E.tab_press = h.id; E.tab_press_x = E.mx; E.tab_dragging = false; break;
     case H_TABCLOSE: E.mode = M_EDIT; close_tab(h.id); break;
     case H_BOX: do_action(E.mode == M_FIND ? A_NONE : A_FIND); break;
     case H_ACT: if (h.id != A_TOG_CASE && h.id != A_TOG_REGEX && h.id != A_TOG_WORD) E.mode = M_EDIT; do_action(h.id); break;
@@ -5931,7 +5937,7 @@ void click_hit(const Hit &h) {
         const std::vector<Tree::Row> &rows = E.tree.rows();
         if ((size_t)h.id >= rows.size()) break;
         if (rows[(size_t)h.id].dir) E.tree.toggle((size_t)h.id);
-        else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p); }
+        else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2); }
         break;
     }
     case H_ACTIVITY: show_view((View)h.id); break;

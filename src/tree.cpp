@@ -26,6 +26,22 @@ bool is_dir(const std::string &p, const dirent *e, bool follow_links) {
 
 std::string lower(std::string s) { for (char &c : s) if (c >= 'A' && c <= 'Z') c = (char)(c + 32); return s; }
 
+/* the only visible entry of `dir` when it is a directory, else empty: VS Code's compact folders (a/b/c on one row) */
+std::string sole_subdir(const std::string &dir) {
+    DIR *d = opendir(dir.c_str());
+    if (!d) return std::string();
+    std::string only;
+    int n = 0;
+    while (dirent *e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || hidden_name(e->d_name)) continue;
+        if (++n > 1) break;
+        std::string p = dir + (dir.size() && dir.back() == '/' ? "" : "/") + e->d_name;
+        if (is_dir(p, e, true)) only = e->d_name;
+    }
+    closedir(d);
+    return n == 1 ? only : std::string();
+}
+
 }  // namespace
 
 void Tree::load_dir(const std::string &dir, int depth, std::vector<Row> &out, bool follow_links) const {
@@ -35,7 +51,12 @@ void Tree::load_dir(const std::string &dir, int depth, std::vector<Row> &out, bo
     while (dirent *e = readdir(d)) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || hidden_name(e->d_name)) continue;
         std::string p = dir + (dir.size() && dir.back() == '/' ? "" : "/") + e->d_name;
-        v.push_back({e->d_name, p, depth, is_dir(p, e, follow_links), false});
+        bool dir = is_dir(p, e, follow_links);
+        std::string name = e->d_name;
+        if (dir && follow_links) {   /* the tree view, not the search walk */
+            for (int guard = 0; guard < 12; guard++) { std::string sub = sole_subdir(p); if (sub.empty()) break; name += "/" + sub; p += "/" + sub; }
+        }
+        v.push_back({name, p, depth, dir, false});
     }
     closedir(d);
     std::sort(v.begin(), v.end(), [](const Row &a, const Row &b) { return a.dir != b.dir ? a.dir : lower(a.name) < lower(b.name); });
