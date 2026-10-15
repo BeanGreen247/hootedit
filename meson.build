@@ -27,51 +27,37 @@ hootedit_exe = executable('hootedit', files('src/main.cpp', 'src/buffer.cpp', 's
 
 install_data('data/hootedit.png', install_dir: get_option('datadir') / 'icons' / 'hicolor' / '256x256' / 'apps')
 
-test_buffer = executable('test_buffer', files('tests/test_buffer.cpp', 'src/buffer.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('buffer differential', test_buffer, args: ['--gen'])
+# ---- tests: GoogleTest, one binary for the unit tests under ASan and UBSan, sliced into areas, plus a speed gate and the scripted UI test ----
+# groups (the same names in fleetwm and Lestrix): unit, differential and fuzz (inside the unit binary), perf, ui, static; see docs/testing.md
+gtest_dep = dependency('gtest', main: true, required: true, fallback: ['gtest', 'gtest_main_dep'])
+san = ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug']
 
-test_syntax = executable('test_syntax', files('tests/test_syntax.cpp', 'src/syntax.cpp'))
-test('syntax classes', test_syntax)
+unit_sources = files(
+  'tests/test_buffer.cpp', 'tests/test_doc.cpp', 'tests/test_syntax.cpp', 'tests/test_fuzzy.cpp', 'tests/test_diff.cpp', 'tests/test_merge.cpp', 'tests/test_regex.cpp',
+  'tests/test_vim.cpp', 'tests/test_outline.cpp', 'tests/test_tree.cpp', 'tests/test_lint.cpp',
+  'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/tree.cpp',
+  'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp')
+unit_tests = executable('hootedit-unit-tests', unit_sources, dependencies: [gtest_dep], cpp_args: ['-fexceptions'], override_options: san)
+test('hootedit-unit-tests', unit_tests, protocol: 'gtest', timeout: 300)
 
-test_doc = executable('test_doc', files('tests/test_doc.cpp', 'src/doc.cpp', 'src/buffer.cpp', 'src/syntax.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('doc undo and selection', test_doc)
+# one meson test per area, so `meson test lint` runs just that slice (the same slices scripts/test.sh offers)
+test_areas = {
+  'buffer': 'Buffer.*', 'doc': 'Doc.*', 'syntax': 'Syntax.*', 'fuzzy': 'Fuzzy.*', 'diff': 'Diff.*', 'merge': 'Merge.*', 'regex': 'Regex.*',
+  'vim': 'Vim.*', 'outline': 'Outline.*', 'tree': 'Tree.*', 'lint': 'Lint.*',
+}
+foreach area, filter : test_areas
+  test(area, unit_tests, args: ['--gtest_filter=' + filter], suite: 'areas', protocol: 'gtest', timeout: 300)
+endforeach
 
-test_regex = executable('test_regex', files('tests/test_regex.cpp', 'src/regex.cpp'), cpp_args: ['-fexceptions'],
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('regex vs std::regex', test_regex, timeout: 300)
-
-test_diff = executable('test_diff', files('tests/test_diff.cpp', 'src/diff.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('line diff minimal and replayable', test_diff)
-
-test_merge = executable('test_merge', files('tests/test_merge.cpp', 'src/merge.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('merge parse and result', test_merge)
-
-test_fuzzy = executable('test_fuzzy', files('tests/test_fuzzy.cpp', 'src/fuzzy.cpp'))
-test('fuzzy ranking', test_fuzzy)
+perf_gate = executable('hootedit-perf-gate', files('tests/perf_gate.cpp', 'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp'),
+  dependencies: [gtest_dep], cpp_args: ['-fexceptions'])
+test('perf-gate', perf_gate, protocol: 'gtest', suite: 'perf', timeout: 120, is_parallel: false)
 
 bench_search = executable('bench_search', files('tests/bench_search.cpp', 'src/search.cpp', 'src/regex.cpp', 'src/tree.cpp'), dependencies: [dependency('threads')])
-
-test_vim = executable('test_vim', files('tests/test_vim.cpp', 'src/vim.cpp', 'src/doc.cpp', 'src/buffer.cpp', 'src/syntax.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('vim engine', test_vim)
-
-test_outline = executable('test_outline', files('tests/test_outline.cpp', 'src/outline.cpp', 'src/doc.cpp', 'src/buffer.cpp', 'src/syntax.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('outline scan', test_outline)
-
-test_tree = executable('test_tree', files('tests/test_tree.cpp', 'src/tree.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('explorer tree', test_tree)
 
 bash = find_program('bash', required: false)
 if bash.found()
   test('ui scenarios', bash, args: [files('tests/ui_test.sh'), hootedit_exe], suite: 'ui', timeout: 180)
 endif
 
-test_lint = executable('test_lint', files('tests/test_lint.cpp', 'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp', 'src/syntax.cpp'),
-  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
-test('lint rules', test_lint)
+

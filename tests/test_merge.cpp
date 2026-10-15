@@ -1,10 +1,19 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
+/* Three-way merge: parsing conflict blocks, building the result from the choices, layout. */
 #include "../src/merge.h"
+#include <gtest/gtest.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 
-int main() {
+#define CHECK(c) EXPECT_TRUE(c)
+
+TEST(Merge, ParsesOneConflictAndBuildsTheResultFromChoices) {
     MergeView v;
     CHECK(!merge_parse("a\nb\n", v));
     CHECK(merge_parse("a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> feat\nz\n", v));
@@ -19,14 +28,23 @@ int main() {
     CHECK(merge_result_text(v) == "a\nx\ny\nz\n");
     v.segs[1].choice = 4;
     CHECK(merge_result_text(v) == "a\ny\nx\nz\n");
-    /* diff3 style with a base, two conflicts, CRLF, no final newline */
+}
+
+TEST(Merge, Diff3StyleWithBaseTwoConflictsCrlfAndNoFinalNewline) {
+    MergeView v;
     CHECK(merge_parse("<<<<<<< a\r\n1\r\n||||||| base\r\n0\r\n=======\r\n2\r\n>>>>>>> b\r\nmid\r\n<<<<<<< a\r\n\r\n=======\r\nq\r\n>>>>>>> b", v));
     CHECK(v.nconf == 2 && v.crlf && !v.final_nl && v.segs[0].has_base && v.segs[0].base.size() == 1);
     v.segs[0].choice = 5; v.segs[2].choice = 3;
     CHECK(merge_result_text(v) == "0\r\nmid\r\n\r\nq");
-    /* unfinished block: not parsed */
+}
+
+TEST(Merge, UnfinishedBlockIsNotParsed) {
+    MergeView v;
     CHECK(!merge_parse("a\n<<<<<<< x\nb\n=======\nc\n", v));
-    /* layout: a long common run is cut to its edges, conflicts are indexed, the result lists unresolved ones */
+}
+
+TEST(Merge, LayoutCutsLongCommonRunsAndIndexesConflicts) {
+    MergeView v;
     std::string big = "<<<<<<< a\nx\n=======\ny\n>>>>>>> b\n";
     for (int i = 0; i < 20; i++) big += "c" + std::to_string(i) + "\n";
     big += "<<<<<<< a\n=======\nz\n>>>>>>> b\n";
@@ -38,6 +56,4 @@ int main() {
     CHECK(plain == 6 && elided == 14);
     v.segs[v.conf_seg[0]].choice = 2; v.dirty = true; merge_layout(v);
     CHECK(v.unresolved == 1);
-    puts("merge ok");
-    return 0;
 }

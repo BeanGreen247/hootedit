@@ -28,7 +28,7 @@ Needs SDL2, FreeType, fontconfig and OpenGL; the installer fetches the build pac
 
 ## Speed
 
-Measured numbers and how to repeat them: [docs/performance.md](docs/performance.md). Hootedit against VS Code (clean, and your own profile) on the same machine, with the tools to rerun it: [docs/COMPARISON.md](docs/COMPARISON.md). Tests: [docs/testing.md](docs/testing.md). Current state: [docs/status.md](docs/status.md).
+Measured numbers and how to repeat them: [docs/performance.md](docs/performance.md). Hootedit against VS Code (clean, and your own profile) on the same machine, with the tools to rerun it: [docs/COMPARISON.md](docs/COMPARISON.md). Tests (GoogleTest, the same groups and runner as fleetwm and Lestrix): [docs/testing.md](docs/testing.md). Current state: [docs/status.md](docs/status.md).
 
 ## License
 

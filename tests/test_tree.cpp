@@ -1,4 +1,5 @@
 /* The Explorer tree: sorted rows, compact folders, reveal, refresh keeping folders open, ghost rows for deleted files. */
+#include <gtest/gtest.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -6,14 +7,13 @@
 #include <string>
 #include "../src/tree.h"
 
-static int fails;
-#define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
+#define CHECK(c) EXPECT_TRUE(c)
 
 static void put(const std::string &p, const char *t = "x") { FILE *f = fopen(p.c_str(), "w"); if (f) { fputs(t, f); fclose(f); } }
 
-int main() {
+TEST(Tree, CompactFoldersRevealRefreshAndGhosts) {
     char tmpl[] = "/tmp/hootedit_tree_XXXXXX";
-    if (!mkdtemp(tmpl)) return 1;
+    ASSERT_NE(mkdtemp(tmpl), nullptr);
     std::string r = tmpl;
     mkdir((r + "/a").c_str(), 0755); mkdir((r + "/a/b").c_str(), 0755); mkdir((r + "/a/b/c").c_str(), 0755);
     mkdir((r + "/z").c_str(), 0755); mkdir((r + "/z/one").c_str(), 0755); mkdir((r + "/z/two").c_str(), 0755);
@@ -50,6 +50,4 @@ int main() {
     CHECK(!ghost_in_search && all.size() == 5);
     std::string cmd = "rm -rf " + r;
     if (system(cmd.c_str()) != 0) {}
-    if (fails == 0) printf("tree ok\n");
-    return fails ? 1 : 0;
 }

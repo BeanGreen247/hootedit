@@ -82,12 +82,12 @@ measure() {   # measure EDITOR FILE LABEL
     [ -d "$HOME/.config/Code/User/snippets" ] && cp -r "$HOME/.config/Code/User/snippets" "$T/ud/User/"
     [ -d "$HOME/.vscode/extensions" ] && cp -r "$HOME/.vscode/extensions" "$T/ext"
   fi
-  if [ "$ed" = code ] || [ "$ed" = code-yours ]; then   # only things that stop a first-run dialog from covering the editor; nothing that changes speed
+  if [ "$ed" = code ] || [ "$ed" = code-yours ]; then   # stops a first-run dialog from covering the editor, and keeps the caret solid: a blinking caret trips the pixel-change detector (it showed up as a false 400 ms)
     python3 - "$T/ud/User/settings.json" <<'PY'
 import re, sys
 p = sys.argv[1]
 t = open(p).read() if __import__("os").path.exists(p) else "{}"
-extra = '"chat.disableAIFeatures": true, "update.mode": "none", "telemetry.telemetryLevel": "off", "extensions.autoUpdate": false, "workbench.welcomePage.walkthroughs.openOnInstall": false'
+extra = '"editor.cursorBlinking": "solid", "chat.disableAIFeatures": true, "update.mode": "none", "telemetry.telemetryLevel": "off", "extensions.autoUpdate": false, "workbench.welcomePage.walkthroughs.openOnInstall": false'
 i = t.rstrip().rfind("}")
 body = t[:i].rstrip()
 sep = "" if body.endswith("{") or body.endswith(",") else ","
