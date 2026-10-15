@@ -227,5 +227,8 @@ has "pressing it again pins the sidebar" "sidebar: 1"
 run "wait:200;mouse:5,5;click:979,14;mouse:900,400;mouse:8,400;wait:100;mouse:8,400;dump" typo.yaml
 has "a hidden sidebar opens when the pointer is within 10 px of the left edge" "sidebar: 1"
 
+run "act:settings;mouse:5,5;click:340,130;mouse:5,5;click:976,170;mouse:5,5;wait:200;dump" typo.yaml
+has "clicking a toggle on the Settings page changes it (vim keys)" "vim: -- NORMAL --"
+
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]

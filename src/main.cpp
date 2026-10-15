@@ -4917,7 +4917,7 @@ void draw_settings(const Layout &L) {
     // the rows
     float list_top = sy + sh + (float)S(14);
     r_clip(E.r, (int)(lw + 1), (int)list_top, (int)(W - lw - 1), (int)(bot - list_top));
-    float rowh = (float)S(72), headh = (float)S(36), content = 0;
+    float rowh = (float)S(86), headh = (float)S(36), content = 0;
     for (const SetRow &r : g_set.rows) content += r.item < 0 ? headh : rowh;
     float max_scroll = std::max(0.f, content - (bot - list_top) + (float)S(20));
     g_set.scroll = std::max(0.f, std::min(g_set.scroll, max_scroll));
@@ -4945,12 +4945,16 @@ void draw_settings(const Layout &L) {
             bool sel = (int)i == g_set.sel;
             if (sel) { r_rect(E.r, px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, C_SELROW); r_rect(E.r, px - (float)S(10), ry + 2, (float)S(2), rowh - 4, C_ACCENT); }
             else if (hovered(H_SETROW, r.item)) r_rect(E.r, px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, C_HOVER);
+            hit(px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, H_SETROW, r.item);   /* before the control: the last hit box wins */
             float cw = it.kind == SK_TOGGLE ? (float)S(44) : (float)S(220);
             float textw = pw - cw - (float)S(30);
             draw_text(E.ui, px, ui_base(ry + (float)S(8), (float)S(22)), it.label.c_str(), C_UI, textw, FS_BOLD);
             // the description, wrapped to two lines at most
-            std::vector<std::string> lines = wrap_lines(it.desc, textw);
-            for (size_t k = 0; k < lines.size() && k < 2; k++) draw_text(E.ui, px, ui_base(ry + (float)S(30) + (float)k * (float)S(16), (float)S(18)), lines[k].c_str(), C_UI_FAINT, textw);
+            static std::unordered_map<int, std::pair<float, std::vector<std::string>>> wrapped;   /* shaping text is the slow part: wrap once per width */
+            auto &wr = wrapped[r.item];
+            if (wr.first != textw) { wr.first = textw; wr.second = wrap_lines(it.desc, textw); }
+            const std::vector<std::string> &lines = wr.second;
+            for (size_t k = 0; k < lines.size() && k < 3; k++) draw_text(E.ui, px, ui_base(ry + (float)S(30) + (float)k * (float)S(16), (float)S(18)), lines[k].c_str(), C_UI_FAINT, textw);
             float cx = px + pw - cw, cy = ry + (rowh - (float)S(28)) / 2;   /* the control sits in the middle of the row */
             if (it.kind == SK_TOGGLE) {
                 bool on = it.on();
@@ -4969,7 +4973,6 @@ void draw_settings(const Layout &L) {
                 if (!btn) draw_icon(IC_CHEV_D, cx + cw - (float)S(22), cy + (float)S(6), S(16), C_UI_DIM);
                 hit(cx, cy, cw, (float)S(28), H_SETCTL, r.item);
             }
-            hit(px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, H_SETROW, r.item);
         }
         ry += rowh;
     }
@@ -6508,7 +6511,7 @@ void do_action(int act) {
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
     case A_REOPEN: reopen_closed_tab(); break;
     case A_CLOSE_ALL: close_all_tabs(); break;
-    case A_ABOUT: E.status_msg = "Hootedit 0.4.0 - BeanGreen247 - fast native editor"; break;
+    case A_ABOUT: E.status_msg = "Hootedit 0.2.0 - BeanGreen247 - fast native editor"; break;
     case A_REFRESH: E.tree.refresh(); git_refresh(); break;
     default: return;
     }
@@ -7552,6 +7555,7 @@ void run_script(const char *script) {
             for (const Tree::Row &r : E.tree.rows()) { auto di = E.deco.find(r.path); printf("row: %s depth=%d dir=%d ghost=%d deco=%c\n", r.name.c_str(), r.depth, r.dir ? 1 : 0, r.ghost ? 1 : 0, di == E.deco.end() ? '-' : di->second); }
             printf("sidebar: %d\n", E.side_open ? 1 : 0);
             printf("settings: open=%d category=%d query=%s rows=%zu\n", g_set.open ? 1 : 0, g_set.cat, g_set.q.c_str(), g_set.rows.size());
+            printf("frame_ms: %.3f\n", E.last_build_ms);
             lint_kick(dd, true);
             if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());
             if (E.outline_on && !dd.dv && !dd.mv) for (const OItem &o : outline_for(dd)) printf("outline: %s line=%zu depth=%d kind=%c\n", o.name.c_str(), o.line + 1, o.depth, o.kind);
@@ -7894,7 +7898,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--timed")) g_timed = true;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &win_w, &win_h);
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) cli_theme = argv[++i];
-        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.4.0"); return 0; }
+        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.2.0"); return 0; }
         else if (argv[i][0] != '-') args.push_back(argv[i]);
         else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
     }
