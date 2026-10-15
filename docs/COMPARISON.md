@@ -36,24 +36,26 @@ Method notes: every editor gets the same display size, window size and file, and
 
 Machine: 2 cores, Debian 13 (kernel 6.12), Xvfb at 1280x1024 with the Marco window manager, software rendering (no GPU), window 1024x768, 60 samples at 100 ms spacing, VS Code 1.138.0 started with `--disable-gpu`. "VS Code" is a clean profile with no extensions. "your VS Code" is a copy of the author's own profile (settings.json and all 25 installed extensions, among them the Red Hat Ansible and YAML language servers, Error Lens, Python, markdownlint and the Remote-SSH family), copied into a throwaway directory so the real profile is never opened; two first-run settings were added to both VS Code rows only to stop a sign-in dialog from covering the editor. Memory is PSS summed over the whole process tree, measured 10 s after the window appeared; idle CPU is the next 5 s.
 
-| editor | file | window painted | memory | idle CPU | typing, key to pixels (median / p95) |
+| editor | file | window appears / shows content | memory | idle CPU | typing, key to pixels (median / p95) |
 |---|---|---|---|---|---|
-| Hootedit | empty | 0.64 s | 67 MB | 0.0% | 14.0 / 27.8 ms |
-| Hootedit | 40 MB C file | 0.64 s | 113 MB | 0.2% | 10.3 / 18.0 ms |
-| Hootedit | Ansible role, 300 tasks | 0.65 s | 67 MB | 0.2% | 9.3 / 17.0 ms |
-| VS Code, clean | empty | 2.6 s | 679 MB | 0.0% | 14.0 / 59.5 ms |
-| VS Code, clean | 40 MB C file | 2.3 s | 1101 MB | 1.4% | 31.5 / 401 ms |
-| VS Code, clean | Ansible role, 300 tasks | 2.6 s | 697 MB | 2.6% | 16.1 / 53.5 ms |
-| your VS Code | empty | 2.1 s | 927 MB | 3.4% | 18.9 / 400 ms |
-| your VS Code | 40 MB C file | 2.1 s | 1449 MB | 27.4% | 41.9 / 400 ms |
-| your VS Code | Ansible role, 300 tasks | 2.7 s | 1050 MB | 104.6% | 70.3 / 400 ms |
+| Hootedit | empty | 0.34 s / 0.35 s | 67 MB | 0.2% | 7.1 / 9.9 ms |
+| Hootedit | 40 MB C file | 0.26 s / 0.26 s | 113 MB | 0.2% | 8.8 / 11.1 ms |
+| Hootedit | Ansible role, 300 tasks | 0.30 s / 0.30 s | 68 MB | 0.2% | 7.5 / 11.6 ms |
+| VS Code, clean | empty | 0.71 s / 2.34 s | 712 MB | 1.0% | 16.4 / 405 ms |
+| VS Code, clean | 40 MB C file | 0.65 s / 2.29 s | 1135 MB | 1.0% | 24.2 / 400 ms |
+| VS Code, clean | Ansible role, 300 tasks | 0.66 s / 2.50 s | 741 MB | 0.8% | 14.7 / 400 ms |
+| your VS Code | empty | 0.64 s / 2.37 s | 920 MB | 3.6% | 21.2 / 401 ms |
+| your VS Code | 40 MB C file | 0.73 s / 2.39 s | 1417 MB | 3.6% | 33.3 / 400 ms |
+| your VS Code | Ansible role, 300 tasks | 0.67 s / 2.25 s | 932 MB | 2.8% | 60.9 / 320 ms |
+
+The first time column is when a window of the editor first appears on the screen, the second when it first has content in it (more than 40 distinct colours, which a blank window never has). For VS Code the window is on screen for 1.6 to 1.8 seconds with nothing in it; Hootedit keeps its window hidden until the first frame is drawn, so the two times are within a few milliseconds of each other. All times are measured from the launch, include the window manager's work and are slower than they would be on a GPU.
 
 Checking the same 300-task role for mistakes: `ansible-lint --offline` took 8.9 to 10.1 s on this machine (three runs); Hootedit's built-in check took 0.8 ms (`hootedit --bench-core`, best of 5, 30 KB file). The two do not cover the same rules (see below), but the cheap ones are the ones you need while typing.
 
 What to take from it, and what not:
 
-- Start-up, memory and idle CPU are large, repeatable differences. Hootedit uses about a tenth of the memory and paints its window in a quarter to a third of the time, and with the Ansible and YAML language servers your VS Code setup was still using a full core ten seconds after opening a 300-task role (that may be their first analysis of the file; it is what a user sees on opening it).
-- Typing latency is closer for small files and diverges on large ones. The medians are the trustworthy part. The p95 column for VS Code contains a repeated value of almost exactly 400 ms that looks like a timer in the editor or the measurement, not typing delay; I could not attribute it, so do not read it as a measured p95.
+- Start-up, memory and idle CPU are large, repeatable differences. Hootedit uses about a tenth of the memory and has content on screen in about a seventh of the time, and its window never shows empty. In this run your VS Code setup used 2.8% CPU ten seconds after opening the Ansible role (an earlier run caught the Ansible language server using a full core while it analysed the file).
+- Typing latency is closer for small files and diverges on large ones. The medians are the trustworthy part. The p95 column for VS Code contains a repeated value of almost exactly 400 ms that looks like a timer in the editor or the measurement, not typing delay; I could not attribute it, so do not read it as a measured p95. (An earlier version of this table showed Hootedit taking 0.44 to 0.64 s to start; that was my script sleeping half a second before it started measuring, now fixed.)
 - This machine renders in software. That hurts every editor, and Electron more than a native OpenGL program would be hurt on a GPU; VS Code on a real GPU will do better than `--disable-gpu`. An earlier run without a window manager gave Hootedit a median of 6.9 ms on the empty file; the window manager adds its own work. Treat the numbers as "same conditions for everyone on this box", and rerun the script on your hardware.
 - Zed, Sublime Text and others are not installed here, so they are not in the table; `scripts/compare-editors.sh --editors "hootedit code subl zeditor"` adds any that are.
 - Hootedit's Ansible check is a subset of ansible-lint: the rules that can be decided from the text. Rules that need the Ansible runtime (module argument validation, role dependency checks) still need ansible-lint, which is why it is slower.

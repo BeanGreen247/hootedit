@@ -97,18 +97,16 @@ PY
   t0=$(date +%s%3N)
   bash -c "exec $(launch_cmd "$ed" "$file")" >/dev/null 2>&1 &
   local launched=$!
-  wid=""
-  for _ in $(seq 1 600); do   # the largest viewable window of at least 300x200
-    wid=$(xwininfo -root -tree 2>/dev/null | awk '/^ +0x/ && /[0-9]+x[0-9]+\+/ { split($0,a," "); if (match($0,/([0-9]+)x([0-9]+)\+/,m) && m[1]>=300 && m[2]>=200) { print a[1]; exit } }')
-    [ -n "$wid" ] && break
-    sleep 0.05
-  done
+  # when the first window appears and when it first shows content (the gap is the empty window the user sees), measured from the launch
+  local timing
+  timing=$("$T/xlatency" -P -W -s "$t0" -T 90000 2>/dev/null)
+  wid=$(xwininfo -root -tree 2>/dev/null | awk '/^ +0x/ && /[0-9]+x[0-9]+\+/ { split($0,a," "); if (match($0,/([0-9]+)x([0-9]+)\+/,m) && m[1]>=300 && m[2]>=200) { print a[1]; exit } }')
   if [ -z "$wid" ]; then echo "| $ed | $label | no window | | | | |"; kill "$xpid" 2>/dev/null; return; fi
+  ready=$(printf '%s' "$timing" | sed -E 's/mapped=([0-9]+) ms ready=([0-9]+) ms/\2 ms (window at \1 ms)/')
+  local ax ay rect
   xdotool windowmove "$wid" 0 0 windowsize "$wid" 1024 768 2>/dev/null; sleep 0.5
-  local ax ay rect   # where the window really is (a window manager may keep its own position): watch the top 240 px of it
   read -r ax ay <<<"$(xwininfo -id "$wid" 2>/dev/null | awk '/Absolute upper-left X/ {x=$4} /Absolute upper-left Y/ {y=$4} END {print x+0, y+0}')"
-  rect="$ax,$ay,$(( 1280 - ax > 1024 ? 1024 : 1280 - ax )),240"
-  ready=$("$T/xlatency" -P -s "$t0" -r "$rect" -T 90000 2>/dev/null | sed 's/ready=//')
+  rect="$ax,$ay,$(( 1280 - ax > 1024 ? 1024 : 1280 - ax )),240"   # and where it is after the move, for the typing test
   wpid=$(xdotool getwindowpid "$wid" 2>/dev/null || echo "$launched")
   sleep 10   # settle: start-up work, and Hootedit stops blinking its caret after 10 s idle
   pss=$(pss_mb "$wpid")

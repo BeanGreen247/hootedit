@@ -430,8 +430,11 @@ struct GutterCache {
     std::vector<DiffHunk> hunks;                   /* HEAD lines against the buffer's lines */
     std::vector<GitBlame> blame;
     bool blame_tried = false, blame_ok = false;
+    std::shared_ptr<struct BlameJob> blame_job;    /* git blame runs on a thread: a big file in a big repository takes a while */
 };
 std::unordered_map<const Doc *, GutterCache> g_gutter;
+std::atomic<bool> g_async_ready{false};            /* a background job finished: draw again */
+struct BlameJob { std::atomic<bool> done{false}; bool ok = false; std::vector<GitBlame> v; };
 /* merge conflict blocks of the open files (see conflicts_for) */
 struct Conflict { long a = -1, base = -1, mid = -1, b = -1; };   /* line numbers of the four marker lines (base: the ||||||| line of diff3 style, else -1) */
 struct ConflictCache { uint64_t rev = ~0ull; bool listed = false; std::vector<Conflict> v; };
@@ -638,6 +641,36 @@ void git_deco_rebuild() {
     if (old != ghosts) { E.tree.set_ghosts(ghosts); E.tree.refresh(); }
 }
 
+/* git_refresh for start-up: the git commands run on a thread, the window is drawn meanwhile, the result is applied by git_startup_poll */
+struct GitStartup { std::mutex mu; bool ready = false; GitInfo g; std::string where; };
+GitStartup *g_gs = new GitStartup;
+
+void git_apply(const GitInfo &g, const std::string &where);
+
+void git_refresh_async() {
+    std::string ws = E.tree.root().empty() ? "." : E.tree.root();
+    std::string alt = !E.docs.empty() && !D().path.empty() ? D().path.substr(0, D().path.rfind('/')) : std::string();
+    std::thread([ws, alt] {
+        GitInfo g = git_query(ws);
+        std::string where = ws;
+        if (!g.repo && !alt.empty()) { GitInfo g2 = git_query(alt); if (g2.repo) { g = g2; where = alt; } }
+        { std::lock_guard<std::mutex> l(g_gs->mu); g_gs->g = std::move(g); g_gs->where = where; g_gs->ready = true; }
+        g_async_ready = true;
+        app_wake();
+    }).detach();
+}
+
+void git_startup_poll() {
+    GitInfo g;
+    std::string where;
+    {
+        std::lock_guard<std::mutex> l(g_gs->mu);
+        if (!g_gs->ready) return;
+        g = std::move(g_gs->g); where = g_gs->where; g_gs->ready = false;
+    }
+    git_apply(g, where);
+}
+
 void git_refresh() {
     std::string ws = E.tree.root().empty() ? "." : E.tree.root();
     E.git = git_query(ws);
@@ -647,6 +680,12 @@ void git_refresh() {
         GitInfo g2 = git_query(dir);
         if (g2.repo) { E.git = g2; E.git_for = dir; }
     }
+    git_apply(E.git, E.git_for);
+}
+
+void git_apply(const GitInfo &g, const std::string &where) {
+    E.git = g;
+    E.git_for = where;
     E.quick_files.clear();
     E.sfiles.reset();                           /* the file list is rebuilt on the next search or quick open */
     git_deco_rebuild();
@@ -696,12 +735,12 @@ void open_path(const std::string &path, bool preview = false) {   /* preview: a 
     set_active((int)E.docs.size() - 1);
 }
 
-void set_workspace(const std::string &dir) {
+void set_workspace(const std::string &dir, bool async_git = false) {
     char real[4096];
     std::string d = realpath(dir.c_str(), real) ? real : dir;
     E.tree.set_root(d);
     E.side_scroll = 0;
-    git_refresh();
+    if (async_git) git_refresh_async(); else git_refresh();
 }
 
 /* ---- diff tabs: both sides come from git (a revision, the index) or from the file on disk ---- */
@@ -2463,8 +2502,19 @@ const GitBlame *blame_for(Doc &d, size_t line) {
     if (!c) return nullptr;
     if (!c->blame_tried) {
         c->blame_tried = true;
-        std::string rel = rel_to_root(d.path);
-        c->blame_ok = d.buf.size() < (2u << 20) && git_blame(E.git.root, rel, c->blame);
+        c->blame_ok = false;
+        if (d.buf.size() < (2u << 20)) {
+            auto job = std::make_shared<BlameJob>();
+            c->blame_job = job;
+            std::string root = E.git.root, rel = rel_to_root(d.path);
+            std::thread([job, root, rel] { job->ok = git_blame(root, rel, job->v); job->done = true; g_async_ready = true; app_wake(); }).detach();
+        }
+    }
+    if (c->blame_job) {
+        if (!c->blame_job->done) return nullptr;
+        c->blame_ok = c->blame_job->ok;
+        c->blame = std::move(c->blame_job->v);
+        c->blame_job.reset();
     }
     return c->blame_ok && line < c->blame.size() ? &c->blame[line] : nullptr;
 }
@@ -5363,7 +5413,7 @@ bool gl_init(GlKind kind, int w, int h) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     }
-    E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN);   /* shown after the first frame is drawn: no empty window while the editor starts */
     if (E.win) {   /* the owl as the window icon (64x64, embedded) */
         SDL_Surface *ic = SDL_CreateRGBSurfaceWithFormatFrom((void *)APP_ICON_RGBA, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
         if (ic) { SDL_SetWindowIcon(E.win, ic); SDL_FreeSurface(ic); }
@@ -7198,7 +7248,7 @@ void run_script(const char *script) {
             double until = now_s() + atof(step.c_str() + (step[5] == '~' ? 6 : 5)) / 1000.0;
             while (now_s() < until && (E.s_active && !E.sstat.done)) { search_poll(); SDL_Delay(1); }
             while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { E.now = now_s(); git_job_poll(); job_poll(g_rjob); askpass_poll(); tip_poll(); lint_tick(); fswatch_tick(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
-            search_poll(); E.now = now_s(); lint_tick(); fswatch_tick(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
+            search_poll(); E.now = now_s(); lint_tick(); fswatch_tick(); git_startup_poll(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
             continue;
         }
         E.ev_t0 = now_s();
@@ -7529,7 +7579,14 @@ void vim_init() {
     vim_reset();
 }
 
+static double g_t_start = 0;
+static void startup_mark(const char *what) {   /* HOOTEDIT_TRACE=1 prints where start-up time goes */
+    static const bool on = getenv("HOOTEDIT_TRACE") != nullptr;
+    if (on) fprintf(stderr, "[start] %6.1f ms  %s\n", (now_s() - g_t_start) * 1000.0, what);
+}
+
 int main(int argc, char **argv) {
+    g_t_start = now_s();
     if (argc >= 2 && !strcmp(argv[1], "--askpass")) return askpass_client(argc >= 3 ? argv[2] : "");   /* git and ssh start us as their password helper */
     if (argc >= 3 && !strcmp(argv[1], "--bench-core")) return bench_core(argv[2], argc >= 4 ? std::max(1, atoi(argv[3])) : 3, argc >= 5 ? argv[4] : nullptr);
     std::vector<const char *> args;
@@ -7552,6 +7609,7 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') args.push_back(argv[i]);
         else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
     }
+    startup_mark("args parsed");
     settings_load();
     vim_init();
     std::string workspace;
@@ -7564,8 +7622,16 @@ int main(int argc, char **argv) {
         if (!d.open(abs_path.c_str())) { fprintf(stderr, "hootedit: cannot open %s\n", a); return 1; }
         if (workspace.empty()) {
             std::string full = expand_path(a);
-            GitInfo g = git_query(full.substr(0, full.rfind('/') == std::string::npos ? 0 : full.rfind('/')));
-            workspace = g.repo ? g.root : full.substr(0, full.rfind('/'));
+            std::string dir = full.substr(0, full.rfind('/') == std::string::npos ? 0 : full.rfind('/'));
+            std::string up = dir, root;
+            for (int guard = 0; guard < 64 && !up.empty(); guard++) {   /* the repository root: the nearest folder above with a .git, found without starting git */
+                struct stat gs;
+                if (stat((up + "/.git").c_str(), &gs) == 0) { root = up; break; }
+                size_t sl = up.rfind('/');
+                if (sl == std::string::npos || sl == 0) break;
+                up.resize(sl);
+            }
+            workspace = !root.empty() ? root : dir;
         }
     }
     if (E.docs.empty()) new_doc();
@@ -7574,11 +7640,13 @@ int main(int argc, char **argv) {
     /* the window class is what a panel uses to match a window to its menu entry and icon; a terminal that exports its own SDL class (Lestrix does) would
      * otherwise make every program started from it look like that terminal. Set ours explicitly before SDL_Init, which reads it once, then take it out of the environment again so the shells
      * and external terminals we start do not inherit it. */
+    startup_mark("files opened, workspace found");
     setenv("SDL_VIDEO_X11_WMCLASS", "hootedit", 1);
     setenv("SDL_VIDEO_WAYLAND_WMCLASS", "hootedit", 1);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) { fprintf(stderr, "hootedit: SDL: %s\n", SDL_GetError()); return 1; }
     bool ok = false;
     for (GlKind k : {GLK_CORE, GLK_ES3, GLK_ES2}) if ((ok = gl_init(k, win_w, win_h))) break;
+    startup_mark("SDL + window + GL context");
     unsetenv("SDL_VIDEO_X11_WMCLASS");
     unsetenv("SDL_VIDEO_WAYLAND_WMCLASS");
     if (!ok) { fprintf(stderr, "hootedit: no usable OpenGL context\n"); return 1; }
@@ -7586,6 +7654,7 @@ int main(int argc, char **argv) {
     E.ui = font_open("sans", 13.0 * E.scale, false);
     E.big = font_open("sans", 34.0 * E.scale, false);
     if (!E.font || !E.ui || !E.big) { fprintf(stderr, "hootedit: no font\n"); return 1; }
+    startup_mark("fonts loaded");
     E.cw = font_cell_w(E.font); E.ch = font_cell_h(E.font); E.asc = font_ascent(E.font);
     E.rowh = std::max(E.ch, (int)lround(19.0 * E.scale));
     E.rowasc = E.asc + (E.rowh - E.ch) / 2;
@@ -7599,15 +7668,24 @@ int main(int argc, char **argv) {
     if (!E.theme) E.theme = ui_theme_find("Xylonic Dark");
     apply_theme(E.theme);
     if (E.follow_fleet) follow_fleetwm();
+    startup_mark("terminal engine, theme");
     SDL_StartTextInput();
-    set_workspace(workspace);
+    set_workspace(workspace, !script);   /* git status on a thread, so the first frame does not wait for it (scripts want it done) */
+    startup_mark("workspace (tree + git)");
     E.side_open = true;
     set_active(0);
 
     E.now = now_s();
     double t0 = E.now;
     E.last_active = E.last_blink = E.now;
-    build_frame();   /* one layout pass first so clicks and menus have their hit boxes */
+    r_begin(E.r, E.W, E.H, C_EDITOR);
+    build_frame();   /* the first frame: it also gives clicks and menus their hit boxes */
+    r_end(E.r);
+    SDL_GL_SwapWindow(E.win);
+    startup_mark("first frame drawn");
+    SDL_ShowWindow(E.win);   /* only now: the window appears with the editor in it */
+    startup_mark("window shown");
+    E.dirty = true;
     if (script) { g_scripted = true; run_script(script); }
     hud_tick();
     if (bench > 0) {   /* scroll one line per frame through the file: CPU time to build a frame, and the same with every row already cached */
@@ -7663,6 +7741,8 @@ int main(int argc, char **argv) {
         search_poll();
         lint_tick();
         fswatch_tick();
+        git_startup_poll();
+        if (g_async_ready.exchange(false)) redraw();
         git_job_poll();
         job_poll(g_rjob);
         askpass_poll();
