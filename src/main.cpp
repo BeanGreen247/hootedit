@@ -1148,6 +1148,34 @@ void fuzzy_filter(const std::vector<std::string> &files, const std::string &q, s
 
 /* ---- quick open (Ctrl+P) ---- */
 
+/* Ctrl+P shows each file in a preview tab as the arrow keys move through the list; Esc puts everything back */
+const Doc *g_qp_prev = nullptr, *g_qp_new = nullptr;
+
+int doc_index(const Doc *d) { for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i].get() == d) return (int)i; return -1; }
+
+void quick_preview() {
+    if (E.quick_hits.empty() || (!E.quick_q.empty() && E.quick_q[0] == ':')) return;
+    const std::string &path = E.quick_hits[(size_t)std::min<int>(E.quick_sel, (int)E.quick_hits.size() - 1)];
+    if (!g_qp_prev && !E.docs.empty()) g_qp_prev = &D();
+    int old = doc_index(g_qp_new);
+    if (old >= 0 && E.docs[(size_t)old]->preview && !E.docs[(size_t)old]->modified() && E.docs[(size_t)old]->path != path) remove_doc(old);
+    g_qp_new = nullptr;
+    bool existed = false;
+    for (auto &dp : E.docs) if (dp->path == path) existed = true;
+    open_path(path, true);
+    if (!existed) g_qp_new = &D();
+}
+
+void quick_end(bool accept) {
+    if (!accept) {
+        int n = doc_index(g_qp_new);
+        if (n >= 0 && E.docs[(size_t)n]->preview && !E.docs[(size_t)n]->modified()) remove_doc(n);
+        int p = doc_index(g_qp_prev);
+        if (p >= 0) set_active(p);
+    }
+    g_qp_prev = g_qp_new = nullptr;
+}
+
 void quick_update() {
     WorkTimer wt;
     if (E.quick_files.empty()) { ensure_files(); E.quick_files = *E.sfiles; }
@@ -5898,10 +5926,10 @@ void key_down(const SDL_KeyboardEvent &k) {
     }
     if (E.mode == M_QUICK) {
         int n = (int)E.quick_hits.size();
-        if (sym == SDLK_ESCAPE) E.mode = M_EDIT;
-        else if (sym == SDLK_UP) E.quick_sel = std::max(0, E.quick_sel - 1);
-        else if (sym == SDLK_DOWN) E.quick_sel = std::min(n - 1, E.quick_sel + 1);
-        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) { E.mode = M_EDIT; if (!E.quick_q.empty() && E.quick_q[0] == ':') goto_line(E.quick_q.substr(1)); else if (n) open_path(E.quick_hits[(size_t)E.quick_sel]); }
+        if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; quick_end(false); }
+        else if (sym == SDLK_UP) { E.quick_sel = std::max(0, E.quick_sel - 1); quick_preview(); }
+        else if (sym == SDLK_DOWN) { E.quick_sel = std::min(n - 1, E.quick_sel + 1); quick_preview(); }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) { E.mode = M_EDIT; quick_end(true); if (!E.quick_q.empty() && E.quick_q[0] == ':') goto_line(E.quick_q.substr(1)); else if (n) open_path(E.quick_hits[(size_t)E.quick_sel]); }
         else if (sym == SDLK_BACKSPACE) { pop_utf8(E.quick_q); E.quick_sel = 0; quick_update(); }
         else return;
         touch();
@@ -6216,7 +6244,7 @@ void click_hit(const Hit &h) {
     case H_MENU: if (E.mode == M_MENU && E.menu_open == h.id) { E.mode = M_EDIT; E.menu_open = -1; } else open_menu(h.id); break;
     case H_MENUITEM: { int act = MENUS[(size_t)E.menu_open].items[(size_t)h.id].act; E.mode = M_EDIT; E.menu_open = -1; do_action(act); break; }
     case H_PICKITEM: pick_choose(h.id); break;
-    case H_QUICKITEM: E.mode = M_EDIT; if (h.id < (int)E.quick_hits.size()) open_path(E.quick_hits[(size_t)h.id]); break;
+    case H_QUICKITEM: E.mode = M_EDIT; quick_end(true); if (h.id < (int)E.quick_hits.size()) open_path(E.quick_hits[(size_t)h.id]); break;
     case H_BTN_SAVE: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_s; key_down(k); break; }
     case H_BTN_DISCARD: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_d; key_down(k); break; }
     case H_BTN_CANCEL: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_ESCAPE; key_down(k); break; }
