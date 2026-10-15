@@ -207,5 +207,13 @@ printf 'apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\nspec:\n  re
 run "dump" typo.yaml
 has "a misspelt field name is caught from the API tables" "Did you mean 'replicas'?"
 
+# ---- Settings page ----
+run "act:settings;text:vim;dump" typo.yaml
+has "the Settings page opens and its search narrows the list" "settings: open=1 category=0 query=vim rows=2"
+run "act:settings;down;return;dump" typo.yaml
+has "Enter on a setting toggles it and the page stays" "settings: open=1"
+run "ctrl+,;dump" typo.yaml
+has "Ctrl+, opens the Settings page" "settings: open=1"
+
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]

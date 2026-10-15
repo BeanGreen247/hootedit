@@ -14,6 +14,8 @@
 
 namespace {
 
+bool g_compact = true;
+
 bool hidden_name(const char *n) { return !strcmp(n, ".git") || !strcmp(n, "node_modules") || !strcmp(n, "vendor") || !strcmp(n, "dist"); }
 
 bool is_dir(const std::string &p, const dirent *e, bool follow_links) {
@@ -44,6 +46,8 @@ std::string sole_subdir(const std::string &dir) {
 
 }  // namespace
 
+void Tree::set_compact(bool on) { g_compact = on; }
+
 void Tree::load_dir(const std::string &dir, int depth, std::vector<Row> &out, bool follow_links) const {
     DIR *d = opendir(dir.c_str());
     if (!d) return;
@@ -53,7 +57,7 @@ void Tree::load_dir(const std::string &dir, int depth, std::vector<Row> &out, bo
         std::string p = dir + (dir.size() && dir.back() == '/' ? "" : "/") + e->d_name;
         bool dir = is_dir(p, e, follow_links);
         std::string name = e->d_name;
-        if (dir && follow_links) {   /* the tree view, not the search walk */
+        if (dir && follow_links && g_compact) {   /* the tree view, not the search walk */
             for (int guard = 0; guard < 12; guard++) { std::string sub = sole_subdir(p); if (sub.empty()) break; name += "/" + sub; p += "/" + sub; }
         }
         v.push_back({name, p, depth, dir, false});

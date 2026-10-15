@@ -22,6 +22,7 @@ public:
     void reveal(const std::string &path);     /* expand parents so `path` is visible */
     void set_ghosts(std::vector<std::string> abs_paths) { ghosts_ = std::move(abs_paths); }   /* call refresh() after */
     const std::vector<std::string> &ghosts() const { return ghosts_; }
+    static void set_compact(bool on);        /* show single-child folder chains as one row (default on) */
     void refresh();                           /* re-read every expanded directory */
     long find(const std::string &path) const; /* row index or -1 */
 

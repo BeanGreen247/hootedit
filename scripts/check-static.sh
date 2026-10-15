@@ -10,9 +10,9 @@ bad=0
 for f in install.sh uninstall.sh scripts/*.sh tests/*.sh; do bash -n "$f" || { echo "syntax error in $f"; bad=1; }; done
 for md in README.md docs/*.md; do
   dir=$(dirname "$md")
-  grep -oE '\]\(([^)#]+)(#[^)]*)?\)' "$md" | sed -E 's/^\]\(([^)#]+).*$/\1/' | grep -vE '^(https?:|mailto:)' | while read -r link; do
-    [ -e "$dir/$link" ] || { echo "$md: broken link $link"; exit 1; }
-  done || bad=1
+  while read -r link; do
+    [ -e "$dir/$link" ] || { echo "$md: broken link $link"; bad=1; }
+  done < <(grep -oE '\]\(([^)#]+)(#[^)]*)?\)' "$md" | sed -E 's/^\]\(([^)#]+).*$/\1/' | grep -vE '^(https?:|mailto:)' || true)
 done
 for src in src/*.cpp src/*.h tests/*.cpp tools/*.c; do
   head -5 "$src" | grep -q "SPDX-License-Identifier\|Copyright" || head -3 "$src" | grep -q "^/\*" || { echo "no header in $src"; bad=1; }

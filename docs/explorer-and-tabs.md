@@ -11,7 +11,7 @@ A narrow rail on the left holds the **pin** button and three rotated tabs. Pinne
 ## Explorer, preview tabs, outline
 
 - Single click on a file opens an italic preview tab that the next single click replaces; double click, or typing, keeps it.
-- OPEN EDITORS lists every tab (unsaved dot, close button). OUTLINE (View > Outline, off by default) lists the types, functions and markdown headings of the active file; click to jump.
+- OPEN EDITORS lists every tab (unsaved dot, close button). OUTLINE (Settings > Outline, off by default) lists the types, functions and markdown headings of the active file; click to jump.
 - Single-child folders show as one row (`a/b/c`), and the parents of the first visible row stay pinned while you scroll.
 - In a git project, changed files are coloured with a status letter (M, A, U, !), folders get a dot, and files deleted from disk stay listed, struck through with a red D; clicking one opens the diff.
 - Help > Keyboard Shortcuts (Ctrl+K Ctrl+H) lists every shortcut in one filterable list.

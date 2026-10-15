@@ -188,33 +188,33 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S, A_K8S_CRD, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S, A_K8S_CRD, A_SETTINGS, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes", "reload_crds"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes", "reload_crds", "settings"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task", "insert kubernetes resource", "reload crds"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task", "insert kubernetes resource", "reload crds", "settings page"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
 const std::vector<Menu> MENUS = {
     {"File", {{"New File", "Ctrl+N", A_NEW}, {"Open File...", "Ctrl+O", A_OPEN_FILE}, {"Open Folder...", "Ctrl+K Ctrl+O", A_OPEN_FOLDER}, {"Quick Open...", "Ctrl+P", A_QUICK}, {"", "", A_NONE},
-              {"Save", "Ctrl+S", A_SAVE}, {"Save As...", "Ctrl+Shift+S", A_SAVEAS}, {"", "", A_NONE}, {"Close Tab", "Ctrl+W", A_CLOSE}, {"Exit", "Ctrl+Q", A_QUIT}}},
+              {"Save", "Ctrl+S", A_SAVE}, {"Save As...", "Ctrl+Shift+S", A_SAVEAS}, {"", "", A_NONE}, {"Close Tab", "Ctrl+W", A_CLOSE}, {"", "", A_NONE}, {"Settings...", "Ctrl+,", A_SETTINGS}, {"Exit", "Ctrl+Q", A_QUIT}}},
     {"Edit", {{"Undo", "Ctrl+Z", A_UNDO}, {"Redo", "Ctrl+Y", A_REDO}, {"", "", A_NONE}, {"Cut", "Ctrl+X", A_CUT}, {"Copy", "Ctrl+C", A_COPY}, {"Paste", "Ctrl+V", A_PASTE},
               {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
-              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"Live Checks", "", A_LINT}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"Reload Kubernetes CRDs", "", A_K8S_CRD}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"Reload Kubernetes CRDs", "", A_K8S_CRD}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
     {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
                   {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
     {"Help", {{"Keyboard Shortcuts", "Ctrl+K Ctrl+H", A_SHORTCUTS}, {"", "", A_NONE}, {"About Hootedit", "", A_ABOUT}}},
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE };
-enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL };
+enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX, M_SETTINGS };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
 enum Pending { P_NONE, P_CLOSE, P_QUIT };
@@ -372,6 +372,8 @@ struct Ed {
     bool pinned = true, side_open = true, root_open = true, opened_open = true, outline_open = true;
     std::unordered_map<std::string, char> deco;        /* absolute path -> git status letter, for file and folder rows in the Explorer */
     bool outline_on = false;
+    bool preview_tabs = true, hot_reload = true, compact_folders = true, show_hud = true;   /* Settings page */
+    std::string lint_ignore;                           /* check codes left out of the live checks, space separated */
     bool lint_on = true;                               /* live checks (src/lint.cpp), View > Live Checks */
     double lint_at = 0;                                /* when a pending re-check is due */                           /* Explorer shows the symbols of the active file (View > Outline, off by default) */
     bool vim_on = false;                               /* modal editing */
@@ -545,6 +547,11 @@ void settings_load() {
         else if (!strcmp(line, "git_sync_confirm")) E.g.sync_confirm = atoi(v) != 0;
         else if (!strcmp(line, "outline")) E.outline_on = atoi(v) != 0;
         else if (!strcmp(line, "lint")) E.lint_on = atoi(v) != 0;
+        else if (!strcmp(line, "lint_ignore")) E.lint_ignore = v;
+        else if (!strcmp(line, "preview_tabs")) E.preview_tabs = atoi(v) != 0;
+        else if (!strcmp(line, "hot_reload")) E.hot_reload = atoi(v) != 0;
+        else if (!strcmp(line, "show_hud")) E.show_hud = atoi(v) != 0;
+        else if (!strcmp(line, "compact_folders")) { E.compact_folders = atoi(v) != 0; Tree::set_compact(E.compact_folders); }
         else if (!strcmp(line, "vim_keys")) E.vim_on = atoi(v) != 0;
         else if (!strcmp(line, "git_tree")) E.g.tree_view = atoi(v) != 0;
         else if (!strcmp(line, "panel_height")) E.panel_logical = std::max(80, std::min(1200, atoi(v)));
@@ -561,7 +568,7 @@ void settings_save() {
     FILE *f = fopen(p.c_str(), "w");
     if (!f) return;
     fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : E.view == V_REMOTE ? "remote" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
-    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0);
+    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\nlint_ignore=%s\npreview_tabs=%d\nhot_reload=%d\ncompact_folders=%d\nshow_hud=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0, E.lint_ignore.c_str(), E.preview_tabs ? 1 : 0, E.hot_reload ? 1 : 0, E.compact_folders ? 1 : 0, E.show_hud ? 1 : 0);
     fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0);
     fclose(f);
 }
@@ -3287,6 +3294,7 @@ bool external_change(Doc &d, double event_at) {
 
 /* once per loop iteration: follow the folders we should watch, then act on what changed */
 void fswatch_tick() {
+    if (!E.hot_reload) { std::lock_guard<std::mutex> g(g_fw->mu); g_fw->changed.clear(); return; }
     std::set<std::string> want;
     for (auto &dp : E.docs) if (!dp->dv && !dp->mv && !dp->path.empty() && dp->path[0] == '/') want.insert(dp->path.substr(0, dp->path.rfind('/') == 0 ? 1 : dp->path.rfind('/')));
     if (!E.tree.root().empty()) {
@@ -3342,6 +3350,14 @@ struct LintState {
 std::unordered_map<const Doc *, LintState> g_lint;
 void lint_forget(const Doc *d) { g_lint.erase(d); }
 
+void lint_filter(std::vector<Diag> &v) {   /* Settings > Ignored check codes */
+    if (E.lint_ignore.empty()) return;
+    std::set<std::string> skip;
+    size_t p = 0;
+    while (p < E.lint_ignore.size()) { size_t e = E.lint_ignore.find(' ', p); if (e == std::string::npos) e = E.lint_ignore.size(); if (e > p) skip.insert(E.lint_ignore.substr(p, e - p)); p = e + 1; }
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const Diag &d) { std::string base = d.code.substr(0, d.code.find('[')); return skip.count(d.code) || skip.count(base); }), v.end());
+}
+
 void lint_count(LintState &st) { for (int &c : st.counts) c = 0; for (const Diag &x : st.d) if (x.sev < 4) st.counts[x.sev]++; }
 
 const LintState *lint_state(const Doc &d) { auto it = g_lint.find(&d); return it == g_lint.end() ? nullptr : &it->second; }
@@ -3360,6 +3376,7 @@ void lint_kick(Doc &d, bool force_sync) {
     if (n <= (192u << 10) || force_sync) {   /* small files: about 2 ms, done in the idle gap; bigger ones on a thread */
         double t0 = now_s();
         lint_run(in, st.d);
+        lint_filter(st.d);
         st.rev = rev;
         lint_count(st);
         record_op("live checks", (now_s() - t0) * 1000.0);
@@ -3408,7 +3425,7 @@ void lint_tick() {
     auto it = g_lint.find(&d);
     if (it != g_lint.end() && it->second.job && it->second.job->done) {
         LintState &st = it->second;
-        if (st.job->rev == d.buf.revision()) { st.d = std::move(st.job->out); st.rev = st.job->rev; lint_count(st); redraw(); }
+        if (st.job->rev == d.buf.revision()) { st.d = std::move(st.job->out); lint_filter(st.d); st.rev = st.job->rev; lint_count(st); redraw(); }
         st.job.reset();
     }
     if (d.dv || d.mv) return;
@@ -4729,6 +4746,221 @@ bool merge_key(const SDL_KeyboardEvent &k, bool ctrl, bool shift) {
     return true;
 }
 
+void open_picker(PickKind k);
+void do_action(int act);
+void follow_fleetwm();
+
+/* ---- Settings: one page for everything that can be changed, with a search box (File > Settings, Ctrl+,) ---- */
+
+enum SetKind { SK_TOGGLE, SK_CHOICE, SK_TEXT, SK_ACTION };
+struct SetItem {
+    const char *cat;
+    std::string label, desc;
+    int kind;
+    std::function<bool()> on;                 /* toggles */
+    std::function<void()> flip;
+    std::function<std::string()> value;       /* choices, text */
+    std::function<void()> act;                /* open the choice list, ask for the text, run the action */
+};
+struct SetRow { int item; const char *heading; };   /* a row of the page: an item, or the heading of a category */
+
+struct SetState {
+    bool open = false;
+    std::string q;
+    int cat = 0, sel = 0;
+    float scroll = 0;
+    std::vector<SetRow> rows;
+} g_set;
+
+const char *SET_CATS[] = {"Appearance", "Editor", "Explorer", "Source Control", "Terminal", "Files"};
+
+std::vector<SetItem> &set_items() {
+    static std::vector<SetItem> items;
+    if (!items.empty()) return items;
+    auto toggle = [&](const char *cat, const char *label, const char *desc, std::function<bool()> on, std::function<void()> flip) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_TOGGLE; it.on = std::move(on); it.flip = std::move(flip); items.push_back(std::move(it));
+    };
+    auto choice = [&](const char *cat, const char *label, const char *desc, std::function<std::string()> value, std::function<void()> act) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_CHOICE; it.value = std::move(value); it.act = std::move(act); items.push_back(std::move(it));
+    };
+    auto text = [&](const char *cat, const char *label, const char *desc, std::function<std::string()> value, std::function<void()> act) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_TEXT; it.value = std::move(value); it.act = std::move(act); items.push_back(std::move(it));
+    };
+    auto action = [&](const char *cat, const char *label, const char *desc, const char *button, std::function<void()> act) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_ACTION; it.value = [button] { return std::string(button); }; it.act = std::move(act); items.push_back(std::move(it));
+    };
+    choice("Appearance", "Color theme", "The colours of the editor and its chrome. Follow fleetwm takes them from the fleetwm theme.", [] { return E.follow_fleet ? std::string("Follow fleetwm") : std::string(E.theme ? E.theme->name : ""); }, [] { open_picker(PICK_THEME); });
+    toggle("Appearance", "Follow the fleetwm theme", "Take the colours from the fleetwm compositor's theme file and follow it when it changes.", [] { return E.follow_fleet; },
+           [] { if (E.follow_fleet) { E.follow_fleet = false; } else if (E.fleet.found || (fleetwm_read(&E.fleet), E.fleet.found)) { E.follow_fleet = true; follow_fleetwm(); } else E.status_msg = "fleetwm theme file not found"; settings_save(); });
+    toggle("Appearance", "Timing and memory in the status bar", "How long the last operation took, frames per second, CPU and memory, at the left of the status bar.", [] { return E.show_hud; }, [] { E.show_hud = !E.show_hud; settings_save(); });
+    toggle("Editor", "Vim keys", "Modal editing: normal, insert, visual and block modes, operators, text objects, macros, :s, :g and a command line at the bottom.", [] { return E.vim_on; }, [] { do_action(A_VIM); });
+    toggle("Editor", "Live checks", "Look for common mistakes while you type: Ansible, Kubernetes, YAML, JSON, shell, Python, C and more. Underlines, the problem list (Ctrl+Shift+M), F8, quick fixes (Ctrl+.).", [] { return E.lint_on; }, [] { do_action(A_LINT); });
+    text("Editor", "Ignored check codes", "Codes of live checks to leave out, separated by spaces, for example: trailing-whitespace name[casing] shell-no-set-e.", [] { return E.lint_ignore.empty() ? std::string("none") : E.lint_ignore; },
+         [] { dlg_show("Ignored check codes", "Codes of live checks to leave out, separated by spaces (the code is shown in the status bar, in [brackets]).", {"Save", "Cancel"}, [](int b, const std::string &t) { if (b == 0) { E.lint_ignore = trim_nl(t); settings_save(); for (auto &kv : g_lint) kv.second.rev = ~0ull; } }, true, E.lint_ignore, "trailing-whitespace name[casing]"); });
+    toggle("Editor", "Preview tabs", "A single click on a file in the Explorer opens an italic preview tab that the next click replaces. Double click or typing keeps it.", [] { return E.preview_tabs; }, [] { E.preview_tabs = !E.preview_tabs; settings_save(); });
+    toggle("Editor", "Reload files changed on disk", "When a program (an AI tool, a formatter, git) changes an open file, load the new text at once and say how long it took. Files with unsaved edits ask first.", [] { return E.hot_reload; }, [] { E.hot_reload = !E.hot_reload; settings_save(); });
+    toggle("Explorer", "Outline", "Show the symbols of the active file (types, functions, headings) in the Files tab.", [] { return E.outline_on; }, [] { do_action(A_OUTLINE); });
+    toggle("Explorer", "Pin the sidebar", "Keep the sidebar open beside the editor instead of floating over it.", [] { return E.pinned; }, [] { do_action(A_PIN); });
+    toggle("Explorer", "Compact folders", "Show a chain of folders that each hold only one folder as one row (a/b/c).", [] { return E.compact_folders; }, [] { E.compact_folders = !E.compact_folders; Tree::set_compact(E.compact_folders); E.tree.refresh(); settings_save(); });
+    choice("Source Control", "When committing with nothing staged", "Smart commit: stage everything, never do that, or ask each time.", [] { static const char *n[] = {"Ask", "Stage all changes", "Never"}; return std::string(n[std::max(0, std::min(2, E.g.smart_commit))]); },
+           [] { pick_custom("When committing with nothing staged", {{"Ask each time", 0, E.g.smart_commit == 0}, {"Always stage all changes", 1, E.g.smart_commit == 1}, {"Never stage automatically", 2, E.g.smart_commit == 2}}, [](const Ed::PItem &it) { E.g.smart_commit = it.id; settings_save(); }); });
+    toggle("Source Control", "Ask before Sync Changes", "Confirm before the pull and push that Sync Changes runs.", [] { return E.g.sync_confirm; }, [] { E.g.sync_confirm = !E.g.sync_confirm; settings_save(); });
+    toggle("Source Control", "Show changes as a tree", "List the changed files grouped by folder instead of as a flat list.", [] { return E.g.tree_view; }, [] { E.g.tree_view = !E.g.tree_view; settings_save(); });
+    choice("Terminal", "Terminal", "The built-in panel (Ctrl+`), or an external terminal emulator found on this system.", [] { return E.term_choice == "builtin" ? std::string("Built-in panel") : E.term_choice.substr(E.term_choice.find(':') + 1); }, [] { open_picker(PICK_TERMINAL); });
+    action("Files", "Settings file", "Everything on this page is stored in a plain text file.", "Open settings.ini", [] { open_path(settings_path()); E.mode = M_EDIT; g_set.open = false; });
+    action("Files", "Remote connections", "The saved ssh, sftp, ftp and smb connections.", "Open remotes.ini", [] { const char *x2 = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME"); open_path((x2 && *x2 ? std::string(x2) : std::string(h ? h : ".") + "/.config") + "/hootedit/remotes.ini"); E.mode = M_EDIT; g_set.open = false; });
+    action("Files", "Reset", "Put every setting on this page back to its default.", "Reset all", [] {
+        dlg_show("Reset all settings?", "Every setting on this page goes back to its default. Your files and connections are not touched.", {"Reset", "Cancel"}, [](int b, const std::string &) {
+            if (b != 0) return;
+            E.vim_on = false; E.lint_on = true; E.lint_ignore.clear(); E.preview_tabs = true; E.hot_reload = true; E.outline_on = false; E.compact_folders = true; Tree::set_compact(true); E.tree.refresh();
+            E.show_hud = true; E.g.smart_commit = 0; E.g.sync_confirm = true; E.g.tree_view = false; E.term_choice = "builtin"; E.pinned = true; vim_reset(); for (auto &kv : g_lint) kv.second.rev = ~0ull;
+            settings_save(); E.status_msg = "settings reset";
+        });
+    });
+    return items;
+}
+
+bool set_matches(const SetItem &it, const std::string &q) {
+    if (q.empty()) return true;
+    std::string hay = std::string(it.cat) + " " + it.label + " " + it.desc, ql;
+    for (char &c : hay) c = (char)tolower((unsigned char)c);
+    for (char c : q) ql += (char)tolower((unsigned char)c);
+    size_t p = 0;
+    for (size_t i = 0; i < ql.size();) {   /* every word of the query must appear */
+        size_t e = ql.find(' ', i);
+        if (e == std::string::npos) e = ql.size();
+        if (e > i && hay.find(ql.substr(i, e - i)) == std::string::npos) return false;
+        i = e + 1;
+    }
+    (void)p;
+    return true;
+}
+
+void set_rebuild() {
+    g_set.rows.clear();
+    const std::vector<SetItem> &items = set_items();
+    const char *last = nullptr;
+    for (size_t c = 0; c < sizeof SET_CATS / sizeof *SET_CATS; c++) {
+        if (g_set.q.empty() && (int)c != g_set.cat) continue;
+        for (size_t i = 0; i < items.size(); i++) {
+            if (strcmp(items[i].cat, SET_CATS[c]) != 0 || !set_matches(items[i], g_set.q)) continue;
+            if (last != SET_CATS[c]) { g_set.rows.push_back({-1, SET_CATS[c]}); last = SET_CATS[c]; }
+            g_set.rows.push_back({(int)i, nullptr});
+        }
+    }
+    if (g_set.sel >= (int)g_set.rows.size()) g_set.sel = (int)g_set.rows.size() - 1;
+    while (g_set.sel > 0 && g_set.rows[(size_t)g_set.sel].item < 0) g_set.sel--;
+    if (g_set.sel < 0 || (g_set.sel < (int)g_set.rows.size() && g_set.rows[(size_t)g_set.sel].item < 0)) { g_set.sel = 0; while (g_set.sel < (int)g_set.rows.size() && g_set.rows[(size_t)g_set.sel].item < 0) g_set.sel++; }
+}
+
+void set_open() { g_set.open = true; g_set.q.clear(); g_set.sel = 0; g_set.scroll = 0; set_rebuild(); E.mode = M_SETTINGS; }
+void set_close() { g_set.open = false; if (E.mode == M_SETTINGS) E.mode = M_EDIT; }
+void set_activate(int item) {
+    const SetItem &it = set_items()[(size_t)item];
+    if (it.kind == SK_TOGGLE) { it.flip(); E.status_msg.clear(); }
+    else if (it.act) it.act();
+}
+void set_move(int dir) {
+    int n = (int)g_set.rows.size(), i = g_set.sel;
+    for (int k = 0; k < n; k++) { i += dir; if (i < 0 || i >= n) return; if (g_set.rows[(size_t)i].item >= 0) { g_set.sel = i; return; } }
+}
+
+void draw_settings(const Layout &L) {
+    float top = (float)L.menu_h, bot = (float)L.bar_y, W = (float)E.W;
+    set_rebuild();
+    r_rect(E.r, 0, top, W, bot - top, C_EDITOR);
+    float lw = (float)S(210);
+    r_rect(E.r, 0, top, lw, bot - top, C_CHROME);
+    r_rect(E.r, lw, top, 1, bot - top, C_BORDER);
+    hit(0, top, W, bot - top, H_SIDEBAR, 0);   /* swallows clicks that miss every control */
+    draw_text(E.ui, (float)S(18), ui_base(top + (float)S(14), (float)S(28)), "Settings", C_UI, lw - (float)S(30), FS_BOLD);
+    float y = top + (float)S(54), ch = (float)S(32);
+    const std::vector<SetItem> &items = set_items();
+    for (size_t c = 0; c < sizeof SET_CATS / sizeof *SET_CATS; c++) {
+        int count = 0;
+        for (const SetItem &it : items) if (strcmp(it.cat, SET_CATS[c]) == 0) count++;
+        bool on = g_set.q.empty() && (int)c == g_set.cat;
+        if (on) { r_rect(E.r, 0, y, lw, ch, C_SELROW); r_rect(E.r, 0, y, (float)S(2), ch, C_ACCENT); }
+        else if (hovered(H_SETCAT, (int)c)) r_rect(E.r, 0, y, lw, ch, C_HOVER);
+        draw_text(E.ui, (float)S(18), ui_base(y, ch), SET_CATS[c], on ? C_ACCENT : g_set.q.empty() ? C_UI : C_UI_DIM, lw - (float)S(60));
+        std::string cs = std::to_string(count);
+        draw_text(E.ui, lw - (float)S(16) - text_width(E.ui, cs.c_str()), ui_base(y, ch), cs.c_str(), C_UI_FAINT, (float)S(30));
+        hit(0, y, lw, ch, H_SETCAT, (int)c);
+        y += ch;
+    }
+    // the search box
+    float px = lw + (float)S(30), pw = W - px - (float)S(30);
+    float sw = std::min(pw, (float)S(620)), sy = top + (float)S(16), sh = (float)S(34);
+    r_rect(E.r, px, sy, sw, sh, g_set.q.empty() ? C_FIELD : C_ACCENT);
+    r_rect(E.r, px + 1, sy + 1, sw - 2, sh - 2, C_FIELD);
+    float pen = draw_text(E.ui, px + (float)S(12), ui_base(sy, sh), g_set.q.empty() ? "Search settings" : g_set.q.c_str(), g_set.q.empty() ? C_UI_FAINT : C_UI, sw - (float)S(24));
+    if (E.blink_on && !g_set.q.empty()) r_rect(E.r, pen + 1, sy + (float)S(8), std::max(1.f, E.scale), sh - (float)S(16), C_CURSOR);
+    // the rows
+    float list_top = sy + sh + (float)S(14);
+    r_clip(E.r, (int)(lw + 1), (int)list_top, (int)(W - lw - 1), (int)(bot - list_top));
+    float rowh = (float)S(72), headh = (float)S(36), content = 0;
+    for (const SetRow &r : g_set.rows) content += r.item < 0 ? headh : rowh;
+    float max_scroll = std::max(0.f, content - (bot - list_top) + (float)S(20));
+    g_set.scroll = std::max(0.f, std::min(g_set.scroll, max_scroll));
+    // keep the selected row in view
+    {
+        float yy = 0;
+        for (size_t i = 0; i < g_set.rows.size(); i++) {
+            float h = g_set.rows[i].item < 0 ? headh : rowh;
+            if ((int)i == g_set.sel) { if (yy < g_set.scroll) g_set.scroll = yy; else if (yy + h > g_set.scroll + (bot - list_top)) g_set.scroll = yy + h - (bot - list_top); }
+            yy += h;
+        }
+        g_set.scroll = std::max(0.f, std::min(g_set.scroll, max_scroll));
+    }
+    float ry = list_top - g_set.scroll;
+    if (g_set.rows.empty()) draw_text(E.ui, px, ui_base(list_top + (float)S(10), (float)S(24)), "No setting matches that.", C_UI_DIM, pw);
+    for (size_t i = 0; i < g_set.rows.size(); i++) {
+        const SetRow &r = g_set.rows[i];
+        if (r.item < 0) {
+            if (ry + headh > list_top && ry < bot) draw_text(E.ui, px, ui_base(ry + (float)S(6), (float)S(24)), r.heading, C_GROUP, pw, FS_BOLD);
+            ry += headh;
+            continue;
+        }
+        if (ry + rowh > list_top && ry < bot) {
+            const SetItem &it = items[(size_t)r.item];
+            bool sel = (int)i == g_set.sel;
+            if (sel) { r_rect(E.r, px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, C_SELROW); r_rect(E.r, px - (float)S(10), ry + 2, (float)S(2), rowh - 4, C_ACCENT); }
+            else if (hovered(H_SETROW, r.item)) r_rect(E.r, px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, C_HOVER);
+            float cw = it.kind == SK_TOGGLE ? (float)S(44) : (float)S(220);
+            float textw = pw - cw - (float)S(30);
+            draw_text(E.ui, px, ui_base(ry + (float)S(8), (float)S(22)), it.label.c_str(), C_UI, textw, FS_BOLD);
+            // the description, wrapped to two lines at most
+            std::vector<std::string> lines = wrap_lines(it.desc, textw);
+            for (size_t k = 0; k < lines.size() && k < 2; k++) draw_text(E.ui, px, ui_base(ry + (float)S(30) + (float)k * (float)S(16), (float)S(18)), lines[k].c_str(), C_UI_FAINT, textw);
+            float cx = px + pw - cw, cy = ry + (rowh - (float)S(28)) / 2;   /* the control sits in the middle of the row */
+            if (it.kind == SK_TOGGLE) {
+                bool on = it.on();
+                float tw = (float)S(40), th = (float)S(20), ty = ry + (rowh - th) / 2;
+                draw_pill(cx + cw - tw, ty, tw, th, on ? C_ACCENT : C_BORDER);
+                draw_dot(cx + cw - tw + (on ? tw - th / 2 : th / 2), ty + th / 2, (int)(th - (float)S(6)) , on ? C_ON_ACCENT : C_UI_DIM);
+                hit(cx, ry + 2, cw, rowh - 4, H_SETCTL, r.item);
+            } else {
+                std::string v = it.value();
+                bool btn = it.kind == SK_ACTION;
+                r_rect(E.r, cx, cy, cw, (float)S(28), hovered(H_SETCTL, r.item) ? C_ACCENT : (btn ? C_BORDER : C_FIELD));
+                r_rect(E.r, cx + 1, cy + 1, cw - 2, (float)S(26), btn ? (hovered(H_SETCTL, r.item) ? C_ACCENT : C_HOVER) : C_FIELD);
+                float vw = text_width(E.ui, v.c_str());
+                float vx = btn ? cx + (cw - std::min(vw, cw - (float)S(16))) / 2 : cx + (float)S(10);
+                draw_text(E.ui, vx, ui_base(cy, (float)S(28)), v.c_str(), btn && hovered(H_SETCTL, r.item) ? C_ON_ACCENT : C_UI, cw - (float)S(36));
+                if (!btn) draw_icon(IC_CHEV_D, cx + cw - (float)S(22), cy + (float)S(6), S(16), C_UI_DIM);
+                hit(cx, cy, cw, (float)S(28), H_SETCTL, r.item);
+            }
+            hit(px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, H_SETROW, r.item);
+        }
+        ry += rowh;
+    }
+    r_clip_off(E.r);
+    if (max_scroll > 0) {   /* a thin scroll bar */
+        float trk = bot - list_top, th = std::max((float)S(24), trk * trk / (trk + max_scroll));
+        r_rect(E.r, W - (float)S(6), list_top + (trk - th) * (g_set.scroll / max_scroll), (float)S(3), th, C_BORDER);
+    }
+}
+
 void build_frame() {
     Layout L = layout();
     Doc &d = D();
@@ -5069,7 +5301,7 @@ void build_frame() {
             }
         }
         std::string last = E.ops.empty() ? std::string() : (E.ops.back().brief.empty() ? E.ops.back().name : E.ops.back().brief) + "  " + fmt_ms(E.ops.back().ms);
-        std::string left = E.status_msg.empty() ? (last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
+        std::string left = E.status_msg.empty() ? (!E.show_hud ? std::string() : last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
         if (vim_active() && !d.dv && !d.mv) {
             std::string vl = g_vim.label();
             float vw = draw_text(E.ui, lx, sy, vl.c_str(), g_vim.typing() ? C_GREEN : C_ACCENT, std::max(0.f, rx - lx), FS_BOLD);
@@ -5092,6 +5324,8 @@ void build_frame() {
     E.hit_floor = (float)L.bar_y;
     if (E.side_open) draw_sidebar(L);
     E.hit_floor = 1e9f;   /* menus, the command box and dialogs may go anywhere */
+
+    if (g_set.open) draw_settings(L);
 
     /* ---- menu bar and command box (drawn last so menus and the box sit above the sidebar) ---- */
     float menu_end;
@@ -6244,6 +6478,7 @@ void do_action(int act) {
     case A_LINT: E.lint_on = !E.lint_on; settings_save(); if (!E.lint_on) g_lint.clear(); E.status_msg = E.lint_on ? "live checks on" : "live checks off"; break;
     case A_ANSIBLE: template_insert(false); break;
     case A_K8S: template_insert(true); break;
+    case A_SETTINGS: set_open(); break;
     case A_K8S_CRD: lint_crd_reset(); g_crd_force = true; E.status_msg = "scanning the workspace for CustomResourceDefinitions"; break;
     case A_VIM: E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
     case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
@@ -6286,6 +6521,10 @@ void command_palette() {
         for (const MenuItem &it : m.items)
             if (it.label[0] && it.act != A_NONE && it.act != A_PALETTE) { int act = it.act; cmds->push_back({std::string(m.name) + ": " + it.label + (it.keys[0] ? std::string("    ") + it.keys : std::string()), [act] { do_action(act); }}); }
     auto add = [&](const char *l, std::function<void()> f) { cmds->push_back({l, std::move(f)}); };
+    add("Open Settings", [] { do_action(A_SETTINGS); });
+    add("Settings: Toggle Vim Keys", [] { do_action(A_VIM); });
+    add("Settings: Toggle Outline", [] { do_action(A_OUTLINE); });
+    add("Settings: Toggle Live Checks", [] { do_action(A_LINT); });
     add("Git: Pull", [] { git_pull_flow(); });
     add("Git: Pull (Rebase)", [] { git_pull_rebase(); });
     add("Git: Pull from...", [] { git_pull_from(); });
@@ -6398,6 +6637,23 @@ void key_down(const SDL_KeyboardEvent &k) {
             E.mode = M_EDIT; E.menu_open = -1;
             do_action(act);
         } else return;
+        touch();
+        return;
+    }
+    if (E.mode == M_SETTINGS) {
+        if (sym == SDLK_ESCAPE) { if (!g_set.q.empty()) { g_set.q.clear(); g_set.sel = 0; } else set_close(); }
+        else if (sym == SDLK_UP) set_move(-1);
+        else if (sym == SDLK_DOWN) set_move(1);
+        else if (sym == SDLK_PAGEUP) { for (int i = 0; i < 5; i++) set_move(-1); }
+        else if (sym == SDLK_PAGEDOWN) { for (int i = 0; i < 5; i++) set_move(1); }
+        else if (sym == SDLK_HOME) { g_set.sel = 0; set_move(1); if (g_set.rows.size() && g_set.rows[0].item >= 0) g_set.sel = 0; }
+        else if (sym == SDLK_LEFT && g_set.q.empty()) { g_set.cat = std::max(0, g_set.cat - 1); g_set.sel = 0; g_set.scroll = 0; }
+        else if (sym == SDLK_RIGHT && g_set.q.empty()) { g_set.cat = std::min((int)(sizeof SET_CATS / sizeof *SET_CATS) - 1, g_set.cat + 1); g_set.sel = 0; g_set.scroll = 0; }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER || (sym == SDLK_SPACE && g_set.q.empty())) { if (g_set.sel >= 0 && g_set.sel < (int)g_set.rows.size() && g_set.rows[(size_t)g_set.sel].item >= 0) set_activate(g_set.rows[(size_t)g_set.sel].item); }
+        else if (sym == SDLK_BACKSPACE) { pop_utf8(g_set.q); g_set.sel = 0; }
+        else if (ctrl && !shift && sym == SDLK_COMMA) set_close();
+        else return;
+        set_rebuild();
         touch();
         return;
     }
@@ -6582,6 +6838,7 @@ void key_down(const SDL_KeyboardEvent &k) {
     if (ctrl && !shift && sym == SDLK_d) { select_next_occurrence(d); E.follow = true; touch(); return; }
     if (ctrl && shift && sym == SDLK_t) { do_action(A_REOPEN); touch(); return; }
     if (sym == SDLK_TAB && !ctrl && (shift || (d.has_sel() && d.buf.line_of(d.sel_lo()) != d.buf.line_of(d.sel_hi())))) { indent_lines(d, shift); E.follow = true; touch(); return; }
+    if (ctrl && !shift && !alt && sym == SDLK_COMMA) { do_action(A_SETTINGS); touch(); return; }
     if (sym == SDLK_F8 && !ctrl && !alt) { do_action(shift ? A_PREV_PROBLEM : A_NEXT_PROBLEM); touch(); return; }
     if (ctrl && !shift && sym == SDLK_PERIOD) { do_action(A_QUICKFIX); touch(); return; }
     if (ctrl && shift && sym == SDLK_m) { do_action(A_PROBLEMS); touch(); return; }
@@ -6751,6 +7008,9 @@ void click_hit(const Hit &h) {
     case H_MENU: if (E.mode == M_MENU && E.menu_open == h.id) { E.mode = M_EDIT; E.menu_open = -1; } else open_menu(h.id); break;
     case H_MENUITEM: { int act = MENUS[(size_t)E.menu_open].items[(size_t)h.id].act; E.mode = M_EDIT; E.menu_open = -1; do_action(act); break; }
     case H_PICKITEM: pick_choose(h.id); break;
+    case H_SETCAT: g_set.q.clear(); g_set.cat = h.id; g_set.sel = 0; g_set.scroll = 0; E.mode = M_SETTINGS; set_rebuild(); break;
+    case H_SETROW: for (size_t i = 0; i < g_set.rows.size(); i++) if (g_set.rows[i].item == h.id) g_set.sel = (int)i; E.mode = M_SETTINGS; break;
+    case H_SETCTL: for (size_t i = 0; i < g_set.rows.size(); i++) if (g_set.rows[i].item == h.id) g_set.sel = (int)i; E.mode = M_SETTINGS; set_activate(h.id); break;
     case H_QUICKITEM: E.mode = M_EDIT; quick_end(true); if (h.id < (int)E.quick_hits.size()) open_path(E.quick_hits[(size_t)h.id]); break;
     case H_BTN_SAVE: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_s; key_down(k); break; }
     case H_BTN_DISCARD: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_d; key_down(k); break; }
@@ -6767,7 +7027,7 @@ void click_hit(const Hit &h) {
             std::string p = rows[(size_t)h.id].path;
             for (const GitChange &c : E.git.changes) if (E.git.root + "/" + c.path == p) { if (!E.pinned) open_side(false); open_change_diff(c, c.y == ' '); break; }
         }
-        else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2); }
+        else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2 && E.preview_tabs); }
         break;
     }
     case H_ACTIVITY: show_view((View)h.id); break;
@@ -6975,6 +7235,7 @@ void text_input(const char *s) {
     if (E.mode == M_GITMSG) { E.g.msg += s; E.g.err.clear(); touch(); return; }
     if (E.mode == M_PROMPT) { E.prompt_q += s; touch(); return; }
     if (E.mode == M_PICK) { E.pick_filter += s; E.pick_sel = 0; touch(); return; }
+    if (E.mode == M_SETTINGS) { g_set.q += s; g_set.sel = 0; g_set.scroll = 0; set_rebuild(); touch(); return; }
     if (E.mode == M_QUICK) { E.quick_q += s; E.quick_sel = 0; quick_update(); touch(); return; }
     if (E.mode == M_SIDE) {
         if (E.view == V_SEARCH) { E.sq += s; start_search(); }
@@ -7058,6 +7319,7 @@ void handle_event(const SDL_Event &e) {
         }
         if (E.mode == M_FILEDLG) { E.fd.scroll = std::max(0, E.fd.scroll - e.wheel.y * 3); redraw(); break; }
         if (E.mode == M_PICK) { E.pick_scroll = std::max(0, E.pick_scroll - e.wheel.y * 3); redraw(); break; }
+        if (E.mode == M_SETTINGS) { g_set.scroll -= (float)e.wheel.y * (float)S(48); redraw(); break; }
         if (E.mx >= (float)L.ed_x && E.my >= (float)L.tab_y && E.my < (float)L.text_y && !splash()) {   /* over the tab strip: slide the tabs, keep the active one */
             E.tab_scroll += (float)(e.wheel.x - e.wheel.y) * (float)S(70);
             redraw();
@@ -7263,6 +7525,7 @@ void run_script(const char *script) {
             printf("text: %s\ncursor: %zu,%zu\nselection: %zu\nstatus: %s\nvim: %s\nfind: %s\nmode: %d\nsidebar: %d view=%d\n", esc(all).c_str(), cl + 1, dd.cur - dd.buf.line_start(cl) + 1, dd.sel_hi() - dd.sel_lo(),
                    E.status_msg.c_str(), vim_active() ? g_vim.label().c_str() : "off", E.find_q.c_str(), (int)E.mode, E.side_open ? 1 : 0, (int)E.view);
             for (const Tree::Row &r : E.tree.rows()) { auto di = E.deco.find(r.path); printf("row: %s depth=%d dir=%d ghost=%d deco=%c\n", r.name.c_str(), r.depth, r.dir ? 1 : 0, r.ghost ? 1 : 0, di == E.deco.end() ? '-' : di->second); }
+            printf("settings: open=%d category=%d query=%s rows=%zu\n", g_set.open ? 1 : 0, g_set.cat, g_set.q.c_str(), g_set.rows.size());
             lint_kick(dd, true);
             if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());
             if (E.outline_on && !dd.dv && !dd.mv) for (const OItem &o : outline_for(dd)) printf("outline: %s line=%zu depth=%d kind=%c\n", o.name.c_str(), o.line + 1, o.depth, o.kind);
@@ -7739,6 +8002,7 @@ int main(int argc, char **argv) {
         if (g_print_stats) { g_print_stats = 0; fprintf(stderr, "%s\n", cache_stats_text().c_str()); }
         g_wake_pending = 0;
         search_poll();
+        if (g_set.open && E.mode == M_EDIT) { E.mode = M_SETTINGS; redraw(); }   /* a list or a dialog opened from the Settings page has closed: back to the page */
         lint_tick();
         fswatch_tick();
         git_startup_poll();
