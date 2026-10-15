@@ -139,6 +139,95 @@ int main() {
         for (const Diag &x : d) if (x.code == "trailing-whitespace") CHECK(apply("text   \n", x) == "text\n");
         CHECK(run("a.md", "hard break  \n").empty());
     }
+    {   // Kubernetes
+        const char *dep = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: Web_App\n  labels:\n    version: 1.2\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: web\n  template:\n    metadata:\n      labels:\n        app: api\n    spec:\n      hostNetwork: true\n      containers:\n        - name: web\n          image: nginx\n          ports:\n            - containerPort: \"80\"\n          env:\n            - name: DB_PASSWORD\n              value: hunter2\n            - name: DEBUG\n              value: true\n          securityContext:\n            privileged: true\n        - name: web\n          image: redis:latest\n          imagePullPolicy: sometimes\n          resources:\n            limits:\n              memory: 1gb\n";
+        auto d = run("deploy.yaml", dep);
+        if (!has(d, "k8s-name", 3)) printf("k8s diags: %s\n", codes(d).c_str());
+        CHECK(has(d, "k8s-name", 3));
+        CHECK(has(d, "k8s-string-value", 5));       /* version: 1.2 */
+        CHECK(has(d, "k8s-selector-mismatch", 10));
+        CHECK(has(d, "k8s-host-namespace", 16));
+        CHECK(has(d, "k8s-image-untagged", 19));
+        CHECK(has(d, "k8s-port-type", 21));
+        CHECK(has(d, "k8s-env-secret", 24));
+        CHECK(has(d, "k8s-string-value", 26));      /* env value: true */
+        CHECK(has(d, "k8s-privileged", 28));
+        CHECK(has(d, "k8s-container-duplicate", 29));
+        CHECK(has(d, "k8s-image-latest", 30));
+        CHECK(has(d, "k8s-pull-policy", 31));
+        CHECK(has(d, "k8s-quantity", 34));
+        CHECK(has(d, "k8s-no-resources", 18));
+        for (const Diag &x : d) { if (x.code == "k8s-string-value" && x.line == 5) CHECK(x.has_fix && x.fix == "\"1.2\""); if (x.code == "k8s-port-type") CHECK(x.has_fix && x.fix == "80"); if (x.code == "k8s-name") CHECK(x.has_fix && x.fix == "web_app" ? false : true); }
+        auto old = run("ing.yaml", "apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: x\nspec:\n  rules: []\n");
+        CHECK(has(old, "k8s-api-removed", 0));
+        for (const Diag &x : old) if (x.code == "k8s-api-removed") CHECK(x.has_fix && x.fix == "networking.k8s.io/v1");
+        auto wrong = run("svc.yaml", "apiVersion: apps/v1\nkind: Service\nmetadata:\n  name: x\nspec:\n  selector:\n    app: x\n");
+        CHECK(has(wrong, "k8s-api-mismatch", 0));
+        auto miss = run("p.yaml", "apiVersion: v1\nkind: Pod\nspec:\n  containers: []\n");
+        CHECK(has(miss, "k8s-missing-field"));
+        auto sec = run("s.yaml", "apiVersion: v1\nkind: Secret\nmetadata:\n  name: s\nstringData:\n  password: x\n");
+        CHECK(has(sec, "k8s-secret-in-file"));
+        auto cron = run("c.yaml", "apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: j\nspec:\n  schedule: \"* * * * *\"\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          restartPolicy: Always\n          containers:\n            - name: a\n              image: busybox:1.36\n");
+        CHECK(has(cron, "k8s-restart-policy", 10));
+        CHECK(!has(cron, "k8s-no-readiness"));
+        auto good = run("ok.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  selector:\n    matchLabels:\n      app: web\n  template:\n    metadata:\n      labels:\n        app: web\n    spec:\n      securityContext:\n        runAsNonRoot: true\n      containers:\n        - name: web\n          image: nginx:1.27\n          resources:\n            requests: {cpu: 100m}\n            limits:\n              memory: 256Mi\n          readinessProbe:\n            httpGet: {path: /, port: 80}\n          securityContext:\n            allowPrivilegeEscalation: false\n");
+        CHECK(!has(good, "k8s-selector-mismatch") && !has(good, "k8s-image-untagged") && !has(good, "k8s-no-resources") && !has(good, "k8s-root-possible"));
+        auto helm = run("chart/templates/d.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ .Release.Name }}\n  labels:\n    {{- include \"x\" . | nindent 4 }}\n");
+        CHECK(helm.empty());
+        auto multi = run("m.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: B\n");
+        CHECK(has(multi, "k8s-name", 8));
+    }
+    {   // TOML
+        auto d = run("a.toml", "[pkg]\nname = \"x\"\nname = \"y\"\nflag = True\ns = \"open\nn = None\n[pkg]\nthis is wrong\narr = [\n  1,\n  2,\n]\nok = 3\n");
+        CHECK(has(d, "toml-duplicate-key", 2) && has(d, "toml-boolean", 3) && has(d, "toml-string", 4) && has(d, "toml-null", 5) && has(d, "toml-duplicate-table", 6) && has(d, "toml-syntax", 7));
+        CHECK(!has(d, "toml-syntax", 9) && !has(d, "toml-syntax", 12));
+        CHECK(run("b.toml", "[a]\nx = 1\n[b.c]\ny = \"\"\"multi\nline\"\"\"\nz = { a = 1, b = [1, 2] }\n").empty());
+    }
+    {   // XML
+        auto d = run("a.xml", "<?xml version=\"1.0\"?>\n<root>\n  <a href=x>text & more</a>\n  <b>\n</root>\n");
+        CHECK(has(d, "xml-attribute", 2) && has(d, "xml-ampersand", 2) && has(d, "xml-mismatch", 4));
+        CHECK(run("b.xml", "<?xml version=\"1.0\"?>\n<!-- c -->\n<r a=\"1\"><x/><y>t &amp; u</y><![CDATA[ <not a tag> ]]></r>\n").empty());
+        CHECK(has(run("c.xml", "<a><b></a>\n"), "xml-mismatch"));
+    }
+    {   // Markdown
+        auto d = run("/tmp/hootedit_lint_test/doc.md", "#Title\n\n```c\nint x;\n\n[gone](missing.md) and [web](https://example.com) and `[code](nope.md)`\n");
+        CHECK(has(d, "md-heading", 0) && has(d, "md-fence", 2));
+        CHECK(!has(d, "md-broken-link"));   /* the link is inside an unclosed fence */
+        auto d2 = run("/tmp/hootedit_lint_test/doc.md", "# T\n\n[gone](missing.md) and [web](https://example.com) and `[code](nope.md)` and [anchor](#t)\n");
+        CHECK(has(d2, "md-broken-link", 2) && d2.size() == 1);
+    }
+    {   // SQL
+        auto d = run("a.sql", "SELECT * FROM t WHERE a = NULL;\nDELETE FROM t;\nUPDATE t SET a = 1\nWHERE b = 2;\n-- DELETE FROM x;\nDELETE FROM u\nWHERE id = 3;\n");
+        CHECK(has(d, "sql-select-star", 0) && has(d, "sql-null-compare", 0) && has(d, "sql-delete-all", 1) && !has(d, "sql-update-all") && d.size() == 3);
+    }
+    {   // CSS
+        auto d = run("a.css", "a { color: #12345; background: #fff; border: 1px solid #abcdef; }\n#header { color: red; }\n");
+        CHECK(has(d, "css-color", 0) && d.size() == 1);
+    }
+    {   // leftovers in other languages
+        CHECK(has(run("a.rs", "fn main() {\n    dbg!(x);\n    todo!();\n}\n"), "rust-dbg", 1));
+        CHECK(has(run("a.rb", "def f\n  binding.pry\nend\n"), "ruby-debugger", 1));
+        CHECK(has(run("a.php", "<?php\nvar_dump($x);\n"), "php-debug", 1));
+        CHECK(has(run("A.java", "class A { void f() { try { g(); } catch (Exception e) {} } }\n"), "empty-catch", 0));
+    }
+    {   // generic: mixed indentation, mixed line endings, invalid UTF-8
+        CHECK(has(run("a.txt", "a\n\tb\n  c\n  d\n  e\n  f\n"), "mixed-indent", 1));
+        CHECK(has(run("a.txt", "a\r\nb\r\nc\nd\r\n"), "mixed-eol"));
+        std::string bad = "ok \xc3\xa9\nbad \xff\xfe here\n";
+        CHECK(has(run("a.txt", bad), "invalid-utf8", 1));
+        CHECK(!has(run("a.txt", "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80\n"), "invalid-utf8"));
+        CHECK(!has(run("Makefile", "all:\n\techo a\n\techo b\n"), "mixed-indent"));
+    }
+    {   // the skeletons we hand out must pass our own checks
+        for (const AnsibleTemplate &tp : ansible_templates()) {
+            auto d = run("/r/roles/x/tasks/main.yml", tp.text);
+            for (const Diag &x : d) if (x.sev <= SEV_WARN) { printf("ansible template '%s': %s (line %u)\n", tp.label, x.code.c_str(), x.line + 1); fails++; }
+        }
+        for (const AnsibleTemplate &tp : k8s_templates()) {
+            auto d = run("/r/manifests/x.yaml", tp.text);
+            for (const Diag &x : d) if (x.sev <= SEV_ERROR || (x.sev == SEV_WARN && x.code != "k8s-secret-in-file")) { printf("k8s template '%s': %s %s (line %u)\n", tp.label, x.code.c_str(), x.msg.c_str(), x.line + 1); fails++; }
+        }
+    }
     {   // cost: a big file stays cheap
         std::string big;
         for (int i = 0; i < 200000; i++) big += "int f" + std::to_string(i) + "(int a) { return a + 1; }\n";

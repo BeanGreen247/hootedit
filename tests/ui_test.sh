@@ -158,5 +158,29 @@ printf '{"a": [1, 2,]}\n' > "$T/ws/bad.json"
 run "dump" bad.json
 has "JSON syntax error" "json-syntax"
 
+# ---- Kubernetes ----
+printf 'apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: Web\n  labels:\n    tier: 1\nspec:\n  rules: []\n' > "$T/ws/ing.yaml"
+run "dump" ing.yaml
+has "k8s: removed apiVersion" "diag: 1:"
+has "k8s: removed apiVersion code" "k8s-api-removed"
+has "k8s: name rule" "k8s-name"
+has "k8s: label value must be a string" "k8s-string-value"
+run "act:fixall;dump" ing.yaml
+has "k8s: fix all corrects the apiVersion" "text: apiVersion: networking.k8s.io/v1\\nkind: Ingress"
+has "k8s: fix all quotes the label" "tier: \"1\""
+: > "$T/ws/new.yaml"
+run "act:kubernetes;return;dump" new.yaml
+has "k8s: insert resource puts a Deployment into an empty file" "text: apiVersion: apps/v1\\nkind: Deployment"
+hasnot "k8s: the inserted Deployment is clean" "diag:"
+printf '[a]\nx = 1\nx = 2\n' > "$T/ws/dup.toml"
+run "dump" dup.toml
+has "TOML duplicate key" "toml-duplicate-key"
+printf '<a>\n<b>\n</a>\n' > "$T/ws/bad.xml"
+run "dump" bad.xml
+has "XML mismatch" "xml-mismatch"
+printf 'DELETE FROM users;\n' > "$T/ws/bad.sql"
+run "dump" bad.sql
+has "SQL delete without where" "sql-delete-all"
+
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]

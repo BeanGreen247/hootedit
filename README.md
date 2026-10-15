@@ -20,7 +20,7 @@ Needs SDL2, FreeType, fontconfig and OpenGL; the installer fetches the build pac
 
 - **Editing** like VS Code and Sublime Text: tabs with preview, select next occurrence (Ctrl+D), command palette (Ctrl+Shift+P), quick open with live preview (Ctrl+P), Find and Replace with regex, outline, themes. [Sidebar, Explorer and tabs](docs/explorer-and-tabs.md), [editing details](docs/editing.md), [all shortcuts](docs/shortcuts.md).
 - **Vim keys** as a toggle: modes, operators and text objects, registers, macros, `:s`, `:g`, block mode, surround. [docs/vim.md](docs/vim.md)
-- **Live checks** for common mistakes while you type, including the ansible-lint rules that can be decided from the text, with one-key fixes. [docs/live-checks.md](docs/live-checks.md)
+- **Live checks** for common mistakes while you type: Ansible playbooks (the ansible-lint rules that can be decided from the text), Kubernetes manifests, YAML, JSON, TOML, XML, shell, Python, C/C++, JavaScript, SQL, CSS, Dockerfile and more, with one-key fixes and correct skeletons to insert. [docs/live-checks.md](docs/live-checks.md)
 - **Source control**: staged and changed files, graph, blame, diff and merge tabs, rebase, stash, branches. [docs/git.md](docs/git.md)
 - **Remote** tabs over ssh, sftp, ftp, ftps and smb. [docs/remote.md](docs/remote.md)
 - **Search** in files with own regex and fuzzy engines. [docs/search.md](docs/search.md)

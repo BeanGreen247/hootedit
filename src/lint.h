@@ -41,4 +41,5 @@ bool lint_is_ansible(const std::string &path, const char *text, size_t n);   /* 
 /* Task skeletons for "Ansible: Insert Task": name, text with "- " first; every line after the first is indented by the caller */
 struct AnsibleTemplate { const char *label; const char *text; };
 const std::vector<AnsibleTemplate> &ansible_templates();
+const std::vector<AnsibleTemplate> &k8s_templates();   /* whole resources: Deployment, Service, Ingress, ConfigMap, ... */
 #endif

@@ -4,6 +4,7 @@
  */
 
 #include "lint.h"
+#include "lint_priv.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -17,59 +18,7 @@
 
 namespace {
 
-using sv = std::string_view;
-
-struct Ctx {
-    std::vector<Diag> &out;
-    size_t max;
-    uint32_t line = 0;
-    sv cur;                 /* the line being checked, for "# noqa" */
-    bool full() const { return out.size() >= max; }
-};
-
-bool noqa(const Ctx &c, const char *code) {
-    size_t p = c.cur.find("noqa");
-    if (p == sv::npos || c.cur.find('#') == sv::npos) return false;
-    p += 4;
-    if (p >= c.cur.size() || c.cur[p] != ':') return true;   /* a bare "# noqa" silences everything on the line */
-    sv rest = c.cur.substr(p + 1);
-    std::string short_code = code;
-    size_t br = short_code.find('[');
-    if (br != std::string::npos) short_code.resize(br);
-    size_t i = 0;
-    while (i < rest.size()) {
-        while (i < rest.size() && (rest[i] == ' ' || rest[i] == ',')) i++;
-        size_t j = i;
-        while (j < rest.size() && rest[j] != ' ' && rest[j] != ',') j++;
-        sv tok = rest.substr(i, j - i);
-        if (!tok.empty() && (tok == code || tok == short_code)) return true;
-        i = j;
-    }
-    return false;
-}
-
-Diag &add(Ctx &c, size_t c0, size_t c1, int sev, const char *code, const std::string &msg) {
-    static Diag dummy;
-    if (c.full() || noqa(c, code)) { dummy = Diag(); return dummy; }
-    Diag d;
-    d.line = c.line; d.c0 = (uint32_t)c0; d.c1 = (uint32_t)std::max(c1, c0 + 1); d.sev = (uint8_t)sev; d.code = code; d.msg = msg;
-    c.out.push_back(std::move(d));
-    return c.out.back();
-}
-
-void fixit(Diag &d, size_t f0, size_t f1, const std::string &text) { d.has_fix = true; d.f0 = (uint32_t)f0; d.f1 = (uint32_t)f1; d.fix = text; }
-
-sv trim(sv s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
-    return s;
-}
-bool starts(sv s, sv p) { return s.size() >= p.size() && s.compare(0, p.size(), p) == 0; }
-bool ends(sv s, sv p) { return s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0; }
-bool idc(char c) { return isalnum((unsigned char)c) || c == '_'; }
-
-/* word at or after position p: the identifier starting there */
-sv word_at(sv s, size_t p) { size_t e = p; while (e < s.size() && idc(s[e])) e++; return s.substr(p, e - p); }
+using namespace lintp;
 
 /* every position where `name` stands as a whole word followed by "(" (spaces allowed) */
 void each_call(sv code, sv name, const std::function<void(size_t)> &f) {
@@ -151,75 +100,6 @@ std::string short_module(const std::string &k) {
 bool known_module(const std::string &k) {
     if (k.find('.') != std::string::npos) return starts(k, "ansible.") || starts(k, "community.") || starts(k, "amazon.") || starts(k, "kubernetes.");
     return fqcn_map().count(k) != 0;
-}
-
-/* ---------------------------------------------------------------- YAML line reader */
-
-struct YLine {
-    size_t indent = 0;          /* first non-space column */
-    int dashes = 0;             /* "- " markers before the content */
-    size_t kp = 0;              /* column where the content (key) starts */
-    bool blank = true;          /* blank or comment only */
-    bool is_key = false;
-    sv key;
-    size_t k0 = 0, k1 = 0;
-    sv value;                   /* trimmed, comment removed */
-    size_t v0 = 0;
-    bool tab_indent = false;
-};
-
-void parse_yline(sv line, YLine &y) {
-    y = YLine();
-    size_t i = 0;
-    while (i < line.size() && line[i] == ' ') i++;
-    if (i < line.size() && line[i] == '\t') { y.tab_indent = true; size_t j = i; while (j < line.size() && (line[j] == ' ' || line[j] == '\t')) j++; i = j; }
-    y.indent = i;
-    if (i >= line.size() || line[i] == '#' || line[i] == '\r') return;
-    y.blank = false;
-    size_t p = i;
-    while (p < line.size() && line[p] == '-' && (p + 1 == line.size() || line[p + 1] == ' ')) {
-        y.dashes++;
-        p++;
-        while (p < line.size() && line[p] == ' ') p++;
-    }
-    y.kp = p;
-    if (p >= line.size()) return;
-    size_t k0 = p, k1;
-    char c = line[p];
-    if (c == '"' || c == '\'') {
-        size_t q = p + 1;
-        while (q < line.size() && line[q] != c) { if (line[q] == '\\' && c == '"') q++; q++; }
-        if (q >= line.size() || q + 1 >= line.size() + 0 || line[q + 1] != ':') return;
-        k0 = p + 1; k1 = q;
-        p = q + 2;
-    } else {
-        if (c == '{' || c == '[' || c == '|' || c == '>' || c == '&' || c == '*' || c == '!' || c == '%' || c == '@' || c == '`') return;
-        size_t q = p;
-        while (q < line.size()) {
-            if (line[q] == ':' && (q + 1 == line.size() || line[q + 1] == ' ' || line[q + 1] == '\r')) break;
-            if (line[q] == '#' && q > p && line[q - 1] == ' ') return;
-            if (line[q] == '{' && q + 1 < line.size() && line[q + 1] == '{') return;   /* a Jinja expression, not a key */
-            q++;
-        }
-        if (q >= line.size()) return;
-        k1 = q;
-        while (k1 > k0 && line[k1 - 1] == ' ') k1--;
-        p = q + 1;
-    }
-    y.is_key = true;
-    y.key = line.substr(k0, k1 - k0);
-    y.k0 = k0; y.k1 = k1;
-    while (p < line.size() && line[p] == ' ') p++;
-    y.v0 = p;
-    sv v = line.substr(p);
-    bool q1 = false, q2 = false;
-    size_t cut = v.size();
-    for (size_t t = 0; t < v.size(); t++) {
-        if (v[t] == '\'' && !q2) q1 = !q1;
-        else if (v[t] == '"' && !q1) q2 = !q2;
-        else if (v[t] == '#' && !q1 && !q2 && (t == 0 || v[t - 1] == ' ')) { cut = t; break; }
-    }
-    y.value = trim(v.substr(0, cut));
 }
 
 /* ---------------------------------------------------------------- Ansible task rules */
@@ -464,6 +344,14 @@ void yaml_pass(Ctx &c, sv text, bool ansible, bool tasks_file) {
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         c.line = ln;
         c.cur = line;
+        if (starts(line, "---") && (line.size() == 3 || line[3] == ' ' || line[3] == '\t')) {   /* a new document: keys of the last one do not count */
+            for (size_t k = open.size(); k-- > 0;) { if (ansible) eval_task(c, open[k]); }
+            open.clear(); maps.clear(); ctx.clear(); block_skip = (size_t)-1;
+            c.cur = sv();
+            ln++; pos = e + 1;
+            if (e >= text.size()) break;
+            continue;
+        }
         parse_yline(line, y);
         bool in_block = false;
         if (block_skip != (size_t)-1) {
@@ -659,7 +547,13 @@ void check_shell(Ctx &c, sv line, bool bash_shebang_sh, bool set_e, bool set_u) 
             if (ch == '"' && !sq2) dq = !dq;
             else if (ch == '\'' && !dq) sq2 = !sq2;
             else if (ch == '#' && !dq && !sq2 && i > 0 && t[i - 1] == ' ') break;
-            else if (ch == '$' && !dq && !sq2 && i + 1 < t.size() && (idc(t[i + 1]) || t[i + 1] == '{') && !isdigit((unsigned char)t[i + 1]) && t[i + 1] != '?') {
+            else if (ch == '$' && i + 1 < t.size() && t[i + 1] == '(') {   /* a command substitution has its own quoting: skip it whole */
+                int depth = 0;
+                size_t k = i + 1;
+                for (; k < t.size(); k++) { if (t[k] == '(') depth++; else if (t[k] == ')' && --depth == 0) break; }
+                i = k;
+            }
+            else if (ch == '$' && !dq && !sq2 && i + 1 < t.size() && (idc(t[i + 1]) || (t[i + 1] == '{' && !(i + 2 < t.size() && t[i + 2] == '#'))) && !isdigit((unsigned char)t[i + 1]) && t[i + 1] != '?') {
                 size_t e = i + 1;
                 if (t[e] == '{') { size_t cb = t.find('}', e); e = cb == sv::npos ? t.size() : cb + 1; } else while (e < t.size() && idc(t[e])) e++;
                 if (in_test && t.find("[[") != sv::npos) break;
@@ -723,7 +617,12 @@ void check_c(Ctx &c, sv code, bool header) {
         while (q < n && code[q] == ' ') q++;
         if (q >= n || code[q] != '(') continue;
         sv w = code.substr(s0, len);
-        if (w == "gets") add(c, s0, i, SEV_ERROR, "c-gets", "gets cannot limit its input and was removed from C11; use fgets");
+        if (w == "gets") {
+            int depth = 0;
+            bool comma = false, decl = s0 > 0 && (idc(code[s0 - 1]) || code[s0 - 1] == ' ' || code[s0 - 1] == '*' || code[s0 - 1] == '&') && !trim(code.substr(0, s0)).empty() && trim(code.substr(0, s0)).back() != '(' && trim(code.substr(0, s0)).back() != '=' && trim(code.substr(0, s0)).back() != ',' && trim(code.substr(0, s0)).find("return") == sv::npos;
+            for (size_t k = q; k < n; k++) { if (code[k] == '(') depth++; else if (code[k] == ')') { if (--depth == 0) break; } else if (code[k] == ',' && depth == 1) comma = true; }
+            if (!comma && !decl) add(c, s0, i, SEV_ERROR, "c-gets", "gets cannot limit its input and was removed from C11; use fgets");   /* a function of your own named gets takes more arguments or has a return type before it */
+        }
         else if (w == "strcpy" || w == "strcat" || w == "sprintf") add(c, s0, i, SEV_WARN, "c-unbounded", std::string(w) + " does not check the size of the destination; use snprintf / a bounded copy");
         else if (w == "vsprintf") add(c, s0, i, SEV_WARN, "c-unbounded", "vsprintf does not check the size of the destination; use vsnprintf");
         else if (w == "mktemp") add(c, s0, i, SEV_WARN, "c-mktemp", "mktemp is racy; use mkstemp");
@@ -850,11 +749,25 @@ void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max) {
     bool make = ln_ == "Makefile";
     bool md = ln_ == "Markdown";
     bool brackets = cfam || js || ln_ == "Go" || ln_ == "Rust" || ln_ == "Java" || ln_ == "C#" || ln_ == "JSON" || ln_ == "PHP" || ln_ == "Kotlin" || ln_ == "Swift" || ln_ == "CSS" || py;
-    bool ansible = yaml && lint_is_ansible(in.path, in.text, in.n);
+    bool sql = ln_ == "SQL", css = ln_ == "CSS", toml = ln_ == "TOML", xml = ln_ == "XML";
+    bool helm = yaml && ("/" + in.path).find("/templates/") != std::string::npos && text.find("{{") != sv::npos;   /* a Helm template is Go template text, not YAML */
+    bool ansible = yaml && !helm && lint_is_ansible(in.path, in.text, in.n);
+    bool k8s = yaml && !helm && !ansible && k8s_detect(text, in.path);
     bool tasks_file = ansible && (("/" + in.path).find("/tasks/") != std::string::npos || ("/" + in.path).find("/handlers/") != std::string::npos);
-    bool lex = brackets && (in.n < (24u << 20));
+    bool minified = false;
+    {   // a bundled or minified file: very long lines, regex literals and template strings the lexer cannot follow
+        size_t p = 0;
+        while (p < in.n) { const char *nl = (const char *)memchr(in.text + p, '\n', in.n - p); size_t e = nl ? (size_t)(nl - in.text) : in.n; if (e - p > 2000) { minified = true; break; } p = e + 1; }
+    }
+    bool raw_strings = cfam && text.find("R\"") != sv::npos;   /* C++ raw strings: the lexer does not know them, so brackets inside would be miscounted */
+    bool lex = (brackets || sql || ln_ == "Ruby") && (in.n < (24u << 20)) && !minified;
+    if (raw_strings) brackets = false;
 
-    if (yaml) yaml_pass(c, text, ansible, tasks_file);
+    if (yaml && !helm) yaml_pass(c, text, ansible, tasks_file);
+    if (k8s) k8s_pass(c, text);
+    if (toml) toml_check(c, text);
+    if (xml && in.n < (24u << 20)) xml_check(c, text);
+    if (md) markdown_check(c, text, in.path);
     if (json) json_check(c, in.text, in.n);
 
     struct Br { char ch; uint32_t line, col; };
@@ -863,6 +776,13 @@ void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max) {
     uint8_t lstate = 0;
     std::string code;
     std::set<std::string> stages;
+    SqlState sqlst;
+    CssState cssst;
+    uint32_t tab_lines = 0, space_lines = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> tab_at, space_at;   /* line, indent width, for the minority style */
+    bool utf8_reported = false;
+    int crlf_lines = 0, lf_lines = 0;
+    uint32_t first_crlf = 0, first_lf = 0;
     bool saw_set_e = false, saw_set_u = false;
     int shell_lines = 0;
     bool make_rule = false, make_recipe = false;
@@ -887,6 +807,27 @@ void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max) {
         if (line.size() >= 12) check_secrets(c, line);
         if (ansible && false) {}
         if (cr && ln == 0) add(c, line.size(), line.size() + 1, SEV_HINT, "crlf", "This file uses Windows (CRLF) line endings");
+        if (!last) { if (cr) { if (!crlf_lines) first_crlf = ln; crlf_lines++; } else { if (!lf_lines) first_lf = ln; lf_lines++; } }
+        if (!line.empty() && !md && !make && ln_ != "Go" && !yaml) {   /* tabs and spaces both used to indent */
+            if (line[0] == '\t') { tab_lines++; if (tab_at.size() < 40) tab_at.push_back({ln, 1}); }
+            else if (line.size() > 1 && line[0] == ' ' && line[1] == ' ') { size_t k = 0; while (k < line.size() && line[k] == ' ') k++; if (k < line.size()) { space_lines++; if (space_at.size() < 40) space_at.push_back({ln, (uint32_t)k}); } }
+        }
+        if (!utf8_reported && !line.empty()) {   /* only lines with a byte >= 0x80 are looked at */
+            bool hi = false;
+            for (unsigned char ch : line) if (ch >= 0x80) { hi = true; break; }
+            if (hi) {
+                size_t i2 = 0;
+                while (i2 < line.size()) {
+                    unsigned char b = (unsigned char)line[i2];
+                    size_t need = b < 0x80 ? 0 : (b >> 5) == 6 ? 1 : (b >> 4) == 14 ? 2 : (b >> 3) == 30 ? 3 : (size_t)-1;
+                    if (need == (size_t)-1) { add(c, i2, i2 + 1, SEV_WARN, "invalid-utf8", "This is not valid UTF-8 (the file may be in another encoding)"); utf8_reported = true; break; }
+                    bool ok = true;
+                    for (size_t k = 1; k <= need; k++) if ((i2 + k >= line.size()) || (((unsigned char)line[i2 + k]) & 0xC0) != 0x80) ok = false;
+                    if (!ok) { add(c, i2, i2 + 1, SEV_WARN, "invalid-utf8", "This is not valid UTF-8 (the file may be in another encoding)"); utf8_reported = true; break; }
+                    i2 += need + 1;
+                }
+            }
+        }
         // code view with strings and comments blanked, from the lexer
         if (lex || (shell && false)) {
             if (tok.size() < line.size() + 1) tok.resize(line.size() + 64);
@@ -896,6 +837,9 @@ void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max) {
                 uint8_t k = tok[i];
                 if (k == T_COMMENT || k == T_STRING) code[i] = ' ';
             }
+            if (sql) sql_line(c, code, sqlst);
+            if (css) css_line(c, code, cssst);
+            else if (!sql && !py && !cfam && !js) misc_line(c, lname, code);
             if (brackets) {
                 for (size_t i = 0; i < code.size(); i++) {
                     char ch = code[i];
@@ -947,6 +891,17 @@ void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max) {
         c.line = 0; c.cur = sv();
         add(c, 0, 1, SEV_HINT, "shell-no-set-e", "No 'set -e' (or 'set -euo pipefail'): the script keeps going after a failing command");
     }
+    if (tab_lines > 0 && space_lines > 0 && !c.full() && !minified && !raw_strings && std::min(tab_lines, space_lines) * 4 <= std::max(tab_lines, space_lines)) {   /* point at the lines in the minority style */
+        bool tabs_minor = tab_lines < space_lines;
+        const auto &minor = tabs_minor ? tab_at : space_at;
+        c.cur = sv();
+        for (auto &m : minor) { if (c.full()) break; c.line = m.first; add(c, 0, m.second, SEV_HINT, "mixed-indent", tabs_minor ? "This line is indented with a tab; the rest of the file uses spaces" : "This line is indented with spaces; the rest of the file uses tabs"); }
+    }
+    if (crlf_lines > 0 && lf_lines > 0 && !c.full()) {
+        bool crlf_minor = crlf_lines < lf_lines;
+        c.line = crlf_minor ? first_crlf : first_lf; c.cur = sv();
+        add(c, 0, 1, SEV_HINT, "mixed-eol", crlf_minor ? "This line ends with CRLF; the rest of the file uses LF" : "This line ends with LF; the rest of the file uses CRLF");
+    }
     if (!stack.empty() && lex) {
         size_t shown = 0;
         for (size_t i = stack.size(); i-- > 0 && shown < 5; shown++) {
@@ -987,6 +942,28 @@ const std::vector<AnsibleTemplate> &ansible_templates() {
         {"sysctl: kernel setting", "- name: Set a kernel parameter\n  ansible.posix.sysctl:\n    name: net.ipv4.ip_forward\n    value: \"1\"\n    sysctl_set: true\n    state: present\n    reload: true\n"},
         {"docker_container", "- name: Run container\n  community.docker.docker_container:\n    name: example\n    image: example/app:1.0.0\n    state: started\n    restart_policy: unless-stopped\n    published_ports:\n      - \"8080:80\"\n"},
         {"play: skeleton", "- name: Configure servers\n  hosts: all\n  become: true\n  gather_facts: true\n  tasks:\n    - name: Ping\n      ansible.builtin.ping:\n"},
+    };
+    return t;
+}
+
+const std::vector<AnsibleTemplate> &k8s_templates() {
+    static const std::vector<AnsibleTemplate> t = {
+        {"Deployment", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\n  labels:\n    app: app\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: app\n  template:\n    metadata:\n      labels:\n        app: app\n    spec:\n      securityContext:\n        runAsNonRoot: true\n      containers:\n        - name: app\n          image: registry.example.com/app:1.0.0\n          ports:\n            - containerPort: 8080\n          resources:\n            requests:\n              cpu: 100m\n              memory: 128Mi\n            limits:\n              memory: 256Mi\n          readinessProbe:\n            httpGet:\n              path: /healthz\n              port: 8080\n          livenessProbe:\n            httpGet:\n              path: /healthz\n              port: 8080\n          securityContext:\n            allowPrivilegeEscalation: false\n            readOnlyRootFilesystem: true\n"},
+        {"Service (ClusterIP)", "apiVersion: v1\nkind: Service\nmetadata:\n  name: app\nspec:\n  selector:\n    app: app\n  ports:\n    - port: 80\n      targetPort: 8080\n"},
+        {"Ingress", "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: app\nspec:\n  ingressClassName: nginx\n  rules:\n    - host: app.example.com\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend:\n              service:\n                name: app\n                port:\n                  number: 80\n  tls:\n    - hosts:\n        - app.example.com\n      secretName: app-tls\n"},
+        {"ConfigMap", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config\ndata:\n  LOG_LEVEL: info\n  app.properties: |\n    key=value\n"},
+        {"Secret (stringData)", "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-secret\ntype: Opaque\nstringData:\n  password: CHANGEME   # do not commit real values\n"},
+        {"StatefulSet", "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  serviceName: db\n  replicas: 1\n  selector:\n    matchLabels:\n      app: db\n  template:\n    metadata:\n      labels:\n        app: db\n    spec:\n      containers:\n        - name: db\n          image: postgres:16.4\n          resources:\n            requests:\n              cpu: 100m\n              memory: 128Mi\n            limits:\n              memory: 256Mi\n          ports:\n            - containerPort: 5432\n          volumeMounts:\n            - name: data\n              mountPath: /var/lib/postgresql/data\n  volumeClaimTemplates:\n    - metadata:\n        name: data\n      spec:\n        accessModes: [\"ReadWriteOnce\"]\n        resources:\n          requests:\n            storage: 10Gi\n"},
+        {"DaemonSet", "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: agent\nspec:\n  selector:\n    matchLabels:\n      app: agent\n  template:\n    metadata:\n      labels:\n        app: agent\n    spec:\n      containers:\n        - name: agent\n          image: registry.example.com/agent:1.0.0\n          resources:\n            requests:\n              cpu: 100m\n              memory: 128Mi\n            limits:\n              memory: 256Mi\n"},
+        {"Job", "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: task\nspec:\n  backoffLimit: 3\n  template:\n    spec:\n      restartPolicy: Never\n      containers:\n        - name: task\n          image: busybox:1.36\n          command: [\"sh\", \"-c\", \"echo done\"]\n          resources:\n            requests:\n              cpu: 100m\n              memory: 128Mi\n            limits:\n              memory: 256Mi\n"},
+        {"CronJob", "apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: nightly\nspec:\n  schedule: \"0 3 * * *\"\n  concurrencyPolicy: Forbid\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          restartPolicy: OnFailure\n          containers:\n            - name: nightly\n              image: busybox:1.36\n              command: [\"sh\", \"-c\", \"echo run\"]\n              resources:\n                requests:\n                  cpu: 100m\n                  memory: 64Mi\n                limits:\n                  memory: 128Mi\n"},
+        {"PersistentVolumeClaim", "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\nspec:\n  accessModes:\n    - ReadWriteOnce\n  resources:\n    requests:\n      storage: 5Gi\n"},
+        {"HorizontalPodAutoscaler", "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: app\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: app\n  minReplicas: 2\n  maxReplicas: 10\n  metrics:\n    - type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n          averageUtilization: 70\n"},
+        {"NetworkPolicy (deny all ingress)", "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: default-deny-ingress\nspec:\n  podSelector: {}\n  policyTypes:\n    - Ingress\n"},
+        {"Namespace", "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: team-a\n"},
+        {"ServiceAccount + Role + RoleBinding", "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: app\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: app\nrules:\n  - apiGroups: [\"\"]\n    resources: [\"configmaps\"]\n    verbs: [\"get\", \"list\"]\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: app\nsubjects:\n  - kind: ServiceAccount\n    name: app\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: app\n"},
+        {"PodDisruptionBudget", "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: app\nspec:\n  minAvailable: 1\n  selector:\n    matchLabels:\n      app: app\n"},
+        {"Pod (debug)", "apiVersion: v1\nkind: Pod\nmetadata:\n  name: debug\nspec:\n  restartPolicy: Never\n  containers:\n    - name: debug\n      image: busybox:1.36\n      command: [\"sleep\", \"3600\"]\n      resources:\n        requests:\n          cpu: 100m\n          memory: 64Mi\n        limits:\n          memory: 128Mi\n"},
     };
     return t;
 }

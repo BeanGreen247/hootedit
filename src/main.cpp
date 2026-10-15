@@ -185,14 +185,14 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task", "insert kubernetes resource"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
@@ -203,7 +203,7 @@ const std::vector<Menu> MENUS = {
               {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
-              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"Live Checks", "", A_LINT}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"Live Checks", "", A_LINT}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
     {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
                   {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
     {"Help", {{"Keyboard Shortcuts", "Ctrl+K Ctrl+H", A_SHORTCUTS}, {"", "", A_NONE}, {"About Hootedit", "", A_ABOUT}}},
@@ -3343,12 +3343,13 @@ void lint_fix_all() {
     E.status_msg = sfmt("applied %zu fix%s", applied, applied == 1 ? "" : "es");
 }
 
-void ansible_insert_task() {
+/* Insert Ansible Task / Insert Kubernetes Resource: a list of correct skeletons; a task goes in at the current list position, a resource as a new YAML document */
+void template_insert(bool k8s) {
+    const auto &tp = k8s ? k8s_templates() : ansible_templates();
     std::vector<Ed::PItem> items;
-    const auto &tp = ansible_templates();
     for (size_t i = 0; i < tp.size(); i++) items.push_back({tp[i].label, (int)i, false});
-    pick_custom("Ansible: Insert Task", items, [](const Ed::PItem &it) {
-        const auto &tpl = ansible_templates();
+    pick_custom(k8s ? "Kubernetes: Insert Resource" : "Ansible: Insert Task", items, [k8s](const Ed::PItem &it) {
+        const auto &tpl = k8s ? k8s_templates() : ansible_templates();
         if ((size_t)it.id >= tpl.size()) return;
         E.mode = M_EDIT;
         Doc &d = D();
@@ -3356,12 +3357,25 @@ void ansible_insert_task() {
         std::string cur_line;
         d.buf.line_text(line, cur_line);
         bool blank = cur_line.find_first_not_of(" \t") == std::string::npos;
+        std::string src = tpl[(size_t)it.id].text;
+        d.break_group();
+        if (k8s) {   /* a resource is a whole document: into an empty line as it is, otherwise after the current document under a --- line */
+            bool empty_doc = d.buf.size() == 0;
+            std::string text = (blank || empty_doc) ? src : "---\n" + src;
+            size_t at = blank ? ls0 : std::min(d.buf.size(), ls0 + cur_line.size() + (line + 1 < d.buf.lines() ? 1 : 0));
+            if (!blank && line + 1 >= d.buf.lines()) text = "\n" + text;
+            d.replace(at, 0, text.data(), text.size());
+            d.break_group();
+            E.follow = true;
+            touch();
+            return;
+        }
         std::string indent = cur_line.substr(0, cur_line.find_first_not_of(" \t") == std::string::npos ? cur_line.size() : cur_line.find_first_not_of(" \t"));
         if (!blank) {   /* a task below the current one: same indentation as the current list item */
             size_t dash = cur_line.find("- ");
             if (dash != std::string::npos && dash == indent.size()) indent = cur_line.substr(0, dash);
         }
-        std::string text, src = tpl[(size_t)it.id].text;
+        std::string text;
         size_t pos = 0;
         bool first = true;
         while (pos < src.size()) {
@@ -3372,9 +3386,7 @@ void ansible_insert_task() {
             pos = nl + 1;
         }
         size_t at = blank ? ls0 + indent.size() : d.buf.line_start(line) + cur_line.size();
-        if (!blank) { text = "\n" + text.substr(0, text.size() - 1); }
-        if (blank) text = text;   /* inserted at the cursor line start after its indentation */
-        d.break_group();
+        if (!blank) text = "\n" + text.substr(0, text.size() - 1);
         d.replace(at, 0, text.data(), text.size());
         d.break_group();
         if (!blank) d.anchor = d.cur = d.buf.line_start(std::min(line + 1, d.buf.lines() - 1)) + indent.size() + 8;
@@ -6023,7 +6035,8 @@ void do_action(int act) {
     case A_QUICKFIX: lint_quick_fix(); break;
     case A_FIXALL: lint_fix_all(); break;
     case A_LINT: E.lint_on = !E.lint_on; settings_save(); if (!E.lint_on) g_lint.clear(); E.status_msg = E.lint_on ? "live checks on" : "live checks off"; break;
-    case A_ANSIBLE: ansible_insert_task(); break;
+    case A_ANSIBLE: template_insert(false); break;
+    case A_K8S: template_insert(true); break;
     case A_VIM: E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
     case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
