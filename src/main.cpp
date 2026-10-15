@@ -54,6 +54,7 @@
 #include <sys/inotify.h>
 
 #include "lint.h"
+#include "lint_priv.h"
 #include "outline.h"
 
 static Uint32 g_ev_wake;
@@ -187,14 +188,14 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S, A_K8S_CRD, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes", "reload_crds"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task", "insert kubernetes resource"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task", "insert kubernetes resource", "reload crds"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
@@ -205,7 +206,7 @@ const std::vector<Menu> MENUS = {
               {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
-              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"Live Checks", "", A_LINT}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"Live Checks", "", A_LINT}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"Reload Kubernetes CRDs", "", A_K8S_CRD}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
     {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
                   {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
     {"Help", {{"Keyboard Shortcuts", "Ctrl+K Ctrl+H", A_SHORTCUTS}, {"", "", A_NONE}, {"About Hootedit", "", A_ABOUT}}},
@@ -3328,8 +3329,30 @@ void lint_kick(Doc &d, bool force_sync) {
     }).detach();
 }
 
+/* custom resources are checked against the CRDs of the workspace: scanned on a thread the first time a manifest of an unknown kind is seen */
+std::atomic<bool> g_crd_force{false}, g_crd_done{false}, g_crd_scanning{false};
+
+void crd_scan_start() {
+    if (g_crd_scanning.exchange(true)) return;
+    std::string root = E.tree.root().empty() && !E.docs.empty() && !E.docs[(size_t)E.active]->path.empty() ? E.docs[(size_t)E.active]->path.substr(0, E.docs[(size_t)E.active]->path.rfind('/')) : E.tree.root();
+    bool git = E.git.repo;
+    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    std::string cfg = xdg && *xdg ? std::string(xdg) : (home ? std::string(home) + "/.config" : std::string());
+    std::thread([root, git, cfg] {
+        std::vector<std::string> files;
+        if (!root.empty()) for (const std::string &f : list_workspace_files(root, git)) if (lintp::ends(f, ".yaml") || lintp::ends(f, ".yml")) files.push_back(f);
+        if (!cfg.empty()) for (const std::string &f : list_workspace_files(cfg + "/hootedit/crds", false)) if (lintp::ends(f, ".yaml") || lintp::ends(f, ".yml")) files.push_back(f);   /* CRDs you keep for every project */
+        lint_crd_build(files);
+        g_crd_done = true;
+        g_crd_scanning = false;
+        app_wake();
+    }).detach();
+}
+
 /* once per loop iteration: take finished background checks, start the one that is due */
 void lint_tick() {
+    if (g_crd_done.exchange(false)) { for (auto &kv : g_lint) kv.second.rev = ~0ull; redraw(); }   /* the CRDs are known now: check the manifests again */
+    if (lint_crd_wanted() || g_crd_force.exchange(false)) crd_scan_start();
     if (!E.lint_on || E.docs.empty()) return;
     Doc &d = D();
     auto it = g_lint.find(&d);
@@ -6171,6 +6194,7 @@ void do_action(int act) {
     case A_LINT: E.lint_on = !E.lint_on; settings_save(); if (!E.lint_on) g_lint.clear(); E.status_msg = E.lint_on ? "live checks on" : "live checks off"; break;
     case A_ANSIBLE: template_insert(false); break;
     case A_K8S: template_insert(true); break;
+    case A_K8S_CRD: lint_crd_reset(); g_crd_force = true; E.status_msg = "scanning the workspace for CustomResourceDefinitions"; break;
     case A_VIM: E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
     case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;

@@ -38,6 +38,13 @@ struct LintInput {
 void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max = 5000);
 bool lint_is_ansible(const std::string &path, const char *text, size_t n);   /* playbook, tasks file, handlers, role vars... */
 
+/* Custom resources are checked against their CRDs when the workspace has them. A manifest of an unknown kind sets "wanted"; the editor then
+ * scans the YAML files of the workspace on a thread (lint_crd_build) and checks again. */
+bool lint_crd_wanted();
+bool lint_crd_ready();
+void lint_crd_reset();
+void lint_crd_build(const std::vector<std::string> &files);
+
 /* Task skeletons for "Ansible: Insert Task": name, text with "- " first; every line after the first is indented by the caller */
 struct AnsibleTemplate { const char *label; const char *text; };
 const std::vector<AnsibleTemplate> &ansible_templates();

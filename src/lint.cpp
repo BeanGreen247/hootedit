@@ -34,17 +34,6 @@ void each_call(sv code, sv name, const std::function<void(size_t)> &f) {
     }
 }
 
-int lev(sv a, sv b) {   /* edit distance, small strings */
-    if (a.size() > 40 || b.size() > 40) return 99;
-    std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
-    for (size_t j = 0; j <= b.size(); j++) prev[j] = (int)j;
-    for (size_t i = 1; i <= a.size(); i++) {
-        cur[0] = (int)i;
-        for (size_t j = 1; j <= b.size(); j++) cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1])});
-        prev.swap(cur);
-    }
-    return prev[b.size()];
-}
 
 /* ---------------------------------------------------------------- Ansible tables */
 
@@ -750,9 +739,13 @@ void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max) {
     bool md = ln_ == "Markdown";
     bool brackets = cfam || js || ln_ == "Go" || ln_ == "Rust" || ln_ == "Java" || ln_ == "C#" || ln_ == "JSON" || ln_ == "PHP" || ln_ == "Kotlin" || ln_ == "Swift" || ln_ == "CSS" || py;
     bool sql = ln_ == "SQL", css = ln_ == "CSS", toml = ln_ == "TOML", xml = ln_ == "XML";
-    bool helm = yaml && ("/" + in.path).find("/templates/") != std::string::npos && text.find("{{") != sv::npos;   /* a Helm template is Go template text, not YAML */
+    bool helm = yaml && ("/" + in.path).find("/templates/") != std::string::npos && text.find("{{") != sv::npos;   /* a Helm template: YAML with Go template actions */
+    std::string base_name = in.path.substr(in.path.rfind('/') == std::string::npos ? 0 : in.path.rfind('/') + 1);
+    bool special = yaml && (base_name == "kustomization.yaml" || base_name == "kustomization.yml" || base_name == "Kustomization" || base_name == "Chart.yaml");
     bool ansible = yaml && !helm && lint_is_ansible(in.path, in.text, in.n);
-    bool k8s = yaml && !helm && !ansible && k8s_detect(text, in.path);
+    std::string neutral;
+    if (helm) neutral = helm_neutralize(text);
+    bool k8s = yaml && !ansible && !special && k8s_detect(helm ? sv(neutral) : text, in.path);
     bool tasks_file = ansible && (("/" + in.path).find("/tasks/") != std::string::npos || ("/" + in.path).find("/handlers/") != std::string::npos);
     bool minified = false;
     {   // a bundled or minified file: very long lines, regex literals and template strings the lexer cannot follow
@@ -764,7 +757,8 @@ void lint_run(const LintInput &in, std::vector<Diag> &out, size_t max) {
     if (raw_strings) brackets = false;
 
     if (yaml && !helm) yaml_pass(c, text, ansible, tasks_file);
-    if (k8s) k8s_pass(c, text);
+    if (k8s) k8s_pass(c, helm ? sv(neutral) : text, text, helm);
+    if (special) k8s_special(c, text, in.path);
     if (toml) toml_check(c, text);
     if (xml && in.n < (24u << 20)) xml_check(c, text);
     if (md) markdown_check(c, text, in.path);

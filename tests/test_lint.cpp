@@ -1,5 +1,6 @@
 /* The built-in checks: Ansible rules, YAML, JSON, shell, Python, C, JavaScript, Dockerfile, Makefile, generic ones, fixes, noqa. */
 #include <stdio.h>
+#include <unistd.h>
 #include <string.h>
 #include <string>
 #include <vector>
@@ -148,7 +149,7 @@ int main() {
         CHECK(has(d, "k8s-selector-mismatch", 10));
         CHECK(has(d, "k8s-host-namespace", 16));
         CHECK(has(d, "k8s-image-untagged", 19));
-        CHECK(has(d, "k8s-port-type", 21));
+        CHECK(has(d, "k8s-number-type", 21));
         CHECK(has(d, "k8s-env-secret", 24));
         CHECK(has(d, "k8s-string-value", 26));      /* env value: true */
         CHECK(has(d, "k8s-privileged", 28));
@@ -157,7 +158,7 @@ int main() {
         CHECK(has(d, "k8s-pull-policy", 31));
         CHECK(has(d, "k8s-quantity", 34));
         CHECK(has(d, "k8s-no-resources", 18));
-        for (const Diag &x : d) { if (x.code == "k8s-string-value" && x.line == 5) CHECK(x.has_fix && x.fix == "\"1.2\""); if (x.code == "k8s-port-type") CHECK(x.has_fix && x.fix == "80"); if (x.code == "k8s-name") CHECK(x.has_fix && x.fix == "web_app" ? false : true); }
+        for (const Diag &x : d) { if (x.code == "k8s-string-value" && x.line == 5) CHECK(x.has_fix && x.fix == "\"1.2\""); if (x.code == "k8s-number-type") CHECK(x.has_fix && x.fix == "80"); if (x.code == "k8s-name") CHECK(x.has_fix && x.fix == "web_app" ? false : true); }
         auto old = run("ing.yaml", "apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: x\nspec:\n  rules: []\n");
         CHECK(has(old, "k8s-api-removed", 0));
         for (const Diag &x : old) if (x.code == "k8s-api-removed") CHECK(x.has_fix && x.fix == "networking.k8s.io/v1");
@@ -217,6 +218,56 @@ int main() {
         CHECK(has(run("a.txt", bad), "invalid-utf8", 1));
         CHECK(!has(run("a.txt", "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80\n"), "invalid-utf8"));
         CHECK(!has(run("Makefile", "all:\n\techo a\n\techo b\n"), "mixed-indent"));
+    }
+    {   // Kubernetes: every field is checked against the API's tables
+        auto d = run("a.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replica: 2\n  selector:\n    matchLabels:\n      app: web\n  template:\n    metadata:\n      labels:\n        app: web\n    spec:\n      containers:\n        - name: web\n          image: nginx:1.27\n          ports:\n            - containerPrt: 80\n");
+        CHECK(has(d, "k8s-unknown-field", 5));
+        for (const Diag &x : d) if (x.code == "k8s-unknown-field" && x.line == 5) CHECK(x.has_fix && x.fix == "replicas" && x.msg.find("Did you mean 'replicas'") != std::string::npos);
+        CHECK(has(d, "k8s-unknown-field", 18));
+        auto shape = run("b.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: \"2\"\n  selector:\n    matchLabels:\n      app: web\n  template:\n    metadata:\n      labels:\n        app: web\n    spec:\n      containers:\n        name: web\n        image: nginx:1.27\n");
+        CHECK(has(shape, "k8s-number-type", 5));
+        CHECK(has(shape, "k8s-wrong-type", 14));    /* containers needs a list */
+        auto req = run("c.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  selector:\n    matchLabels:\n      app: web\n  template:\n    metadata:\n      labels:\n        app: web\n    spec:\n      containers:\n        - image: nginx:1.27\n");
+        CHECK(has(req, "k8s-required", 14));
+        auto noreq = run("d.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 1\n");
+        CHECK(has(noreq, "k8s-required", 4));        /* spec.selector and template */
+        auto cm = run("e.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\ndata:\n  PORT: 8080\n  DEBUG: true\n  NAME: ok\n");
+        CHECK(has(cm, "k8s-string-value", 5) && has(cm, "k8s-string-value", 6) && !has(cm, "k8s-string-value", 7));
+        for (const Diag &x : cm) if (x.line == 5 && x.code == "k8s-string-value") CHECK(x.has_fix && x.fix == "\"8080\"");
+        auto st = run("f.yaml", "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\nspec:\n  containers: []\nstatus:\n  whatever: 1\n");
+        CHECK(!has(st, "k8s-unknown-field"));
+    }
+    {   // custom resources against their CRD
+        const char *crd = "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n  versions:\n    - name: v1\n      served: true\n      storage: true\n      schema:\n        openAPIV3Schema:\n          type: object\n          properties:\n            spec:\n              type: object\n              required: [size]\n              properties:\n                size:\n                  type: integer\n                color:\n                  type: string\n                  enum: [red, blue]\n                tags:\n                  type: array\n                  items:\n                    type: string\n";
+        std::string path = "/tmp/hootedit_lint_test/widget_crd.yaml";
+        FILE *f = fopen(path.c_str(), "w");
+        if (f) { fputs(crd, f); fclose(f); }
+        lint_crd_reset();
+        auto before = run("w.yaml", "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\nspec:\n  sise: 3\n");
+        CHECK(!has(before, "k8s-unknown-field") && lint_crd_wanted());   /* no CRD known yet: nothing to check against, and the editor is asked to scan */
+        lint_crd_build({path});
+        auto d = run("w.yaml", "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\nspec:\n  sise: 3\n  color: green\n  tags: one\n");
+        CHECK(has(d, "k8s-unknown-field", 5) && has(d, "k8s-required", 4) && has(d, "k8s-enum", 6) && has(d, "k8s-wrong-type", 7));
+        auto ok = run("w2.yaml", "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\nspec:\n  size: 3\n  color: red\n  tags: [a, b]\n");
+        CHECK(!has(ok, "k8s-unknown-field") && !has(ok, "k8s-required") && !has(ok, "k8s-enum") && !has(ok, "k8s-wrong-type"));
+        auto badmeta = run("w3.yaml", "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  nme: w\nspec:\n  size: 3\n");
+        CHECK(has(badmeta, "k8s-unknown-field", 3));   /* the CRD's metadata is the core ObjectMeta */
+        lint_crd_reset();
+        unlink(path.c_str());
+    }
+    {   // Helm templates: actions are blanked, typos are still found, what a template can fill in is not demanded
+        auto d = run("chart/templates/deploy.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ include \"x.fullname\" . }}\n  labels:\n    {{- include \"x.labels\" . | nindent 4 }}\nspec:\n  replica: {{ .Values.replicaCount }}\n  {{- if .Values.autoscaling }}\n  {{- end }}\n  template:\n    spec:\n      containers:\n        - name: web\n          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n          resources:\n            {{- toYaml .Values.resources | nindent 12 }}\n          portz: 1\n");
+        CHECK(has(d, "k8s-unknown-field", 7) && has(d, "k8s-unknown-field", 17));
+        CHECK(!has(d, "k8s-required") && !has(d, "k8s-no-resources") && !has(d, "k8s-image-untagged") && !has(d, "duplicate-key") && !has(d, "k8s-name"));
+        CHECK(run("chart/templates/_helpers.yaml", "{{- define \"x\" -}}\nfoo\n{{- end }}\n").empty());
+    }
+    {   // Kustomize and Chart.yaml
+        auto d = run("/tmp/hootedit_lint_test/k/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresourses:\n  - a.yaml\nresources:\n  - missing.yaml\n  - https://example.com/x.yaml\nbases:\n  - ../base\ncommonLabels:\n  app: x\nimages:\n  - newTag: v2\n");
+        CHECK(has(d, "k8s-unknown-field", 2) && has(d, "k8s-kustomize-missing", 5) && has(d, "k8s-deprecated", 7) && has(d, "k8s-deprecated", 9) && has(d, "k8s-required", 12));
+        CHECK(!has(d, "k8s-kustomize-missing", 6));
+        auto c = run("chart/Chart.yaml", "apiVersion: v1\nversion: 1.0\nappVersion: 1.2\ndescripton: x\n");
+        CHECK(has(c, "k8s-required", 0) && has(c, "helm-version", 1) && has(c, "k8s-unknown-field", 3) && has(c, "helm-api-v1", 0));
+        CHECK(!has(run("chart/Chart.yaml", "apiVersion: v2\nname: x\nversion: 1.2.3\nappVersion: \"1.2\"\ndependencies:\n  - name: pg\n    version: 12.0.0\n    repository: https://charts.example.com\n"), "k8s-required"));
     }
     {   // the skeletons we hand out must pass our own checks
         for (const AnsibleTemplate &tp : ansible_templates()) {

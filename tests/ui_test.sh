@@ -198,5 +198,14 @@ run "wait:~300;wait:~1800;dump" hot.txt
 has "a file created by another program shows in the Explorer" "row: zz_created_later.txt"
 rm -f "$T/ws/zz_created_later.txt"
 
+# ---- custom resources are checked against the CRD in the workspace ----
+printf 'apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n  versions:\n    - name: v1\n      served: true\n      storage: true\n      schema:\n        openAPIV3Schema:\n          type: object\n          properties:\n            spec:\n              type: object\n              properties:\n                size:\n                  type: integer\n' > "$T/ws/widget-crd.yaml"
+printf 'apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\nspec:\n  sise: 3\n' > "$T/ws/widget.yaml"
+run "dump;wait:~1500;dump" widget.yaml
+has "a custom resource is checked against its CRD after the scan" "k8s-unknown-field Unknown field 'sise'"
+printf 'apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\nspec:\n  replica: 2\n' > "$T/ws/typo.yaml"
+run "dump" typo.yaml
+has "a misspelt field name is caught from the API tables" "Did you mean 'replicas'?"
+
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]

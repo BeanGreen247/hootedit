@@ -144,9 +144,23 @@ inline void parse_yline(sv line, YLine &y) {
 
 
 
+inline int lev(sv a, sv b) {   /* edit distance, small strings */
+    if (a.size() > 40 || b.size() > 40) return 99;
+    std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); j++) prev[j] = (int)j;
+    for (size_t i = 1; i <= a.size(); i++) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= b.size(); j++) cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1])});
+        prev.swap(cur);
+    }
+    return prev[b.size()];
+}
+
 /* passes in other files */
 bool k8s_detect(sv text, const std::string &path);
-void k8s_pass(Ctx &c, sv text);
+void k8s_pass(Ctx &c, sv text, sv orig, bool helm);
+std::string helm_neutralize(sv text);
+void k8s_special(Ctx &c, sv text, const std::string &path);   /* kustomization.yaml, Chart.yaml */
 void toml_check(Ctx &c, sv text);
 void xml_check(Ctx &c, sv text);
 void markdown_check(Ctx &c, sv text, const std::string &path);
