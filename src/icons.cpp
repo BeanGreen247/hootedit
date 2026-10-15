@@ -67,6 +67,12 @@ bool inside(Icon ic, float x, float y) {
     case IC_OPEN_FILE:   /* a sheet with a small arrow leaving it */
         return seg(x, y, 3.5f, 1.5f, 8.5f, 1.5f, 0.7f) || seg(x, y, 3.5f, 1.5f, 3.5f, 14.5f, 0.7f) || seg(x, y, 3.5f, 14.5f, 12.5f, 14.5f, 0.7f) || seg(x, y, 12.5f, 14.5f, 12.5f, 10, 0.7f) ||
                seg(x, y, 7, 9, 13.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 9.5f, 2.5f, 0.75f) || seg(x, y, 13.5f, 2.5f, 13.5f, 6.5f, 0.75f);
+    case IC_GEAR: {   /* a ring with eight teeth: settings */
+        float dx = x - 8, dy = y - 8, r = sqrtf(dx * dx + dy * dy), a = atan2f(dy, dx);
+        if (ring(x, y, 8, 8, 4.4f, 1.7f)) return true;
+        float t = fabsf(sinf(a * 4.f));   /* eight lobes */
+        return r > 5.2f && r < 7.6f && t > 0.55f;
+    }
     case IC_UNDO: {   /* an arc swinging back to an arrow head at the left: discard changes */
         float dx = x - 8.5f, dy = y - 9.5f, a = atan2f(dy, dx);
         bool gap = a > 1.5f && a < 2.9f;

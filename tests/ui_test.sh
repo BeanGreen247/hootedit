@@ -215,5 +215,8 @@ has "Enter on a setting toggles it and the page stays" "settings: open=1"
 run "ctrl+,;dump" typo.yaml
 has "Ctrl+, opens the Settings page" "settings: open=1"
 
+run "wait:200;mouse:5,5;click:14,725;mouse:5,5;dump" typo.yaml
+has "the cog at the foot of the sidebar rail opens Settings" "settings: open=1"
+
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]

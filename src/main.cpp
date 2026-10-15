@@ -213,7 +213,7 @@ const std::vector<Menu> MENUS = {
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL, H_SETCOG };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX, M_SETTINGS };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -3664,6 +3664,15 @@ void draw_sidebar(const Layout &L) {
         ty += th + (float)S(2);
     }
 
+    {   /* the settings cog at the foot of the rail, like VS Code's manage icon */
+        float gs = (float)S(18), gy = bot - gs - (float)S(12), gx = (rail - gs) / 2;
+        bool on = E.mode == M_SETTINGS;
+        if (on) r_rect(E.r, 0, gy - (float)S(6), rail, gs + (float)S(12), C_SELROW);
+        else if (hovered(H_SETCOG, 0)) r_rect(E.r, 0, gy - (float)S(6), rail, gs + (float)S(12), C_HOVER);
+        draw_icon(IC_GEAR, gx, gy, S(18), on ? C_ACCENT : C_UI_DIM);
+        hit(0, gy - (float)S(6), rail, gs + (float)S(12), H_SETCOG, 0);
+    }
+
     /* content: filter box with a "+" and the grouped list */
     float cx = rail + (float)S(10), cw = sw - cx - (float)S(10);
     float y = top + (float)S(8);
@@ -4866,26 +4875,26 @@ void set_move(int dir) {
 }
 
 void draw_settings(const Layout &L) {
-    float top = (float)L.menu_h, bot = (float)L.bar_y, W = (float)E.W;
+    float top = (float)L.menu_h, bot = (float)L.bar_y, W = (float)E.W, ox = (float)L.side_w;   /* a docked sidebar stays visible, with its cog */
     set_rebuild();
-    r_rect(E.r, 0, top, W, bot - top, C_EDITOR);
-    float lw = (float)S(210);
-    r_rect(E.r, 0, top, lw, bot - top, C_CHROME);
+    r_rect(E.r, ox, top, W - ox, bot - top, C_EDITOR);
+    float lw = ox + (float)S(210);
+    r_rect(E.r, ox, top, lw - ox, bot - top, C_CHROME);
     r_rect(E.r, lw, top, 1, bot - top, C_BORDER);
-    hit(0, top, W, bot - top, H_SIDEBAR, 0);   /* swallows clicks that miss every control */
-    draw_text(E.ui, (float)S(18), ui_base(top + (float)S(14), (float)S(28)), "Settings", C_UI, lw - (float)S(30), FS_BOLD);
+    hit(ox, top, W - ox, bot - top, H_SIDEBAR, 0);   /* swallows clicks that miss every control */
+    draw_text(E.ui, ox + (float)S(18), ui_base(top + (float)S(14), (float)S(28)), "Settings", C_UI, lw - (float)S(30), FS_BOLD);
     float y = top + (float)S(54), ch = (float)S(32);
     const std::vector<SetItem> &items = set_items();
     for (size_t c = 0; c < sizeof SET_CATS / sizeof *SET_CATS; c++) {
         int count = 0;
         for (const SetItem &it : items) if (strcmp(it.cat, SET_CATS[c]) == 0) count++;
         bool on = g_set.q.empty() && (int)c == g_set.cat;
-        if (on) { r_rect(E.r, 0, y, lw, ch, C_SELROW); r_rect(E.r, 0, y, (float)S(2), ch, C_ACCENT); }
-        else if (hovered(H_SETCAT, (int)c)) r_rect(E.r, 0, y, lw, ch, C_HOVER);
-        draw_text(E.ui, (float)S(18), ui_base(y, ch), SET_CATS[c], on ? C_ACCENT : g_set.q.empty() ? C_UI : C_UI_DIM, lw - (float)S(60));
+        if (on) { r_rect(E.r, ox, y, lw - ox, ch, C_SELROW); r_rect(E.r, ox, y, (float)S(2), ch, C_ACCENT); }
+        else if (hovered(H_SETCAT, (int)c)) r_rect(E.r, ox, y, lw - ox, ch, C_HOVER);
+        draw_text(E.ui, ox + (float)S(18), ui_base(y, ch), SET_CATS[c], on ? C_ACCENT : g_set.q.empty() ? C_UI : C_UI_DIM, lw - ox - (float)S(60));
         std::string cs = std::to_string(count);
         draw_text(E.ui, lw - (float)S(16) - text_width(E.ui, cs.c_str()), ui_base(y, ch), cs.c_str(), C_UI_FAINT, (float)S(30));
-        hit(0, y, lw, ch, H_SETCAT, (int)c);
+        hit(ox, y, lw - ox, ch, H_SETCAT, (int)c);
         y += ch;
     }
     // the search box
@@ -7030,7 +7039,8 @@ void click_hit(const Hit &h) {
         else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2 && E.preview_tabs); }
         break;
     }
-    case H_ACTIVITY: show_view((View)h.id); break;
+    case H_SETCOG: if (E.mode == M_SETTINGS) set_close(); else set_open(); break;
+    case H_ACTIVITY: set_close(); show_view((View)h.id); break;
     case H_PIN: do_action(A_PIN); break;
     case H_GITROW: case H_GITOPEN: case H_GITSTG: {
         size_t idx = (size_t)(h.id / 2);

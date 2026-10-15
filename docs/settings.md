@@ -1,6 +1,6 @@
 # Settings
 
-File > Settings (Ctrl+, , or "Open Settings" in the command palette) opens one page for everything that can be changed. Categories are on the left, a search box on top (type `vim`, `git`, `theme`; every word must match the name or the description), Up/Down move, Enter or Space changes the setting, Left/Right switch category, Esc clears the search and then closes the page. Everything is stored in `settings.ini` and applies at once.
+The cog at the foot of the sidebar rail (like VS Code), File > Settings, Ctrl+, (or "Open Settings" in the command palette) all open one page for everything that can be changed. Categories are on the left, a search box on top (type `vim`, `git`, `theme`; every word must match the name or the description), Up/Down move, Enter or Space changes the setting, Left/Right switch category, Esc clears the search and then closes the page. Everything is stored in `settings.ini` and applies at once.
 
 | category | settings |
 |---|---|
