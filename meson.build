@@ -22,7 +22,7 @@ lestrix = files('src/lestrix/vt.cpp', 'src/lestrix/lz.cpp', 'src/lestrix/pty.cpp
 inc = include_directories('src/engine')
 # Lestrix itself is built with exceptions on (fleetwm.cpp uses try/catch); Hootedit's own code is built without.
 lestrix_lib = static_library('lestrix_vendored', lestrix, include_directories: inc, cpp_args: ['-fexceptions'], dependencies: deps)
-hootedit_exe = executable('hootedit', files('src/main.cpp', 'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/icons.cpp', 'src/tree.cpp', 'src/git.cpp', 'src/askpass.cpp', 'src/remote.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/search.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/benchcore.cpp') + engine,
+hootedit_exe = executable('hootedit', files('src/main.cpp', 'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/icons.cpp', 'src/tree.cpp', 'src/git.cpp', 'src/askpass.cpp', 'src/remote.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/search.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/benchcore.cpp', 'src/lint.cpp') + engine,
            include_directories: inc, link_with: lestrix_lib, dependencies: deps + [cxx.find_library('util', required: false)], install: true)
 
 install_data('data/hootedit.png', install_dir: get_option('datadir') / 'icons' / 'hicolor' / '256x256' / 'apps')
@@ -71,3 +71,7 @@ bash = find_program('bash', required: false)
 if bash.found()
   test('ui scenarios', bash, args: [files('tests/ui_test.sh'), hootedit_exe], suite: 'ui', timeout: 180)
 endif
+
+test_lint = executable('test_lint', files('tests/test_lint.cpp', 'src/lint.cpp', 'src/syntax.cpp'),
+  override_options: ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug'])
+test('lint rules', test_lint)

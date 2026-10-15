@@ -16,6 +16,7 @@
 
 #include "doc.h"
 #include "fuzzy.h"
+#include "lint.h"
 #include "outline.h"
 #include "regex.h"
 #include "search.h"
@@ -25,8 +26,8 @@ double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.
 }  // namespace
 
 int bench_core(const char *file, int reps, const char *dir) {
-    enum { OPEN, LEX, SCAN_LIT, SCAN_RX, FUZZY, OUTLINE, EDIT, UNDO, SEARCH, N };
-    const char *names[N] = {"open", "lex", "scan-literal", "scan-regex", "fuzzy", "outline", "edits", "undo", "dir-search"};
+    enum { OPEN, LEX, SCAN_LIT, SCAN_RX, FUZZY, OUTLINE, LINT, EDIT, UNDO, SEARCH, N };
+    const char *names[N] = {"open", "lex", "scan-literal", "scan-regex", "fuzzy", "outline", "lint", "edits", "undo", "dir-search"};
     double best[N];
     for (double &b : best) b = 1e9;
     unsigned long long sink = 0;
@@ -90,6 +91,16 @@ int bench_core(const char *file, int reps, const char *dir) {
         t0 = now();
         { std::vector<OItem> o; outline_scan(d, o); sink += o.size(); }
         t[OUTLINE] = now() - t0;
+
+        t0 = now();
+        {
+            LintInput li;
+            li.text = fb; li.n = fn; li.lang = d.lang; li.path = file;
+            std::vector<Diag> dg;
+            lint_run(li, dg);
+            sink += dg.size();
+        }
+        t[LINT] = now() - t0;
 
         t0 = now();
         {

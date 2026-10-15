@@ -130,5 +130,33 @@ ok "quick open is the quick mode" "mode: 6"
 run "ctrl+p;text:new;return;dump" a.txt
 has "quick open Enter opens the file" "tab 1: new.txt preview=0"
 
+# ---- live checks: Ansible rules, fixes, next problem, noqa, toggle ----
+mkdir -p "$T/ws/role/tasks"
+printf -- '- name: A\n  file:\n    path: /x\n    mode: 644\n- name: B\n  shell: ls  # noqa\n' > "$T/ws/role/tasks/main.yml"
+run "dump" role/tasks/main.yml
+has "ansible fqcn rule" "diag: 2:3 warning fqcn[action-core]"
+has "octal rule" "diag: 4:11 warning risky-octal"
+hasnot "noqa silences the line" "diag: 6:"
+run "act:fixall;dump" role/tasks/main.yml
+has "fix all rewrites the module name" "text: - name: A\\n  ansible.builtin.file:\\n    path: /x\\n    mode: \"0644\"\\n"
+run "act:next_problem;act:quickfix;dump" role/tasks/main.yml
+has "quick fix applies the fix at the cursor" "ansible.builtin.file:"
+run "act:next_problem;dump" role/tasks/main.yml
+ok "next problem moves the cursor to the first one" "cursor: 2,3"
+run "act:lint;dump" role/tasks/main.yml
+hasnot "live checks can be turned off" "diag:"
+printf 'int main(void) {\n    char b[4];\n    gets(b);\n    if (b[0] = 1) return 0;\n' > "$T/ws/bad.c"
+run "dump" bad.c
+has "C: gets" "diag: 3:5 error c-gets"
+has "C: assignment in condition" "c-assign-in-condition"
+has "C: unclosed brace" "bracket Unclosed '{'"
+printf '#!/bin/bash\necho a\ncd /tmp\nrm -rf $DIR/x\necho b\necho c\n' > "$T/ws/bad.sh"
+run "dump" bad.sh
+has "shell: rm -rf with a variable" "rm-rf-variable"
+has "shell: no set -e" "shell-no-set-e"
+printf '{"a": [1, 2,]}\n' > "$T/ws/bad.json"
+run "dump" bad.json
+has "JSON syntax error" "json-syntax"
+
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]

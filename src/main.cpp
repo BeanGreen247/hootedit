@@ -51,6 +51,7 @@
 #include "tree.h"
 #include "vim.h"
 #include "benchcore.h"
+#include "lint.h"
 #include "outline.h"
 
 static Uint32 g_ev_wake;
@@ -184,14 +185,14 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
@@ -202,7 +203,7 @@ const std::vector<Menu> MENUS = {
               {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
-              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Outline (Files tab)", "", A_OUTLINE}, {"Vim Keys", "", A_VIM}, {"Live Checks", "", A_LINT}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
     {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
                   {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
     {"Help", {{"Keyboard Shortcuts", "Ctrl+K Ctrl+H", A_SHORTCUTS}, {"", "", A_NONE}, {"About Hootedit", "", A_ABOUT}}},
@@ -367,7 +368,9 @@ struct Ed {
     View view = V_EXPLORER;
     bool pinned = true, side_open = true, root_open = true, opened_open = true, outline_open = true;
     std::unordered_map<std::string, char> deco;        /* absolute path -> git status letter, for file and folder rows in the Explorer */
-    bool outline_on = false;                           /* Explorer shows the symbols of the active file (View > Outline, off by default) */
+    bool outline_on = false;
+    bool lint_on = true;                               /* live checks (src/lint.cpp), View > Live Checks */
+    double lint_at = 0;                                /* when a pending re-check is due */                           /* Explorer shows the symbols of the active file (View > Outline, off by default) */
     bool vim_on = false;                               /* modal editing */
     double side_close_at = 0;
     float side_scroll = 0;
@@ -535,6 +538,7 @@ void settings_load() {
         else if (!strcmp(line, "git_smart_commit")) E.g.smart_commit = atoi(v);
         else if (!strcmp(line, "git_sync_confirm")) E.g.sync_confirm = atoi(v) != 0;
         else if (!strcmp(line, "outline")) E.outline_on = atoi(v) != 0;
+        else if (!strcmp(line, "lint")) E.lint_on = atoi(v) != 0;
         else if (!strcmp(line, "vim_keys")) E.vim_on = atoi(v) != 0;
         else if (!strcmp(line, "git_tree")) E.g.tree_view = atoi(v) != 0;
         else if (!strcmp(line, "panel_height")) E.panel_logical = std::max(80, std::min(1200, atoi(v)));
@@ -551,7 +555,7 @@ void settings_save() {
     FILE *f = fopen(p.c_str(), "w");
     if (!f) return;
     fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : E.view == V_REMOTE ? "remote" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
-    fprintf(f, "outline=%d\nvim_keys=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0);
+    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0);
     fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0);
     fclose(f);
 }
@@ -580,8 +584,11 @@ void set_active(int i) {
     redraw();
 }
 
+void lint_forget(const Doc *d);
+
 void remove_doc(int i) {
     g_gutter.erase(E.docs[(size_t)i].get());
+    lint_forget(E.docs[(size_t)i].get());
     if (!E.docs[(size_t)i]->path.empty()) { E.closed_tabs.push_back(E.docs[(size_t)i]->path); if (E.closed_tabs.size() > 30) E.closed_tabs.erase(E.closed_tabs.begin()); }
     E.docs.erase(E.docs.begin() + i);
     if (E.docs.empty()) { new_doc(); E.blank_tab = false; }   /* the last tab is gone: back to the start screen */
@@ -3128,6 +3135,254 @@ void draw_remote_view(float rail, float sw, float cx, float cw, float list_top, 
     ry += rowh * 2;
 }
 
+
+/* ---- live checks: src/lint.cpp results per document, refreshed when the text has been still for a moment ---- */
+
+struct LintJob {
+    std::string text, path;
+    const Lang *lang = nullptr;
+    uint64_t rev = 0;
+    std::vector<Diag> out;
+    std::atomic<bool> done{false};
+};
+
+struct LintState {
+    uint64_t rev = ~0ull;                 /* the revision the diagnostics belong to */
+    std::vector<Diag> d;
+    std::shared_ptr<LintJob> job;         /* a check of a big file runs on a thread */
+    int counts[4] = {0, 0, 0, 0};
+    bool skipped = false;
+};
+
+std::unordered_map<const Doc *, LintState> g_lint;
+void lint_forget(const Doc *d) { g_lint.erase(d); }
+
+void lint_count(LintState &st) { for (int &c : st.counts) c = 0; for (const Diag &x : st.d) if (x.sev < 4) st.counts[x.sev]++; }
+
+const LintState *lint_state(const Doc &d) { auto it = g_lint.find(&d); return it == g_lint.end() ? nullptr : &it->second; }
+
+void lint_kick(Doc &d, bool force_sync) {
+    if (!E.lint_on || d.dv || d.mv) return;
+    LintState &st = g_lint[&d];
+    uint64_t rev = d.buf.revision();
+    if (st.rev == rev) return;
+    st.skipped = false;
+    size_t n;
+    const char *fb = d.buf.flat(&n);
+    if (n > (24u << 20)) { st.d.clear(); st.rev = rev; st.skipped = true; lint_count(st); redraw(); return; }
+    LintInput in;
+    in.text = fb; in.n = n; in.lang = d.lang; in.path = d.path;
+    if (n <= (192u << 10) || force_sync) {   /* small files: about 2 ms, done in the idle gap; bigger ones on a thread */
+        double t0 = now_s();
+        lint_run(in, st.d);
+        st.rev = rev;
+        lint_count(st);
+        record_op("live checks", (now_s() - t0) * 1000.0);
+        redraw();
+        return;
+    }
+    if (st.job && !st.job->done) return;   /* one at a time; the next tick starts a fresh one */
+    auto job = std::make_shared<LintJob>();
+    job->text.assign(fb, n);
+    job->path = d.path; job->lang = d.lang; job->rev = rev;
+    st.job = job;
+    std::thread([job] {
+        LintInput li;
+        li.text = job->text.data(); li.n = job->text.size(); li.lang = job->lang; li.path = job->path;
+        lint_run(li, job->out);
+        job->done = true;
+    }).detach();
+}
+
+/* once per loop iteration: take finished background checks, start the one that is due */
+void lint_tick() {
+    if (!E.lint_on || E.docs.empty()) return;
+    Doc &d = D();
+    auto it = g_lint.find(&d);
+    if (it != g_lint.end() && it->second.job && it->second.job->done) {
+        LintState &st = it->second;
+        if (st.job->rev == d.buf.revision()) { st.d = std::move(st.job->out); st.rev = st.job->rev; lint_count(st); redraw(); }
+        st.job.reset();
+    }
+    if (d.dv || d.mv) return;
+    LintState &st = g_lint[&d];
+    if (st.rev == d.buf.revision()) { E.lint_at = 0; return; }
+    if (st.job && !st.job->done) { E.lint_at = E.now + 0.1; return; }
+    double due = std::max(E.last_active, 0.0) + (st.rev == ~0ull ? 0.0 : 0.35);   /* the first check of a file does not wait; later ones wait for a pause in typing */
+    if (E.now >= due) { E.lint_at = 0; lint_kick(d, false); }
+    else E.lint_at = due;
+}
+
+/* the diagnostics of a line: [first, last) indices in the sorted vector */
+std::pair<size_t, size_t> lint_line_range(const std::vector<Diag> &v, size_t line) {
+    size_t lo = 0, hi = v.size();
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (v[mid].line < line) lo = mid + 1; else hi = mid; }
+    size_t e = lo;
+    while (e < v.size() && v[e].line == line) e++;
+    return {lo, e};
+}
+
+uint32_t lint_color(int sev) { return sev == SEV_ERROR ? C_RED : sev == SEV_WARN ? C_ORANGE : sev == SEV_INFO ? C_ACCENT : C_UI_FAINT; }
+const char *lint_sev_name(int sev) { return sev == SEV_ERROR ? "error" : sev == SEV_WARN ? "warning" : sev == SEV_INFO ? "info" : "hint"; }
+
+void lint_squiggle(float x, float y, float w, uint32_t col) {
+    float step = std::max(2.f, 2.f * E.scale), th = std::max(1.f, E.scale);
+    int n = 0;
+    for (float px = x; px < x + w && n < 400; px += step, n++) r_rect(E.r, px, y + ((n & 1) ? 0.f : th), std::min(step, x + w - px), th, col);
+}
+
+const Diag *lint_at_cursor(Doc &d, LintState **stp = nullptr) {
+    if (!E.lint_on || d.dv || d.mv) return nullptr;
+    auto it = g_lint.find(&d);
+    if (it == g_lint.end()) return nullptr;
+    LintState &st = it->second;
+    if (st.rev != d.buf.revision() || st.d.empty()) return nullptr;
+    size_t line = d.buf.line_of(d.cur), col = d.cur - d.buf.line_start(line);
+    auto r = lint_line_range(st.d, line);
+    const Diag *best = nullptr;
+    for (size_t i = r.first; i < r.second; i++) {
+        const Diag &x = st.d[i];
+        if (col >= x.c0 && col <= x.c1) { if (!best || x.sev < best->sev) best = &x; }
+    }
+    if (!best && r.first < r.second) best = &st.d[r.first];
+    if (stp) *stp = &st;
+    return best;
+}
+
+void lint_jump(Doc &d, const Diag &x) {
+    size_t line = std::min<size_t>(x.line, d.buf.lines() - 1);
+    size_t pos = std::min(d.buf.line_start(line) + x.c0, d.buf.line_start(line) + d.buf.line_len(line));
+    d.break_group();
+    d.anchor = d.cur = pos;
+    d.want_col = d.col_of_byte(line, pos - d.buf.line_start(line));
+    E.follow = true;
+}
+
+void lint_next(int dir) {
+    Doc &d = D();
+    lint_kick(d, true);
+    const LintState *st = lint_state(d);
+    if (!st || st->d.empty()) { E.status_msg = "no problems"; return; }
+    size_t line = d.buf.line_of(d.cur), col = d.cur - d.buf.line_start(line);
+    const Diag *pick = nullptr;
+    if (dir > 0) { for (const Diag &x : st->d) if (x.line > line || (x.line == line && x.c0 > col)) { pick = &x; break; } if (!pick) pick = &st->d.front(); }
+    else { for (size_t i = st->d.size(); i-- > 0;) { const Diag &x = st->d[i]; if (x.line < line || (x.line == line && x.c0 < col)) { pick = &x; break; } } if (!pick) pick = &st->d.back(); }
+    lint_jump(d, *pick);
+    E.status_msg.clear();
+}
+
+void lint_problems_list() {
+    Doc &d = D();
+    lint_kick(d, true);
+    const LintState *st = lint_state(d);
+    if (!st || st->d.empty()) { E.status_msg = st && st->skipped ? "live checks are off for files over 24 MB" : "no problems found"; return; }
+    std::vector<Ed::PItem> items;
+    for (size_t i = 0; i < st->d.size() && i < 2000; i++) {
+        const Diag &x = st->d[i];
+        items.push_back({sfmt("%u:%u  %s  %s  %s", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str()), (int)i, false});
+    }
+    auto copy = std::make_shared<std::vector<Diag>>(st->d);
+    pick_custom("Problems (" + std::to_string(st->d.size()) + ")", items, [copy](const Ed::PItem &it) {
+        if ((size_t)it.id < copy->size()) { E.mode = M_EDIT; lint_jump(D(), (*copy)[(size_t)it.id]); }
+    });
+}
+
+/* fixes: replace bytes inside one line; many at once go bottom-up as one undo step */
+void lint_apply_fix(Doc &d, const Diag &x) {
+    size_t line = std::min<size_t>(x.line, d.buf.lines() - 1), ls0 = d.buf.line_start(line), len = d.buf.line_len(line);
+    size_t f0 = std::min<size_t>(x.f0, len), f1 = std::min<size_t>(x.f1, len);
+    d.replace(ls0 + f0, f1 - f0, x.fix.data(), x.fix.size());
+}
+
+void lint_quick_fix() {
+    Doc &d = D();
+    if (d.dv || d.mv) return;
+    lint_kick(d, true);
+    LintState *st = nullptr;
+    const Diag *x = lint_at_cursor(d, &st);
+    if (!x) { E.status_msg = "no problem at the cursor"; return; }
+    const Diag *with_fix = nullptr;
+    size_t line = d.buf.line_of(d.cur), col = d.cur - d.buf.line_start(line);
+    auto r = lint_line_range(st->d, line);
+    for (size_t i = r.first; i < r.second; i++) { const Diag &y = st->d[i]; if (y.has_fix && col >= y.c0 && col <= y.c1) { with_fix = &y; break; } }
+    if (!with_fix) for (size_t i = r.first; i < r.second; i++) if (st->d[i].has_fix) { with_fix = &st->d[i]; break; }
+    if (!with_fix) { E.status_msg = "no automatic fix for: " + x->msg; return; }
+    Diag copy = *with_fix;
+    d.break_group();
+    lint_apply_fix(d, copy);
+    d.break_group();
+    st->rev = ~0ull;
+    E.status_msg = "fixed: " + copy.code;
+    E.follow = true;
+}
+
+void lint_fix_all() {
+    Doc &d = D();
+    if (d.dv || d.mv) return;
+    lint_kick(d, true);
+    LintState *st = nullptr;
+    auto it = g_lint.find(&d);
+    if (it == g_lint.end()) return;
+    st = &it->second;
+    std::vector<Diag> fixes;
+    for (const Diag &x : st->d) if (x.has_fix) fixes.push_back(x);
+    if (fixes.empty()) { E.status_msg = "nothing to fix automatically"; return; }
+    std::sort(fixes.begin(), fixes.end(), [](const Diag &a, const Diag &b) { return a.line != b.line ? a.line > b.line : a.f0 > b.f0; });
+    size_t cur = d.cur, applied = 0;
+    d.break_group();
+    uint32_t last_line = ~0u, last_f0 = ~0u;
+    for (const Diag &x : fixes) {
+        if (x.line == last_line && x.f1 > last_f0) continue;   /* overlaps the fix to its right */
+        lint_apply_fix(d, x);
+        last_line = x.line; last_f0 = x.f0;
+        applied++;
+    }
+    d.break_group();
+    d.anchor = d.cur = std::min(cur, d.buf.size());
+    st->rev = ~0ull;
+    E.status_msg = sfmt("applied %zu fix%s", applied, applied == 1 ? "" : "es");
+}
+
+void ansible_insert_task() {
+    std::vector<Ed::PItem> items;
+    const auto &tp = ansible_templates();
+    for (size_t i = 0; i < tp.size(); i++) items.push_back({tp[i].label, (int)i, false});
+    pick_custom("Ansible: Insert Task", items, [](const Ed::PItem &it) {
+        const auto &tpl = ansible_templates();
+        if ((size_t)it.id >= tpl.size()) return;
+        E.mode = M_EDIT;
+        Doc &d = D();
+        size_t line = d.buf.line_of(d.cur), ls0 = d.buf.line_start(line);
+        std::string cur_line;
+        d.buf.line_text(line, cur_line);
+        bool blank = cur_line.find_first_not_of(" \t") == std::string::npos;
+        std::string indent = cur_line.substr(0, cur_line.find_first_not_of(" \t") == std::string::npos ? cur_line.size() : cur_line.find_first_not_of(" \t"));
+        if (!blank) {   /* a task below the current one: same indentation as the current list item */
+            size_t dash = cur_line.find("- ");
+            if (dash != std::string::npos && dash == indent.size()) indent = cur_line.substr(0, dash);
+        }
+        std::string text, src = tpl[(size_t)it.id].text;
+        size_t pos = 0;
+        bool first = true;
+        while (pos < src.size()) {
+            size_t nl = src.find('\n', pos);
+            std::string ln = src.substr(pos, nl - pos);
+            text += (first && blank ? std::string() : indent) + ln + "\n";
+            first = false;
+            pos = nl + 1;
+        }
+        size_t at = blank ? ls0 + indent.size() : d.buf.line_start(line) + cur_line.size();
+        if (!blank) { text = "\n" + text.substr(0, text.size() - 1); }
+        if (blank) text = text;   /* inserted at the cursor line start after its indentation */
+        d.break_group();
+        d.replace(at, 0, text.data(), text.size());
+        d.break_group();
+        if (!blank) d.anchor = d.cur = d.buf.line_start(std::min(line + 1, d.buf.lines() - 1)) + indent.size() + 8;
+        E.follow = true;
+        touch();
+    });
+}
+
 /* ---- outline: a cheap symbol scan of the active file (no parser): types, functions, markdown headings ---- */
 
 struct OutlineCache { const Doc *d = nullptr; uint64_t rev = 0; std::vector<OItem> items; } g_outline;
@@ -4423,6 +4678,20 @@ void build_frame() {
                     if (c1 > c0) r_rect(E.r, (float)(L.text_x + c0 * E.cw), ry, (float)((c1 - c0) * E.cw), (float)E.rowh, C_SEL);
                 }
             }
+            if (E.lint_on && !d.dv && !d.mv) {   /* wavy underline under every problem on this row */
+                auto lit = g_lint.find(&d);
+                if (lit != g_lint.end() && lit->second.rev == d.buf.revision() && !lit->second.d.empty()) {
+                    auto r = lint_line_range(lit->second.d, line);
+                    for (size_t k = r.first; k < r.second; k++) {
+                        const Diag &dg = lit->second.d[k];
+                        size_t b0 = std::min<size_t>(dg.c0, tt.size()), b1 = std::min<size_t>(dg.c1, tt.size());
+                        int c0 = col_of(tt, b0) - d.left, c1 = col_of(tt, b1) - d.left;
+                        if (dg.c1 > tt.size()) c1 = col_of(tt, tt.size()) - d.left + 1;
+                        c0 = std::max(c0, 0); c1 = std::min(c1, L.cols);
+                        if (c1 > c0) lint_squiggle((float)(L.text_x + c0 * E.cw), ry + (float)E.rowh - std::max(2.f, 2.f * E.scale), (float)((c1 - c0) * E.cw), lint_color(dg.sev));
+                    }
+                }
+            }
             if (vim_active() && g_vim.mode == Vim::VBLOCK) {   /* the Ctrl+V block: one rectangle per line */
                 size_t bl0, bl1;
                 int bc0, bc1;
@@ -4464,6 +4733,22 @@ void build_frame() {
             float colw = (float)(L.text_x - L.ed_x - S(18));   /* the number column: the gutter without the space before the text */
             float x = (float)L.ed_x + (colw - (float)(strlen(num) * (size_t)E.cw)) / 2;   /* centered, so 1, 42 and 1337 share one axis */
             draw_text(E.font, x, (float)(L.text_y + row * E.rowh + E.rowasc), num, line == cl ? C_GUTTER_CUR : C_GUTTER, (float)E.W);
+        }
+        if (E.lint_on && !d.dv && !d.mv) {   /* a thin bar at the far left of every line that has a problem, in the colour of the worst one */
+            auto lit = g_lint.find(&d);
+            if (lit != g_lint.end() && lit->second.rev == d.buf.revision() && !lit->second.d.empty()) {
+                const std::vector<Diag> &dv = lit->second.d;
+                for (int row = 0; row < L.rows; row++) {
+                    size_t line = d.top + (size_t)row;
+                    if (line >= d.buf.lines()) break;
+                    auto r = lint_line_range(dv, line);
+                    if (r.first == r.second) continue;
+                    int worst = SEV_HINT;
+                    for (size_t k = r.first; k < r.second; k++) worst = std::min<int>(worst, dv[k].sev);
+                    if (worst == SEV_HINT) continue;
+                    r_rect(E.r, 1.f, (float)(L.text_y + row * E.rowh + 2), (float)S(3), (float)(E.rowh - 4), lint_color(worst));
+                }
+            }
         }
         if (GutterCache *gc = gutter_for(d)) {   /* change bars: green added, blue changed, a red wedge where lines were removed */
             const std::vector<DiffHunk> &hs = gc->hunks;
@@ -4522,6 +4807,19 @@ void build_frame() {
             draw_text(E.ui, x, sy, items[(size_t)i].c_str(), C_UI_DIM, w + 2);
             rx = x - (float)S(18);
         }
+        if (E.lint_on && !d.dv && !d.mv) {   /* problem counts; a click lists them */
+            const LintState *ls_ = lint_state(d);
+            if (ls_ && ls_->rev == d.buf.revision() && (ls_->counts[SEV_ERROR] || ls_->counts[SEV_WARN])) {
+                std::string pc;
+                if (ls_->counts[SEV_ERROR]) pc += sfmt("%d error%s", ls_->counts[SEV_ERROR], ls_->counts[SEV_ERROR] == 1 ? "" : "s");
+                if (ls_->counts[SEV_WARN]) pc += (pc.empty() ? "" : "  ") + sfmt("%d warning%s", ls_->counts[SEV_WARN], ls_->counts[SEV_WARN] == 1 ? "" : "s");
+                float w = text_width(E.ui, pc.c_str()), x = rx - w;
+                if (hovered(H_ACT, A_PROBLEMS)) r_rect(E.r, x - (float)S(6), by0 + 1, w + (float)S(12), bh - 1, C_HOVER);
+                draw_text(E.ui, x, sy, pc.c_str(), ls_->counts[SEV_ERROR] ? C_RED : C_ORANGE, w + 2);
+                hit(x - (float)S(6), by0, w + (float)S(12), bh, H_ACT, A_PROBLEMS);
+                rx = x - (float)S(18);
+            }
+        }
     }
     {   /* left side: branch, then the Lestrix-style performance segments */
         float lx = (float)S(10);
@@ -4548,7 +4846,9 @@ void build_frame() {
             float vw = draw_text(E.ui, lx, sy, vl.c_str(), g_vim.typing() ? C_GREEN : C_ACCENT, std::max(0.f, rx - lx), FS_BOLD);
             lx = vw + (float)S(14);
         }
-        draw_text(E.ui, lx, sy, left.c_str(), E.status_msg.empty() ? C_UI_FAINT : C_UI_DIM, std::max(0.f, rx - lx));
+        uint32_t left_col = E.status_msg.empty() ? C_UI_FAINT : C_UI_DIM;
+        if (E.status_msg.empty()) if (const Diag *cd = lint_at_cursor(d)) { left = cd->msg + "  [" + cd->code + "]"; left_col = lint_color(cd->sev); }   /* what is wrong where the cursor is */
+        draw_text(E.ui, lx, sy, left.c_str(), left_col, std::max(0.f, rx - lx));
         if (vim_active() && g_vim.cmd_kind) {   /* the vim command line takes over the whole bar, like the last line of the terminal */
             r_rect(E.r, 0, by0, (float)E.W, bh, C_CHROME);
             r_rect(E.r, 0, by0, (float)E.W, 1, C_BORDER);
@@ -4661,7 +4961,7 @@ void build_frame() {
             bool enabled = it.act != A_NONE;
             if (enabled && (int)i == E.menu_sel) r_rect(E.r, x + (float)S(3), y, iw - (float)S(6), ih, C_MENU_SEL);
             uint32_t col = enabled ? C_UI : C_UI_FAINT;
-            draw_text(E.ui, x + (float)S(26), ui_base(y, ih), ((it.act == A_VIM && E.vim_on) || (it.act == A_OUTLINE && E.outline_on) ? std::string("\xE2\x9C\x93 ") + it.label : std::string(it.label)).c_str(), col, iw);
+            draw_text(E.ui, x + (float)S(26), ui_base(y, ih), ((it.act == A_VIM && E.vim_on) || (it.act == A_OUTLINE && E.outline_on) || (it.act == A_LINT && E.lint_on) ? std::string("\xE2\x9C\x93 ") + it.label : std::string(it.label)).c_str(), col, iw);
             float kw = text_width(E.ui, it.keys);
             draw_text(E.ui, x + iw - kw - (float)S(14), ui_base(y, ih), it.keys, C_UI_FAINT, kw + 2);
             if (enabled) hit(x, y, iw, ih, H_MENUITEM, (int)i);
@@ -5707,6 +6007,13 @@ void do_action(int act) {
     case A_PALETTE: command_palette(); break;
     case A_OUTLINE: E.outline_on = !E.outline_on; settings_save(); E.status_msg = E.outline_on ? "outline on (Files tab)" : "outline off"; break;
     case A_SHORTCUTS: show_shortcuts(); break;
+    case A_PROBLEMS: lint_problems_list(); break;
+    case A_NEXT_PROBLEM: lint_next(1); break;
+    case A_PREV_PROBLEM: lint_next(-1); break;
+    case A_QUICKFIX: lint_quick_fix(); break;
+    case A_FIXALL: lint_fix_all(); break;
+    case A_LINT: E.lint_on = !E.lint_on; settings_save(); if (!E.lint_on) g_lint.clear(); E.status_msg = E.lint_on ? "live checks on" : "live checks off"; break;
+    case A_ANSIBLE: ansible_insert_task(); break;
     case A_VIM: E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
     case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
@@ -6044,6 +6351,9 @@ void key_down(const SDL_KeyboardEvent &k) {
     if (ctrl && !shift && sym == SDLK_d) { select_next_occurrence(d); E.follow = true; touch(); return; }
     if (ctrl && shift && sym == SDLK_t) { do_action(A_REOPEN); touch(); return; }
     if (sym == SDLK_TAB && !ctrl && (shift || (d.has_sel() && d.buf.line_of(d.sel_lo()) != d.buf.line_of(d.sel_hi())))) { indent_lines(d, shift); E.follow = true; touch(); return; }
+    if (sym == SDLK_F8 && !ctrl && !alt) { do_action(shift ? A_PREV_PROBLEM : A_NEXT_PROBLEM); touch(); return; }
+    if (ctrl && !shift && sym == SDLK_PERIOD) { do_action(A_QUICKFIX); touch(); return; }
+    if (ctrl && shift && sym == SDLK_m) { do_action(A_PROBLEMS); touch(); return; }
     if (sym == SDLK_F3 && !E.find_q.empty()) { find_from(d.sel_hi()); E.follow = true; touch(); return; }
     switch (sym) {
     case SDLK_LEFT: { d.break_group(); size_t p = d.has_sel() && !shift ? d.sel_lo() : d.prev_char(d.cur); d.move_to(p, shift, false); break; }
@@ -6707,7 +7017,7 @@ void run_script(const char *script) {
             double until = now_s() + atof(step.c_str() + (step[5] == '~' ? 6 : 5)) / 1000.0;
             while (now_s() < until && (E.s_active && !E.sstat.done)) { search_poll(); SDL_Delay(1); }
             while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { git_job_poll(); job_poll(g_rjob); askpass_poll(); tip_poll(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
-            search_poll(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
+            search_poll(); E.now = now_s(); lint_tick(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
             continue;
         }
         E.ev_t0 = now_s();
@@ -6722,6 +7032,8 @@ void run_script(const char *script) {
             printf("text: %s\ncursor: %zu,%zu\nselection: %zu\nstatus: %s\nvim: %s\nfind: %s\nmode: %d\nsidebar: %d view=%d\n", esc(all).c_str(), cl + 1, dd.cur - dd.buf.line_start(cl) + 1, dd.sel_hi() - dd.sel_lo(),
                    E.status_msg.c_str(), vim_active() ? g_vim.label().c_str() : "off", E.find_q.c_str(), (int)E.mode, E.side_open ? 1 : 0, (int)E.view);
             for (const Tree::Row &r : E.tree.rows()) { auto di = E.deco.find(r.path); printf("row: %s depth=%d dir=%d ghost=%d deco=%c\n", r.name.c_str(), r.depth, r.dir ? 1 : 0, r.ghost ? 1 : 0, di == E.deco.end() ? '-' : di->second); }
+            lint_kick(dd, true);
+            if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());
             if (E.outline_on && !dd.dv && !dd.mv) for (const OItem &o : outline_for(dd)) printf("outline: %s line=%zu depth=%d kind=%c\n", o.name.c_str(), o.line + 1, o.depth, o.kind);
             fflush(stdout);
             continue;
@@ -7155,6 +7467,7 @@ int main(int argc, char **argv) {
         if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, E.last_blink + 0.53);
         if (E.side_close_at > 0) due = std::min(due, E.side_close_at);
         if (E.tip_at > 0) due = std::min(due, E.tip_at);
+        if (E.lint_at > 0) due = std::min(due, E.lint_at);
         if (E.follow_fleet && !E.fleet_watch) due = std::min(due, E.next_fleet ? E.next_fleet : E.now + 1.0);
         double left = due - E.now;
         int wait = left < 0.001 ? 1 : left > 5.0 ? 5000 : (int)(left * 1000.0) + 1;
@@ -7164,6 +7477,7 @@ int main(int argc, char **argv) {
         if (g_print_stats) { g_print_stats = 0; fprintf(stderr, "%s\n", cache_stats_text().c_str()); }
         g_wake_pending = 0;
         search_poll();
+        lint_tick();
         git_job_poll();
         job_poll(g_rjob);
         askpass_poll();
