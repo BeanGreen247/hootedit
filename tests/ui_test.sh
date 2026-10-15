@@ -76,6 +76,12 @@ ok "vim search wraps" "cursor: 1,1"
 run "act:vim;text:ihi;escape;text::;text:wq;return;dump" a.txt
 total=$((total + 1)); [ "$(head -c 2 "$T/ws/a.txt")" = "hi" ] || { fails=$((fails + 1)); echo "FAIL: :wq did not write the file"; }
 printf 'one two three\nfour five\nsix\n' > "$T/ws/a.txt"
+run "act:vim;text:G;text:?;text:four;return;dump" a.txt
+ok "vim ? searches backward" "cursor: 2,1"
+run "act:vim;text:j;text:/;text:o;return;text:n;text:N;dump" a.txt
+ok "vim n then N goes back" "cursor: 2,2"
+run "act:vim;text::;text:%s/o/0/g;return;text:u;dump" a.txt
+has "vim :%s is one undo step" "text: one two three\\nfour five\\nsix\\n"
 run "act:vim;text:ysiw);dump" a.txt
 has "vim surround" "text: (one) two three"
 run "act:vim;text:ix;escape;act:vim;text:ix;dump" a.txt

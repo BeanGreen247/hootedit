@@ -27,6 +27,7 @@ bool Buffer::open(const char *path) {
         madvise(m, (size_t)st.st_size, MADV_SEQUENTIAL);
         orig_ = static_cast<const char *>(m);
         orig_len_ = map_len_ = (size_t)st.st_size;
+        flat_rev_ = ~0ull;
         pieces_.push_back({0, 0, orig_len_});
         size_ = orig_len_;
         std::vector<size_t> starts = {0};
@@ -94,6 +95,14 @@ void Buffer::copy(size_t pos, size_t len, std::string &out) const {
     }
 }
 
+const char *Buffer::flat(size_t *n) const {
+    *n = size_;
+    if (size_ == 0) return "";
+    if (pieces_.size() == 1 && !pieces_[0].add && pieces_[0].off == 0 && pieces_[0].len == size_) return orig_;
+    if (flat_rev_ != rev_) { copy(0, size_, flat_); flat_rev_ = rev_; }
+    return flat_.data();
+}
+
 void Buffer::insert(size_t pos, const char *s, size_t n) {
     if (!n) return;
     if (pos > size_) pos = size_;
@@ -132,18 +141,17 @@ void Buffer::erase(size_t pos, size_t n) {
     idx_.shift_from(gone_from, (size_t)0 - n);
 
     size_t in, i = find(pos, &in);
-    size_t left = n;
-    std::vector<Piece> out;
-    for (size_t k = 0; k < i; k++) out.push_back(pieces_[k]);
-    if (in > 0) { Piece h = pieces_[i]; h.len = in; out.push_back(h); }
-    size_t k = i, skip = in;
+    size_t left = n, k = i, skip = in;
+    Piece keep[2];                                              /* what is left of the first and the last piece touched */
+    int nk = 0;
+    if (in > 0) { keep[nk] = pieces_[i]; keep[nk++].len = in; }
     while (k < pieces_.size() && left) {
         size_t avail = pieces_[k].len - skip;
-        if (avail > left) { Piece t = {pieces_[k].add, pieces_[k].off + skip + left, avail - left}; out.push_back(t); left = 0; k++; break; }
+        if (avail > left) { keep[nk++] = {pieces_[k].add, pieces_[k].off + skip + left, avail - left}; left = 0; k++; break; }
         left -= avail; skip = 0; k++;
     }
-    for (; k < pieces_.size(); k++) out.push_back(pieces_[k]);
-    pieces_.swap(out);
+    pieces_.erase(pieces_.begin() + (long)i, pieces_.begin() + (long)k);   /* in place: no copy of the whole piece list per backspace */
+    if (nk) pieces_.insert(pieces_.begin() + (long)i, keep, keep + nk);
     size_ -= n;
     rev_++;
 }

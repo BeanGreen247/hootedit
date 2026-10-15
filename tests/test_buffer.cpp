@@ -14,6 +14,9 @@ static int check(const Buffer &b, const std::string &ref, const char *what, int 
     std::string all;
     b.copy(0, b.size(), all);
     if (all != ref) { printf("FAIL %s step %d: content differs (%zu vs %zu)\n", what, step, all.size(), ref.size()); return 1; }
+    size_t fn;
+    const char *fl = b.flat(&fn);
+    if (fn != ref.size() || (fn && memcmp(fl, ref.data(), fn) != 0)) { printf("FAIL %s step %d: flat() differs\n", what, step); return 1; }
     size_t ln = 1;
     for (char c : ref) if (c == '\n') ln++;
     if (b.lines() != ln) { printf("FAIL %s step %d: lines %zu vs %zu\n", what, step, b.lines(), ln); return 1; }

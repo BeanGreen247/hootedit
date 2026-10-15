@@ -30,6 +30,9 @@ public:
     size_t line_len(size_t line) const;                      /* bytes without the newline */
     size_t line_of(size_t pos) const;                        /* line containing byte offset pos */
     void copy(size_t pos, size_t len, std::string &out) const;
+    /* the whole text as one contiguous block: the mapped file itself while nothing is edited, else a copy kept until the next edit.
+     * Valid until the buffer changes. For scanning big files without a per-line copy. */
+    const char *flat(size_t *n) const;
     void line_text(size_t line, std::string &out) const { copy(idx_.at(line), line_len(line), out); }
 
     void insert(size_t pos, const char *s, size_t n);
@@ -51,5 +54,7 @@ private:
     LineIndex idx_;
     size_t size_ = 0;
     uint64_t rev_ = 0, saved_rev_ = 0;
+    mutable std::string flat_;
+    mutable uint64_t flat_rev_ = ~0ull;
 };
 #endif

@@ -50,6 +50,7 @@
 #include "syntax.h"
 #include "tree.h"
 #include "vim.h"
+#include "benchcore.h"
 #include "outline.h"
 
 static Uint32 g_ev_wake;
@@ -959,6 +960,80 @@ void finish_prompt() {
 
 /* ---- search (in the file, from the command box) ---- */
 
+/* Scanning a whole file line by line with a copy per line costs ~600 ns a line; Matcher::scan walks the flat text with the DFA and only
+ * hands back the lines that match (about 8x faster on a 40 MB file). These helpers are what find, replace, vim search and :s sit on. */
+
+/* first non-empty match starting at or after byte `start`, looking only before byte `limit`; absolute offsets */
+bool match_after(Matcher &m, const char *fb, const Buffer &b, size_t start, size_t limit, size_t *ms_o, size_t *me_o) {
+    size_t a = b.line_start(b.line_of(std::min(start, b.size())));
+    if (limit <= a) return false;
+    bool found = false;
+    m.scan(fb + a, limit - a, [&](size_t ls0, size_t le0) {
+        size_t base = a + ls0, len = le0 - ls0;
+        const char *t = fb + base;
+        size_t from = base < start ? start - base : 0;
+        while (from <= len) {
+            size_t ms, me;
+            if (!m.find(t, len, from, &ms, &me)) break;
+            if (me == ms) { from = ms + 1; continue; }   /* an empty match is not something to select */
+            *ms_o = base + ms; *me_o = base + me; found = true;
+            return false;
+        }
+        return true;
+    });
+    return found;
+}
+
+/* the last non-empty match that starts before byte `before` inside [a, b) */
+bool match_last(Matcher &m, const char *fb, size_t a, size_t b, size_t before, size_t *ms_o, size_t *me_o) {
+    if (b <= a) return false;
+    bool found = false;
+    m.scan(fb + a, b - a, [&](size_t ls0, size_t le0) {
+        size_t base = a + ls0, len = le0 - ls0, from = 0;
+        const char *t = fb + base;
+        if (base >= before) return false;
+        while (from <= len) {
+            size_t ms, me;
+            if (!m.find(t, len, from, &ms, &me)) break;
+            if (me == ms) { from = ms + 1; continue; }
+            if (base + ms >= before) break;
+            *ms_o = base + ms; *me_o = base + me; found = true;
+            from = ms + 1;
+        }
+        return true;
+    });
+    return found;
+}
+
+struct SubResult { size_t first = (size_t)-1, last = 0, count = 0, lines = 0; std::string out; };
+
+/* every matching line of fb[a, b) with its matches replaced by emit(); the result covers only the span from the first to the last changed line */
+void subst_scan(Matcher &m, const char *fb, size_t a, size_t b, bool global, const std::function<void(std::string &, const char *, size_t, size_t)> &emit, SubResult &r) {
+    size_t cp = 0;
+    if (b <= a) return;
+    m.scan(fb + a, b - a, [&](size_t ls0, size_t le0) {
+        size_t ls = a + ls0, le = a + le0, len = le - ls, from = 0, e = 0, c = 0;
+        const char *t = fb + ls;
+        std::string o;
+        while (from <= len) {
+            size_t ms, me;
+            if (!m.find(t, len, from, &ms, &me)) break;
+            if (me == ms) { if (ms >= len) break; from = ms + 1; continue; }
+            o.append(t + e, ms - e);
+            emit(o, t, ms, me);
+            e = me; from = me; c++;
+            if (!global) break;
+        }
+        if (!c) return true;
+        o.append(t + e, len - e);
+        if (r.first == (size_t)-1) { r.first = ls; cp = ls; }
+        r.out.append(fb + cp, ls - cp);
+        r.out += o;
+        cp = le; r.last = le; r.count += c; r.lines++;
+        return true;
+    });
+}
+
 bool find_from(size_t start) {
     WorkTimer wt;
     Doc &d = D();
@@ -969,25 +1044,22 @@ bool find_from(size_t start) {
     std::string err;
     if (!re.compile(E.find_regex ? E.find_q : Searcher::escape_literal(E.find_q), icase, &err)) { E.find_msg = "invalid: " + err; return false; }
     Matcher m(re);
-    std::string t;
-    size_t l0 = d.buf.line_of(start), nl = d.buf.lines();
-    for (size_t k = 0; k <= nl; k++) {
-        size_t line = (l0 + k) % nl;
-        d.buf.line_text(line, t);
-        size_t base = d.buf.line_start(line), from = 0;
-        if (k == 0) from = start > base ? start - base : 0;
-        while (from <= t.size()) {
-            size_t ms, me;
-            if (!m.find(t.data(), t.size(), from, &ms, &me)) break;
-            if (me == ms) { from = ms + 1; continue; }                       /* an empty match is not something to select */
-            if (k == nl && base + ms >= start) break;                       /* wrapped all the way round to where we began */
-            d.break_group();
-            d.anchor = base + ms;
-            d.move_to(base + me, true, false);
-            E.follow = true;
-            E.find_msg.clear();
-            return true;
-        }
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    size_t ms, me;
+    bool ok = match_after(m, fb, d.buf, start, fn, &ms, &me);
+    if (!ok) {   /* wrap: from the top up to where we began */
+        size_t l0 = d.buf.line_of(std::min(start, d.buf.size()));
+        size_t lim = l0 + 1 < d.buf.lines() ? d.buf.line_start(l0 + 1) : fn;
+        ok = match_after(m, fb, d.buf, 0, lim, &ms, &me) && ms < start;
+    }
+    if (ok) {
+        d.break_group();
+        d.anchor = ms;
+        d.move_to(me, true, false);
+        E.follow = true;
+        E.find_msg.clear();
+        return true;
     }
     E.find_msg = "No results";
     return false;
@@ -1028,32 +1100,18 @@ void replace_all() {
     Regex re;
     if (!find_matcher(re)) return;
     Matcher m(re);
-    std::string out, t;
-    size_t nl = d.buf.lines(), count = 0;
-    for (size_t line = 0; line < nl; line++) {
-        d.buf.line_text(line, t);
-        size_t from = 0;
-        std::string o;
-        while (from <= t.size()) {
-            size_t ms, me;
-            if (!m.find(t.data(), t.size(), from, &ms, &me) || me == ms) { if (me == ms && ms < t.size() && from <= ms) { /* an empty match: skip a character */ o.append(t, from, ms + 1 - from); from = ms + 1; continue; } break; }
-            o.append(t, from, ms - from);
-            o += E.repl_q;
-            from = me;
-            count++;
-        }
-        if (from <= t.size()) o.append(t, from, std::string::npos);
-        out += o;
-        if (line + 1 < nl) out += '\n';
-    }
-    if (!count) { E.find_msg = "No results"; return; }
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    SubResult r;
+    subst_scan(m, fb, 0, fn, true, [](std::string &o, const char *, size_t, size_t) { o += E.repl_q; }, r);
+    if (!r.count) { E.find_msg = "No results"; return; }
     size_t keep = d.cur, top = d.top;
     d.break_group();
-    d.replace(0, d.buf.size(), out.data(), out.size());
+    d.replace(r.first, r.last - r.first, r.out.data(), r.out.size());   /* only the span that changed, one undo step */
     d.break_group();
     d.move_to(std::min(keep, d.buf.size()), false, false);
     d.top = std::min(top, d.buf.lines() - 1);
-    E.status_msg = sfmt("replaced %zu occurrence%s", count, count == 1 ? "" : "s");
+    E.status_msg = sfmt("replaced %zu occurrence%s", r.count, r.count == 1 ? "" : "s");
     E.find_msg.clear();
 }
 
@@ -6776,27 +6834,20 @@ bool vim_find(const std::string &pat, size_t from, bool fwd, size_t *pos) {   /*
     std::string err;
     if (!re.compile(pat, icase, &err) && !re.compile(Searcher::escape_literal(pat), icase, &err)) return false;
     Matcher m(re);
-    size_t nl = d.buf.lines(), l0 = d.buf.line_of(std::min(from, d.buf.size()));
-    std::string t;
-    for (size_t i = 0; i <= nl; i++) {
-        size_t line = fwd ? (l0 + i) % nl : (l0 + nl - i % nl) % nl;
-        d.buf.line_text(line, t);
-        size_t base = d.buf.line_start(line), ms, me;
-        if (fwd) {
-            size_t start = i == 0 ? std::min(from - base, t.size() + 1) : 0;
-            if (start > t.size()) continue;
-            if (m.find(t.data(), t.size(), start, &ms, &me)) { *pos = base + ms; return true; }
-        } else {
-            long best = -1;
-            size_t f = 0;
-            while (f <= t.size() && m.find(t.data(), t.size(), f, &ms, &me)) {
-                if (i == 0 && base + ms >= from) break;
-                best = (long)ms;
-                f = ms + 1;
-            }
-            if (best >= 0) { *pos = base + (size_t)best; return true; }
-        }
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    from = std::min(from, fn);
+    size_t ms, me;
+    if (fwd) {
+        if (match_after(m, fb, d.buf, from, fn, &ms, &me)) { *pos = ms; return true; }
+        size_t l0 = d.buf.line_of(from);
+        size_t lim = l0 + 1 < d.buf.lines() ? d.buf.line_start(l0 + 1) : fn;
+        if (match_after(m, fb, d.buf, 0, lim, &ms, &me)) { *pos = ms; return true; }
+        return false;
     }
+    if (match_last(m, fb, 0, fn, from, &ms, &me)) { *pos = ms; return true; }
+    size_t l0 = d.buf.line_of(from);
+    if (match_last(m, fb, d.buf.line_start(l0), fn, (size_t)-1, &ms, &me)) { *pos = ms; return true; }   /* wrapped: the last match of the file */
     return false;
 }
 
@@ -6818,38 +6869,21 @@ void vim_substitute(size_t l0, size_t l1, const std::string &c) {
     std::string err;
     if (!re.compile(pat, icase, &err)) { E.status_msg = "E486: invalid pattern: " + err; return; }
     Matcher m(re);
-    std::string out, t;
-    size_t count = 0, lines_hit = 0;
     l1 = std::min(l1, d.buf.lines() - 1);
-    for (size_t l = l0; l <= l1; l++) {
-        d.buf.line_text(l, t);
-        std::string o;
-        size_t from = 0;
-        bool hit_line = false;
-        while (from <= t.size()) {
-            size_t ms, me;
-            if (!m.find(t.data(), t.size(), from, &ms, &me)) break;
-            if (me == ms) { if (ms >= t.size()) break; o.append(t, from, ms + 1 - from); from = ms + 1; continue; }
-            o.append(t, from, ms - from);
-            for (size_t i = 0; i < rep.size(); i++) {
-                if (rep[i] == '&') o.append(t, ms, me - ms);
-                else if (rep[i] == '\\' && i + 1 < rep.size()) { char n2 = rep[++i]; if (n2 == 'n') o += '\n'; else if (n2 == 't') o += '\t'; else o += n2; }
-                else o += rep[i];
-            }
-            from = me;
-            count++;
-            hit_line = true;
-            if (!global) break;
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    SubResult r;
+    subst_scan(m, fb, d.buf.line_start(l0), d.buf.line_start(l1) + d.buf.line_len(l1), global, [&](std::string &o, const char *t, size_t ms, size_t me) {
+        for (size_t i = 0; i < rep.size(); i++) {
+            if (rep[i] == '&') o.append(t + ms, me - ms);
+            else if (rep[i] == '\\' && i + 1 < rep.size()) { char n2 = rep[++i]; if (n2 == 'n') o += '\n'; else if (n2 == 't') o += '\t'; else o += n2; }
+            else o += rep[i];
         }
-        if (from <= t.size()) o.append(t, from, std::string::npos);
-        if (hit_line) lines_hit++;
-        out += o;
-        if (l < l1) out += '\n';
-    }
+    }, r);
+    size_t count = r.count, lines_hit = r.lines;
     if (!count) { E.status_msg = "E486: Pattern not found: " + pat; return; }
-    size_t a = d.buf.line_start(l0), b = d.buf.line_start(l1) + d.buf.line_len(l1);
     d.break_group();
-    d.replace(a, b - a, out.data(), out.size());
+    d.replace(r.first, r.last - r.first, r.out.data(), r.out.size());
     d.anchor = d.cur = d.buf.line_start(std::min(l1, d.buf.lines() - 1));
     d.break_group();
     E.status_msg = sfmt("%zu substitution%s on %zu line%s", count, count == 1 ? "" : "s", lines_hit, lines_hit == 1 ? "" : "s");
@@ -6899,13 +6933,15 @@ void vim_global(const std::string &c, size_t r0 = 0, size_t r1 = (size_t)-1) {
     if (!re.compile(pat, icase, &err)) { E.status_msg = "E486: invalid pattern: " + err; return; }
     Matcher m(re);
     std::vector<size_t> hits;
-    std::string t;
     size_t nl = real_lines(d);
-    for (size_t l = r0; l < nl && l <= r1; l++) {
-        d.buf.line_text(l, t);
-        size_t ms, me;
-        bool found = m.find(t.data(), t.size(), 0, &ms, &me);
-        if (found != inv) hits.push_back(l);
+    {
+        size_t fn;
+        const char *fb = d.buf.flat(&fn);
+        size_t last = std::min(r1, nl - 1);
+        std::vector<size_t> matched;
+        if (r0 <= last) m.scan(fb + d.buf.line_start(r0), d.buf.line_start(last) + d.buf.line_len(last) - d.buf.line_start(r0), [&](size_t ls0, size_t) { matched.push_back(d.buf.line_of(d.buf.line_start(r0) + ls0)); return true; });
+        if (!inv) hits = matched;
+        else { size_t k = 0; for (size_t l = r0; l <= last && l < nl; l++) { if (k < matched.size() && matched[k] == l) k++; else hits.push_back(l); } }
     }
     if (hits.empty()) { E.status_msg = "E486: Pattern not found: " + pat; return; }
     d.break_group();
@@ -7002,6 +7038,7 @@ void vim_init() {
 
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--askpass")) return askpass_client(argc >= 3 ? argv[2] : "");   /* git and ssh start us as their password helper */
+    if (argc >= 3 && !strcmp(argv[1], "--bench-core")) return bench_core(argv[2], argc >= 4 ? std::max(1, atoi(argv[3])) : 3, argc >= 5 ? argv[4] : nullptr);
     std::vector<const char *> args;
     const char *shot = nullptr, *script = nullptr, *cli_theme = nullptr;
     int bench = 0;
@@ -7020,7 +7057,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) cli_theme = argv[++i];
         else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.4.0"); return 0; }
         else if (argv[i][0] != '-') args.push_back(argv[i]);
-        else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n"); return 2; }
+        else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
     }
     settings_load();
     vim_init();

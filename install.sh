@@ -10,6 +10,7 @@
 #   ./install.sh --prefix DIR     install under DIR
 #   ./install.sh --uninstall      remove it (same location flags; without one it removes every copy it finds)
 #   --no-deps                     never touch system packages
+#   --no-pgo                      skip the profile-guided build (it needs xvfb-run or a display for a short training run; without them the normal build is used)
 #   --tests                       run the test suite before installing
 #   --dry-run                     show the steps, change nothing
 set -euo pipefail
@@ -17,7 +18,7 @@ set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SRC"
 
-PREFIX=""; UNINSTALL=0; DEPS=yes; TESTS=0; DRY=0
+PREFIX=""; UNINSTALL=0; DEPS=yes; TESTS=0; DRY=0; PGO=auto
 while [ $# -gt 0 ]; do
   case "$1" in
     --system) PREFIX=/usr/local ;;
@@ -26,8 +27,10 @@ while [ $# -gt 0 ]; do
     --uninstall) UNINSTALL=1 ;;
     --no-deps) DEPS=no ;;
     --tests) TESTS=1 ;;
+    --no-pgo) PGO=no ;;
+    --pgo) PGO=yes ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n '5,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '5,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -91,17 +94,34 @@ else
 fi
 
 echo "[3/4] build"
+BUILD=build
 if [ "$DRY" = 1 ]; then
   echo "[dry run] meson setup build --prefix $PREFIX --buildtype release && ninja -C build"
+  [ "$PGO" != no ] && echo "[dry run] then scripts/build-pgo.sh --prefix $PREFIX (instrumented build, training run, optimised build)"
 else
-  meson setup build --prefix "$PREFIX" --buildtype release --reconfigure >/dev/null 2>&1 || meson setup build --prefix "$PREFIX" --buildtype release >/dev/null
-  ninja -C build
-  if [ "$TESTS" = 1 ]; then meson test -C build; fi
+  if [ "$TESTS" = 1 ] || [ "$PGO" = no ] || { [ -z "${DISPLAY:-}" ] && ! command -v xvfb-run >/dev/null 2>&1; }; then
+    meson setup build --prefix "$PREFIX" --buildtype release --reconfigure >/dev/null 2>&1 || meson setup build --prefix "$PREFIX" --buildtype release >/dev/null
+    ninja -C build
+    if [ "$TESTS" = 1 ]; then meson test -C build; fi
+  fi
+  if [ "$PGO" != no ]; then
+    if [ -z "${DISPLAY:-}" ] && ! command -v xvfb-run >/dev/null 2>&1; then
+      echo "  profile-guided build skipped: it needs xvfb-run (package xvfb) or a display for a short training run; using the normal build"
+      [ "$PGO" = yes ] && { echo "error: --pgo was given but there is no way to run the training." >&2; exit 1; }
+    elif "$SRC/scripts/build-pgo.sh" --prefix "$PREFIX"; then
+      BUILD=build-pgo
+    else
+      echo "  warning: the profile-guided build failed; falling back to the normal build" >&2
+      [ "$PGO" = yes ] && exit 1
+      meson setup build --prefix "$PREFIX" --buildtype release --reconfigure >/dev/null 2>&1 || meson setup build --prefix "$PREFIX" --buildtype release >/dev/null
+      ninja -C build
+    fi
+  fi
 fi
 
 echo "[4/4] install to $PREFIX"
 SUDO=(); [ ! -w "$probe" ] && SUDO=(sudo)
-run "${SUDO[@]}" meson install -C build --no-rebuild
+run "${SUDO[@]}" meson install -C "$BUILD" --no-rebuild
 run "${SUDO[@]}" install -D -m 644 data/hootedit.desktop "$PREFIX/share/applications/hootedit.desktop"
 command -v update-desktop-database >/dev/null && run "${SUDO[@]}" update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
 # A stale icon-theme.cache (left by an earlier program in this prefix; -t because the prefix has no index.theme of its own) hides new icons from the menu and panel: GTK trusts it while it is newer than the folder.
