@@ -4210,7 +4210,7 @@ void draw_menu_bar(const Layout &L, float *menu_end) {
     float bs = (float)S(26), isz = (float)S(16), by = ((float)L.menu_h - bs) / 2, bx = (float)E.W - (float)S(6) - bs;
     for (int k = 0; k < 2; k++) {
         int kind = k == 0 ? H_SETCOG : H_SIDETOG;
-        bool on = k == 0 ? E.mode == M_SETTINGS : E.side_open;
+        bool on = k == 0 ? E.mode == M_SETTINGS : E.pinned;
         if (hovered(kind, 0)) r_rect(E.r, bx, by, bs, bs, C_HOVER);
         draw_icon(k == 0 ? IC_GEAR : IC_SIDEBAR, bx + (bs - isz) / 2, by + (bs - isz) / 2, (int)isz, on ? C_ACCENT : C_UI_DIM);
         hit(bx, 0, bs, (float)L.menu_h, kind, 0);
@@ -6458,7 +6458,11 @@ void do_action(int act) {
     case A_SELALL: d.break_group(); d.select_all(); break;
     case A_FIND: E.mode = M_FIND; E.find_msg.clear(); E.repl_on = false; E.repl_focus = false; break;
     case A_QUICK: E.mode = M_QUICK; E.quick_q.clear(); E.quick_sel = 0; quick_update(); break;
-    case A_TOGGLE_SIDEBAR: open_side(!E.side_open); break;
+    case A_TOGGLE_SIDEBAR:   /* pinned -> unpin and hide (it comes back on the left edge); anything else -> pin and show */
+        if (E.pinned) { E.pinned = false; E.side_open = false; E.side_close_at = 0; }
+        else { E.pinned = true; E.side_open = true; E.side_close_at = 0; }
+        settings_save();
+        break;
     case A_PIN:
         E.pinned = !E.pinned;
         E.side_open = true;
@@ -7049,7 +7053,7 @@ void click_hit(const Hit &h) {
         else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2 && E.preview_tabs); }
         break;
     }
-    case H_SIDETOG: open_side(!E.side_open); break;
+    case H_SIDETOG: do_action(A_TOGGLE_SIDEBAR); break;
     case H_SETCOG: if (E.mode == M_SETTINGS) set_close(); else set_open(); break;
     case H_ACTIVITY: set_close(); show_view((View)h.id); break;
     case H_PIN: do_action(A_PIN); break;
@@ -7316,7 +7320,7 @@ void handle_motion() {
     Layout L = layout();
     if (!E.pinned) {
         bool in_side = E.side_open && E.mx < (float)L.side_x1 && E.my >= (float)L.menu_h;
-        if (!E.side_open && E.mx >= 0 && E.mx <= (float)S(3) && E.my >= (float)L.menu_h && E.my < (float)L.bar_y) open_side(true);
+        if (!E.side_open && E.mx >= 0 && E.mx <= (float)S(10) && E.my >= (float)L.menu_h && E.my < (float)L.bar_y) open_side(true);
         else if (E.side_open) E.side_close_at = in_side ? 0 : (E.side_close_at ? E.side_close_at : E.now + 0.35);
     }
     update_hover();

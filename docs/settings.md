@@ -13,4 +13,4 @@ The cog at the top right (always there) or at the foot of the sidebar rail, File
 
 The toggles that used to live in the View menu (Outline, Vim Keys, Live Checks) are here now, and still in the command palette as "Settings: Toggle ...". They were in View only because there was no settings page.
 
-The top right of the window has two buttons, like VS Code: the sidebar toggle (Ctrl+B) and the settings cog, so Settings stays reachable when the sidebar is closed.
+The top right of the window has two buttons, like VS Code: the sidebar toggle (Ctrl+B) and the settings cog. The toggle pins the sidebar; pressed again it unpins and hides it, and it then slides in when the pointer touches the left edge (10 px) and leaves again when the pointer does. The toggle pins the sidebar; pressed again it unpins and hides it, and it then slides in when the pointer touches the left edge (10 px) and leaves again when the pointer does, so Settings stays reachable when the sidebar is closed.
