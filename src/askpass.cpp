@@ -102,6 +102,8 @@ bool askpass_start() {
     chmod(g_sock.c_str(), 0600);
     g_run = true;
     g_thread = std::thread(serve);
+    static bool registered = false;
+    if (!registered) { registered = true; atexit(askpass_stop); }   /* the window system can vanish and Xlib then calls exit(): a joinable thread left in a static would abort instead */
     g_env = "GIT_ASKPASS=" + quote(g_script) + " SSH_ASKPASS=" + quote(g_script) + " SSH_ASKPASS_REQUIRE=force HOOTEDIT_ASKPASS_SOCK=" + quote(g_sock) + " ";
     if (!getenv("DISPLAY")) g_env += "DISPLAY=:0 ";   /* older ssh only uses SSH_ASKPASS when DISPLAY is set */
     return true;
