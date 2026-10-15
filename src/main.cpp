@@ -51,6 +51,8 @@
 #include "tree.h"
 #include "vim.h"
 #include "benchcore.h"
+#include <sys/inotify.h>
+
 #include "lint.h"
 #include "outline.h"
 
@@ -3135,6 +3137,138 @@ void draw_remote_view(float rail, float sw, float cx, float cw, float list_top, 
     ry += rowh * 2;
 }
 
+
+
+/* ---- files changed on disk (an AI tool, a formatter, git): inotify on the folders of the open files and of the expanded tree ---- */
+
+struct FsWatch {
+    int fd = -1;
+    std::mutex mu;
+    std::map<std::string, int> wd_of;               /* folder -> watch */
+    std::map<int, std::string> dir_of;
+    std::map<std::string, double> changed;          /* path -> when the event arrived (monotonic seconds) */
+    std::string sig;                                /* the folders the watches were last set for */
+    size_t tree_rows = (size_t)-1;
+    double tree_due = 0;
+    bool started = false;
+};
+FsWatch *g_fw = new FsWatch;                         /* never freed: the thread outlives main's cleanup */
+
+void fswatch_thread() {
+    char buf[16384] __attribute__((aligned(8)));
+    for (;;) {
+        ssize_t n = read(g_fw->fd, buf, sizeof buf);
+        if (n <= 0) { if (n < 0 && errno == EINTR) continue; return; }
+        double t = now_s();
+        {
+            std::lock_guard<std::mutex> g(g_fw->mu);
+            for (char *p = buf; p < buf + n;) {
+                const inotify_event *ev = reinterpret_cast<const inotify_event *>(p);
+                auto it = g_fw->dir_of.find(ev->wd);
+                if (it != g_fw->dir_of.end() && (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MODIFY)) && ev->len) {
+                    std::string path = (it->second == "/" ? std::string() : it->second) + "/" + ev->name;
+                    if (path.size() > 13 && path.compare(path.size() - 13, 13, ".hootedit-tmp") == 0) { p += sizeof(inotify_event) + ev->len; continue; }   /* our own atomic save */
+                    if (!g_fw->changed.count(path)) g_fw->changed[path] = t;   /* keep the first event: the time since the write started */
+                }
+                p += sizeof(inotify_event) + ev->len;
+            }
+        }
+        app_wake();
+    }
+}
+
+void fswatch_dirs(const std::set<std::string> &want) {
+    std::string sig;
+    for (const std::string &d : want) sig += d + "\n";
+    if (sig == g_fw->sig) return;
+    g_fw->sig = sig;
+    if (!g_fw->started) {
+        g_fw->fd = inotify_init1(IN_CLOEXEC);
+        if (g_fw->fd < 0) return;
+        g_fw->started = true;
+        std::thread(fswatch_thread).detach();
+    }
+    if (g_fw->fd < 0) return;
+    std::lock_guard<std::mutex> g(g_fw->mu);
+    for (auto it = g_fw->wd_of.begin(); it != g_fw->wd_of.end();) {
+        if (!want.count(it->first)) { inotify_rm_watch(g_fw->fd, it->second); g_fw->dir_of.erase(it->second); it = g_fw->wd_of.erase(it); } else ++it;
+    }
+    size_t budget = 600;
+    for (const std::string &d : want) {
+        if (g_fw->wd_of.count(d) || budget-- == 0) continue;
+        int wd = inotify_add_watch(g_fw->fd, d.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_MOVED_FROM);
+        if (wd >= 0) { g_fw->wd_of[d] = wd; g_fw->dir_of[wd] = d; }
+    }
+}
+
+std::vector<std::string> g_ext_queue;     /* documents with unsaved edits whose file changed: asked about one at a time */
+
+bool external_change(Doc &d, double event_at) {
+    if (d.dv || d.mv || d.path.empty()) return false;
+    if (d.disk_gone()) { E.status_msg = d.name() + " was deleted on disk; the text is kept in the editor"; d.disk_mtime = 0; d.disk_size = -1; redraw(); return true; }
+    if (!d.disk_changed()) return false;
+    if (!d.modified()) {
+        double t0 = now_s();
+        if (!d.reload_disk()) return false;
+        double t1 = now_s();
+        g_gutter.erase(&d);
+        E.rows.clear();
+        lint_forget(&d);
+        double reload_ms = (t1 - t0) * 1000.0, seen_ms = (t1 - event_at) * 1000.0;
+        record_op("hot reload " + d.name(), reload_ms);
+        E.status_msg = "reloaded " + d.name() + " from disk in " + fmt_ms(reload_ms) + " (" + fmt_ms(seen_ms) + " after the write finished)";
+        E.follow = false;
+        redraw();
+        return true;
+    }
+    std::string name = d.name(), path = d.path;
+    dlg_show(name + " changed on disk", "You have unsaved edits in the editor and the file was changed by something else. Load the new version from disk (Ctrl+Z gets your text back), or keep yours and overwrite the file when you save.", {"Load from disk", "Keep mine"},
+             [path](int btn, const std::string &) {
+                 for (auto &dp : E.docs) {
+                     if (dp->path != path) continue;
+                     if (btn == 0) { double t0 = now_s(); dp->reload_disk(); double ms = (now_s() - t0) * 1000.0; record_op("hot reload " + dp->name(), ms); E.status_msg = "loaded " + dp->name() + " from disk in " + fmt_ms(ms); g_gutter.erase(dp.get()); E.rows.clear(); lint_forget(dp.get()); }
+                     else { dp->stamp_disk(); E.status_msg = "kept your version of " + dp->name() + "; saving overwrites the file on disk"; }
+                 }
+                 redraw();
+             });
+    return true;
+}
+
+/* once per loop iteration: follow the folders we should watch, then act on what changed */
+void fswatch_tick() {
+    std::set<std::string> want;
+    for (auto &dp : E.docs) if (!dp->dv && !dp->mv && !dp->path.empty() && dp->path[0] == '/') want.insert(dp->path.substr(0, dp->path.rfind('/') == 0 ? 1 : dp->path.rfind('/')));
+    if (!E.tree.root().empty()) {
+        want.insert(E.tree.root());
+        for (const Tree::Row &r : E.tree.rows()) if (r.dir && r.expanded && !r.ghost) want.insert(r.path);
+    }
+    fswatch_dirs(want);
+    std::map<std::string, double> got;
+    {
+        std::lock_guard<std::mutex> g(g_fw->mu);
+        if (g_fw->changed.empty() && g_fw->tree_due == 0) return;
+        got.swap(g_fw->changed);
+    }
+    bool tree = false, defer_all = E.mode == M_DIALOG;
+    for (auto &kv : got) {
+        bool is_doc = false;
+        for (auto &dp : E.docs) if (dp->path == kv.first) {
+            is_doc = true;
+            if (defer_all) { std::lock_guard<std::mutex> g(g_fw->mu); g_fw->changed.emplace(kv.first, kv.second); }   /* a dialog is open: ask again afterwards */
+            else if (external_change(*dp, kv.second)) tree = true;
+        }
+        if (!is_doc) tree = true;
+    }
+    if (tree && !E.tree.root().empty()) g_fw->tree_due = now_s() + 0.2;   /* new or removed files: the Explorer and the git state follow, after a short pause so a burst is one refresh */
+    if (g_fw->tree_due > 0 && now_s() >= g_fw->tree_due) {
+        g_fw->tree_due = 0;
+        E.tree.refresh();
+        if (E.git.repo) git_refresh();
+        E.quick_files.clear();
+        E.sfiles.reset();
+        redraw();
+    }
+}
 
 /* ---- live checks: src/lint.cpp results per document, refreshed when the text has been still for a moment ---- */
 
@@ -7039,8 +7173,8 @@ void run_script(const char *script) {
         if (step.compare(0, 4, "wait") == 0) {   /* wait:MS lets background work (a search) finish, then polls and draws */
             double until = now_s() + atof(step.c_str() + (step[5] == '~' ? 6 : 5)) / 1000.0;
             while (now_s() < until && (E.s_active && !E.sstat.done)) { search_poll(); SDL_Delay(1); }
-            while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { git_job_poll(); job_poll(g_rjob); askpass_poll(); tip_poll(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
-            search_poll(); E.now = now_s(); lint_tick(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
+            while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { E.now = now_s(); git_job_poll(); job_poll(g_rjob); askpass_poll(); tip_poll(); lint_tick(); fswatch_tick(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
+            search_poll(); E.now = now_s(); lint_tick(); fswatch_tick(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
             continue;
         }
         E.ev_t0 = now_s();
@@ -7401,7 +7535,9 @@ int main(int argc, char **argv) {
         struct stat st;
         if (stat(a, &st) == 0 && S_ISDIR(st.st_mode)) { if (workspace.empty()) workspace = a; continue; }
         Doc &d = new_doc(false);
-        if (!d.open(a)) { fprintf(stderr, "hootedit: cannot open %s\n", a); return 1; }
+        std::string abs_path = a;
+        if (abs_path[0] != '/') { char cwd[4096]; if (getcwd(cwd, sizeof cwd)) abs_path = std::string(cwd) + "/" + abs_path; }   /* absolute, so the file can be watched and matched with the tree */
+        if (!d.open(abs_path.c_str())) { fprintf(stderr, "hootedit: cannot open %s\n", a); return 1; }
         if (workspace.empty()) {
             std::string full = expand_path(a);
             GitInfo g = git_query(full.substr(0, full.rfind('/') == std::string::npos ? 0 : full.rfind('/')));
@@ -7491,6 +7627,7 @@ int main(int argc, char **argv) {
         if (E.side_close_at > 0) due = std::min(due, E.side_close_at);
         if (E.tip_at > 0) due = std::min(due, E.tip_at);
         if (E.lint_at > 0) due = std::min(due, E.lint_at);
+        if (g_fw->tree_due > 0) due = std::min(due, g_fw->tree_due);
         if (E.follow_fleet && !E.fleet_watch) due = std::min(due, E.next_fleet ? E.next_fleet : E.now + 1.0);
         double left = due - E.now;
         int wait = left < 0.001 ? 1 : left > 5.0 ? 5000 : (int)(left * 1000.0) + 1;
@@ -7501,6 +7638,7 @@ int main(int argc, char **argv) {
         g_wake_pending = 0;
         search_poll();
         lint_tick();
+        fswatch_tick();
         git_job_poll();
         job_poll(g_rjob);
         askpass_poll();

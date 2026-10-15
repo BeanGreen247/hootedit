@@ -47,7 +47,7 @@ printf 'x\n' > "$T/ws/src/lib/deep.txt"
 # ---- typing and saving ----
 run "text:hello;ctrl+s;wait:200;dump" a.txt
 has "typing goes into the buffer" "text: helloone two three\\nfour five\\nsix\\n"
-ok "ctrl+s saves" "status: saved a.txt"
+has "ctrl+s saves" "/ws/a.txt"
 total=$((total + 1)); [ "$(head -c 5 "$T/ws/a.txt")" = "hello" ] || { fails=$((fails + 1)); echo "FAIL: file on disk not written"; }
 printf 'one two three\nfour five\nsix\n' > "$T/ws/a.txt"
 
@@ -181,6 +181,22 @@ has "XML mismatch" "xml-mismatch"
 printf 'DELETE FROM users;\n' > "$T/ws/bad.sql"
 run "dump" bad.sql
 has "SQL delete without where" "sql-delete-all"
+
+# ---- hot reload: a file changed by another program ----
+printf 'one\ntwo\n' > "$T/ws/hot.txt"
+( sleep 1; printf 'one\nchanged outside\nthree\n' > "$T/ws/hot.txt" ) &
+run "wait:~300;wait:~1800;dump" hot.txt
+has "an unmodified file reloads by itself" "text: one\\nchanged outside\\nthree\\n"
+has "the reload says how long it took" "reloaded hot.txt from disk in"
+printf 'one\ntwo\n' > "$T/ws/hot.txt"
+( sleep 1; printf 'rewritten\n' > "$T/ws/hot.txt" ) &
+run "wait:~300;text:mine;wait:~1800;dump" hot.txt
+ok "unsaved edits are not overwritten: a dialog asks" "mode: 10"
+has "the editor text is still the user's" "text: mineone\\ntwo\\n"
+( sleep 1; echo new > "$T/ws/zz_created_later.txt" ) &
+run "wait:~300;wait:~1800;dump" hot.txt
+has "a file created by another program shows in the Explorer" "row: zz_created_later.txt"
+rm -f "$T/ws/zz_created_later.txt"
 
 echo "ui scenarios: $((total - fails))/$total passed"
 [ "$fails" = 0 ]

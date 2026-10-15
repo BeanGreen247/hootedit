@@ -36,6 +36,11 @@ public:
 
     std::shared_ptr<DiffView> dv;             /* set: this tab shows a diff, not text (read only) */
     std::shared_ptr<MergeView> mv;            /* set: this tab is the three-way merge editor of a conflicted file */
+    long long disk_mtime = 0, disk_size = -1;    /* the file as it was at the last open, save or reload: how an outside change is noticed */
+    void stamp_disk();
+    bool disk_changed() const;                /* the file's stamp differs, or the file is gone */
+    bool disk_gone() const;
+    bool reload_disk();                       /* put the file's bytes into the buffer by replacing only the part that differs: one undo step, cursor kept */
     bool preview = false;                     /* italic preview tab (single click in the Explorer): replaced by the next preview until pinned */
     unsigned long used = 0;                   /* when the tab was last active, for Ctrl+Tab in most recently used order */
     std::string title;                        /* shown instead of the file name when set (diff views) */

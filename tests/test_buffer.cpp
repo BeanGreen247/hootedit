@@ -30,8 +30,47 @@ static int check(const Buffer &b, const std::string &ref, const char *what, int 
     return 0;
 }
 
+/* a file rewritten or truncated by another program while it is open must neither change the text we hold (small files are read into memory)
+ * nor kill us (big files are mapped; the SIGBUS guard puts zeros where the file is gone) */
+static int external_change_test() {
+    int bad = 0;
+    char small[] = "/tmp/hootedit-ext-XXXXXX";
+    int fd = mkstemp(small);
+    if (write(fd, "one\ntwo\n", 8) != 8) return 1;
+    close(fd);
+    {
+        Buffer b;
+        if (!b.open(small)) return 1;
+        FILE *f = fopen(small, "w");   /* in place, truncating: what a shell redirect does */
+        fputs("rewritten completely\n", f);
+        fclose(f);
+        std::string t;
+        b.copy(0, b.size(), t);
+        if (t != "one\ntwo\n") { printf("FAIL: small file changed under the buffer: %s\n", t.c_str()); bad = 1; }
+    }
+    unlink(small);
+    char big[] = "/tmp/hootedit-extbig-XXXXXX";
+    fd = mkstemp(big);
+    std::string line(1023, 'x');
+    line += '\n';
+    for (int i = 0; i < 20000; i++) if (write(fd, line.data(), line.size()) < 0) return 1;   /* about 20 MB: mapped, not read */
+    close(fd);
+    {
+        Buffer b;
+        if (!b.open(big)) return 1;
+        if (truncate(big, 0) != 0) return 1;
+        size_t sum = 0;
+        std::string t;
+        for (size_t l = 0; l < b.lines(); l += 997) { b.line_text(l, t); sum += t.size(); }   /* reads pages that no longer exist */
+        (void)sum;
+    }
+    unlink(big);
+    return bad;
+}
+
 int main(int argc, char **argv) {
     int bad = 0, steps = 0;
+    if (external_change_test()) return 1;
     char gen[] = "/tmp/hootedit-test-XXXXXX";
     if (argc > 1 && !strcmp(argv[1], "--gen")) {   /* 60000 lines: crosses many line-index chunks, no big file in the repo */
         int fd = mkstemp(gen);

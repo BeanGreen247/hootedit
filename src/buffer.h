@@ -47,6 +47,7 @@ private:
     const char *base(const Piece &p) const { return (p.add ? add_.data() : orig_) + p.off; }
     size_t find(size_t pos, size_t *within) const;           /* piece index holding pos, offset inside it */
 
+    std::string own_;                                        /* the file read into memory (small files); orig_ points into it */
     const char *orig_ = nullptr;
     size_t orig_len_ = 0, map_len_ = 0;
     std::string add_;

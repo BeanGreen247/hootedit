@@ -11,10 +11,55 @@
 #include <libgen.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <signal.h>
+#include <string.h>
 #include <sys/stat.h>
+
+#include <atomic>
 #include <unistd.h>
 
-Buffer::~Buffer() { if (orig_) munmap(const_cast<char *>(orig_), map_len_); }
+/* A mapped file that another program truncates would kill us with SIGBUS the moment a page past the new end is read. Mapped buffers are
+ * registered here, and the handler puts a page of zeros over the missing one so reading goes on (the editor reloads the file a moment later). */
+namespace {
+struct MapRange { std::atomic<uintptr_t> start{0}; std::atomic<size_t> len{0}; };
+MapRange g_maps[512];
+long g_page = 4096;
+
+void on_sigbus(int, siginfo_t *si, void *) {
+    uintptr_t a = (uintptr_t)si->si_addr;
+    for (MapRange &m : g_maps) {
+        uintptr_t s = m.start.load(std::memory_order_relaxed);
+        if (s && a >= s && a < s + m.len.load(std::memory_order_relaxed)) {
+            void *page = (void *)(a & ~(uintptr_t)(g_page - 1));
+            if (mmap(page, (size_t)g_page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED) return;
+        }
+    }
+    signal(SIGBUS, SIG_DFL);   /* not ours: crash the usual way */
+}
+
+void register_map(const void *p, size_t len) {
+    static bool installed = false;
+    if (!installed) {
+        installed = true;
+        g_page = sysconf(_SC_PAGESIZE);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = on_sigbus;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGBUS, &sa, nullptr);
+    }
+    for (MapRange &m : g_maps) { uintptr_t z = 0; if (m.start.compare_exchange_strong(z, (uintptr_t)p)) { m.len = len; return; } }
+}
+
+void unregister_map(const void *p) {
+    for (MapRange &m : g_maps) if (m.start.load() == (uintptr_t)p) { m.start = 0; m.len = 0; return; }
+}
+
+const size_t READ_INTO_MEMORY = 16u << 20;   /* up to this size the file is read, so a program that rewrites it in place cannot change the text under us */
+}  // namespace
+
+Buffer::~Buffer() { if (orig_ && map_len_) { unregister_map(orig_); munmap(const_cast<char *>(orig_), map_len_); } }
 
 bool Buffer::open(const char *path) {
     int fd = ::open(path, O_RDONLY | O_CLOEXEC);
@@ -22,11 +67,24 @@ bool Buffer::open(const char *path) {
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return false; }
     if (st.st_size > 0) {
-        void *m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (m == MAP_FAILED) { close(fd); return false; }
-        madvise(m, (size_t)st.st_size, MADV_SEQUENTIAL);
-        orig_ = static_cast<const char *>(m);
-        orig_len_ = map_len_ = (size_t)st.st_size;
+        void *m = MAP_FAILED;
+        if ((size_t)st.st_size <= READ_INTO_MEMORY) {
+            own_.resize((size_t)st.st_size);
+            size_t got = 0;
+            while (got < own_.size()) { ssize_t r = read(fd, &own_[got], own_.size() - got); if (r <= 0) break; got += (size_t)r; }
+            own_.resize(got);
+            if (own_.empty()) { close(fd); return true; }
+            orig_ = own_.data();
+            orig_len_ = own_.size();
+            map_len_ = 0;
+        } else {
+            m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m == MAP_FAILED) { close(fd); return false; }
+            madvise(m, (size_t)st.st_size, MADV_SEQUENTIAL);
+            orig_ = static_cast<const char *>(m);
+            orig_len_ = map_len_ = (size_t)st.st_size;
+            register_map(orig_, orig_len_);
+        }
         flat_rev_ = ~0ull;
         pieces_.push_back({0, 0, orig_len_});
         size_ = orig_len_;
@@ -34,7 +92,7 @@ bool Buffer::open(const char *path) {
         starts.reserve(orig_len_ / 40 + 16);
         for (const char *p = orig_, *e = orig_ + orig_len_; (p = static_cast<const char *>(memchr(p, '\n', (size_t)(e - p))));) starts.push_back((size_t)(++p - orig_));
         idx_.reset(starts);
-        madvise(m, (size_t)st.st_size, MADV_NORMAL);
+        if (m != MAP_FAILED) madvise(m, (size_t)st.st_size, MADV_NORMAL);
     }
     close(fd);
     return true;

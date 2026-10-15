@@ -15,3 +15,12 @@ Own engine, no regex and no backtracking: each line is lexed in one forward pass
 ## Themes
 
 The same themes as Lestrix: Xylonic Dark and Light, Graphite, Nord, Gruvbox, Solarized Dark, and the fleetwm set (Dark, Catppuccin, Dracula, OLED Black, Light). View > Color Theme (Ctrl+Shift+T) or `--theme NAME`. "Follow fleetwm theme" tracks the fleetwm config live, the way Lestrix does (an inotify watch, no polling). The theme colours the whole UI, the syntax highlighting (from the theme's ANSI palette) and the terminal.
+
+## Files changed on disk (hot reload)
+
+When another program changes a file you have open, an AI tool, a formatter, `git checkout`, a build step, Hootedit notices at once (inotify on the folders of the open files and of the expanded Explorer folders; nothing is polled, so an idle editor still uses no CPU).
+
+- A file with no unsaved edits reloads by itself. Only the part that differs is replaced, so it is one undo step (Ctrl+Z shows the previous version), your cursor stays where the text around it stays, and the status bar says how long it took: `reloaded app.yaml from disk in 0.03 ms (3.6 ms after the write finished)`.
+- A file you have edited asks first: **Load from disk** (your text comes back with Ctrl+Z) or **Keep mine** (saving then overwrites the file).
+- A file deleted on disk stays in the editor with a notice; new and removed files show up in the Explorer and the git state follows, after a short pause so a burst of changes is one refresh.
+- Files up to 16 MB are read into memory when they open, so a program that rewrites a file in place (a shell redirect, `sed -i` without a temp file) cannot change the text under the editor. Bigger files are memory-mapped for instant opening; if one of those is truncated while open, the editor shows zeros for the missing part and does not crash, then reloads.

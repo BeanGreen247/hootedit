@@ -5,6 +5,9 @@
 
 #include "doc.h"
 
+#include <stdio.h>
+#include <sys/stat.h>
+
 #include <string.h>
 
 #include <algorithm>
@@ -40,9 +43,59 @@ void Doc::redetect() {
     states_.assign(1, 0);
 }
 
+void Doc::stamp_disk() {
+    struct stat st;
+    if (!path.empty() && stat(path.c_str(), &st) == 0) { disk_mtime = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec; disk_size = (long long)st.st_size; }
+    else { disk_mtime = 0; disk_size = -1; }
+}
+
+bool Doc::disk_changed() const {
+    if (path.empty()) return false;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return disk_size != -1;
+    return (long long)st.st_size != disk_size || (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec != disk_mtime;
+}
+
+bool Doc::disk_gone() const {
+    struct stat st;
+    return !path.empty() && stat(path.c_str(), &st) != 0;
+}
+
+bool Doc::reload_disk() {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::string nt;
+    char chunk[65536];
+    size_t got;
+    while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) nt.append(chunk, got);
+    fclose(f);
+    size_t n;
+    const char *fb = buf.flat(&n);
+    size_t pre = 0, lim = std::min(n, nt.size());
+    while (pre < lim && fb[pre] == nt[pre]) pre++;
+    size_t suf = 0;
+    while (suf < lim - pre && fb[n - 1 - suf] == nt[nt.size() - 1 - suf]) suf++;
+    size_t old_cur = cur, old_anchor = anchor;
+    size_t del = n - pre - suf;
+    std::string ins = nt.substr(pre, nt.size() - pre - suf);
+    if (del || !ins.empty()) {
+        break_group();
+        replace(pre, del, ins.data(), ins.size());
+        break_group();
+        auto map = [&](size_t p) { return p <= pre ? p : p >= n - suf ? p - del + ins.size() : pre; };
+        cur = std::min(map(old_cur), buf.size());
+        anchor = std::min(map(old_anchor), buf.size());
+        want_col = col_of_byte(buf.line_of(cur), cur - buf.line_start(buf.line_of(cur)));
+    }
+    save_point_ = undo_.size();
+    stamp_disk();
+    return true;
+}
+
 bool Doc::open(const char *p) {
     path = p ? p : "";
     if (!path.empty() && !buf.open(path.c_str())) return false;
+    stamp_disk();
     redetect();
     if (buf.size()) {                                  /* line ending and indent style from the top of the file */
         std::string line;
@@ -71,6 +124,7 @@ bool Doc::save(const char *p) {
     if (!buf.save(target.c_str())) return false;
     bool renamed = target != path;
     path = target;
+    stamp_disk();
     break_group();
     save_point_ = undo_.size();
     if (renamed) redetect();
