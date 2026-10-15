@@ -4777,7 +4777,17 @@ void build_frame() {
         if (E.blink_on && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows) {
             d.buf.line_text(cl, t);
             int c = col_of(t, cb) - d.left;
-            if (c >= 0 && c <= L.cols) r_rect(E.r, (float)(L.text_x + c * E.cw), (float)(L.text_y + (long)(cl - d.top) * E.rowh), vim_active() && g_vim.block_cursor() ? (float)E.cw : std::max(1.f, 1.5f * E.scale), (float)E.rowh, vim_active() && g_vim.block_cursor() ? ui_mix(C_EDITOR, C_CURSOR, 0.75f) : C_CURSOR);
+            bool blk = vim_active() && g_vim.block_cursor();
+            if (c >= 0 && c <= L.cols) {
+                float cx0 = (float)(L.text_x + c * E.cw), cy0 = (float)(L.text_y + (long)(cl - d.top) * E.rowh);
+                r_rect(E.r, cx0, cy0, blk ? (float)E.cw : std::max(1.f, 1.5f * E.scale), (float)E.rowh, C_CURSOR);
+                if (blk && cb < t.size() && t[cb] != ' ' && t[cb] != '\t') {   /* the letter under a block cursor is drawn again in the editor colour so it stays readable */
+                    size_t n = 1;
+                    while (cb + n < t.size() && ((unsigned char)t[cb + n] & 0xC0) == 0x80) n++;
+                    std::string ch = t.substr(cb, n);
+                    draw_text(E.font, cx0, cy0 + (float)E.rowasc, ch.c_str(), C_EDITOR, (float)E.cw * 2);
+                }
+            }
         }
         draw_peek(L, d);
         draw_conflict_actions(L, d);
