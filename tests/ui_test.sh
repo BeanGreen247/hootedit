@@ -47,6 +47,9 @@ printf '# Preview check\n\nA **bold** paragraph.\n\n```python\nprint("hello")\n`
 printf '= Guide\n\n[source,python]\n----\nprint("hello")\n----\n' > "$T/ws/preview.adoc"
 printf 'Guide\n=====\n\n.. code-block:: python\n\n   print("hello")\n' > "$T/ws/preview.rst"
 printf '# Broken preview\n\n![missing](assets/nope.png)\n\n<div>raw HTML</div>\n' > "$T/ws/preview-broken.md"
+printf 'flowchart TD\n  A[Start] --> B{Ready?}\n  B -->|yes| C[Done]\n' > "$T/ws/preview.mmd"
+printf '# Workflow\n\n```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```\n' > "$T/ws/preview-diagram.md"
+printf '# P and p\n\n## P and p\n\n### P and p\n\n#### P and p\n\n##### P and p\n\n###### P and p\n\nSetext P and p\n===============\n\nSetext P and p\n---------------\n' > "$T/ws/preview-headings.md"
 
 # ---- typing and saving ----
 run "text:hello;ctrl+s;wait:200;dump" a.txt
@@ -221,23 +224,38 @@ has "Ctrl+, opens the Settings page" "settings: open=1"
 
 # ---- documentation preview ----
 run "act:preview;dump" preview.md
-has "Markdown preview can be toggled from the action" "preview: open=1 split=0 target=GitHub format=1 blocks=3"
-run "click:875,45;dump" preview.md
-has "the tab-strip Preview button opens the rendered view" "preview: open=1 split=0 target=GitHub format=1 blocks=3"
+has "Markdown preview can be toggled from the action" "preview: open=1 split=0 target=GitHub mode="
+run "click:800,45;dump" preview.md
+has "the tab-strip Preview button opens the rendered view" "preview: open=1 split=0 target=GitHub mode="
 run "ctrl+shift+v;dump" preview.md
-has "Ctrl+Shift+V toggles source and preview" "preview: open=1 split=0 target=GitHub format=1 blocks=3"
+has "Ctrl+Shift+V toggles source and preview" "preview: open=1 split=0 target=GitHub mode="
 run "act:preview_split;dump" preview.md
-has "split preview opens source and rendered panes together" "preview: open=1 split=1 target=GitHub format=1 blocks=3"
-run "click:938,45;dump" preview.md
-has "the Split control opens synchronized source and preview panes" "preview: open=1 split=1 target=GitHub format=1 blocks=3"
-run "click:990,45;act:preview;dump" preview.md
-has "the preview toolbar selects a GitLab rendering profile" "preview: open=1 split=0 target=GitLab format=1 blocks=3"
+has "split preview opens source and rendered panes together" "preview: open=1 split=1 target=GitHub mode="
+run "click:860,45;dump" preview.md
+has "the Split control opens synchronized source and preview panes" "preview: open=1 split=1 target=GitHub mode="
+run "click:920,45;act:preview;dump" preview.md
+has "the preview toolbar selects a GitLab rendering profile" "preview: open=1 split=0 target=GitLab mode="
+run "act:preview;dump;click:980,45;dump" preview.md
+initial_preview_mode="$(printf '%s\n' "$OUT" | sed -n 's/^preview: .* mode=\([^ ]*\).*/\1/p' | head -1)"
+toggled_preview_mode="$(printf '%s\n' "$OUT" | sed -n 's/^preview: .* mode=\([^ ]*\).*/\1/p' | tail -1)"
+total=$((total + 1))
+if [ -z "$initial_preview_mode" ] || [ "$initial_preview_mode" = "$toggled_preview_mode" ] ||
+   ! printf '%s\n' "$OUT" | grep -qF "preview: open=1 split=0 target=GitHub mode=$toggled_preview_mode"; then
+  fails=$((fails + 1)); echo "FAIL: the preview Light/Dark control toggles its palette independently"
+fi
 run "act:preview;dump" preview-broken.md
-has "preview lists missing images and raw HTML approximations" "preview: open=1 split=0 target=GitHub format=1 blocks=3 notes=2"
+has "the preview does not show markup warning notes" "preview: open=1 split=0 target=GitHub mode="
+hasnot "the preview notes are not shown to readers" "Preview note"
 run "act:preview;dump" preview.adoc
-has "AsciiDoc source blocks are previewable" "preview: open=1 split=0 target=GitHub format=2 blocks=2"
+has "AsciiDoc source blocks are previewable" "preview: open=1 split=0 target=GitHub mode="
 run "act:preview;dump" preview.rst
-has "reStructuredText code directives are previewable" "preview: open=1 split=0 target=GitHub format=3 blocks=2"
+has "reStructuredText code directives are previewable" "preview: open=1 split=0 target=GitHub mode="
+run "act:preview;dump" preview.mmd
+has "standalone Mermaid diagrams are previewable" "preview: open=1 split=0 target=GitHub mode="
+run "act:preview;dump" preview-diagram.md
+has "fenced Mermaid diagrams render in Markdown preview" "preview: open=1 split=0 target=GitHub mode="
+run "act:preview;dump" preview-headings.md
+has "all six Markdown heading levels and Setext headings are previewed" "format=1 blocks=8"
 
 run "wait:200;mouse:5,5;click:14,725;mouse:5,5;dump" typo.yaml
 has "the cog at the foot of the sidebar rail opens Settings" "settings: open=1"

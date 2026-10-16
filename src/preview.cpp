@@ -37,7 +37,10 @@ bool starts(const std::string &s, const char *p) { return s.compare(0, std::char
 
 std::string strip_hashes(const std::string &s, size_t n) {
     std::string out = trim(s.substr(n));
-    while (!out.empty() && out.back() == '#') out.pop_back();
+    size_t end = out.size();
+    while (end && out[end - 1] == '#') end--;
+    if (end < out.size() && end > 0 && (out[end - 1] == ' ' || out[end - 1] == '\t'))
+        out.resize(end);
     return trim(out);
 }
 
@@ -115,7 +118,14 @@ bool is_table_divider(const std::string &s) {
         else if (c == '-') dash = true;
         else if (c != ':' && c != ' ' && c != '\t') return false;
     }
+
     return pipe && dash;
+}
+
+bool is_mermaid_lang(const std::string &s) {
+    std::string t = trim(s);
+    for (char &c : t) c = (char)std::tolower((unsigned char)c);
+    return t == "mermaid";
 }
 
 void append_paragraph(std::vector<PreviewBlock> &out, std::string &text) {
@@ -134,6 +144,7 @@ PreviewFormat preview_format(const std::string &path) {
     if (ext == ".md" || ext == ".markdown" || ext == ".mdown" || ext == ".mkd") return PreviewFormat::Markdown;
     if (ext == ".adoc" || ext == ".asciidoc" || ext == ".asc") return PreviewFormat::AsciiDoc;
     if (ext == ".rst" || ext == ".rest") return PreviewFormat::ReStructuredText;
+    if (ext == ".mmd" || ext == ".mermaid") return PreviewFormat::Mermaid;
     return PreviewFormat::None;
 }
 
@@ -141,9 +152,17 @@ std::vector<PreviewBlock> preview_parse(const std::string &source, PreviewFormat
     std::vector<PreviewBlock> out;
     if (format == PreviewFormat::None) return out;
     std::vector<std::string> lines = split_lines(source);
+    if (format == PreviewFormat::Mermaid) {
+        PreviewBlock diagram;
+        diagram.kind = PreviewBlockKind::Diagram;
+        diagram.language = "mermaid";
+        diagram.lines = std::move(lines);
+        out.push_back(std::move(diagram));
+        return out;
+    }
     std::string paragraph;
     std::string pending_lang;
-    bool table = false, code = false, rst_code = false;
+    bool table = false, code = false, rst_code = false, rst_table = false, adoc_header = false;
     char fence = 0;
     size_t fence_len = 0;
     int rst_indent = 0;
@@ -172,6 +191,38 @@ std::vector<PreviewBlock> preview_parse(const std::string &source, PreviewFormat
             block.lines.push_back(line.substr((size_t)rst_indent));
             continue;
         }
+        if (format == PreviewFormat::AsciiDoc) {
+            std::string t = trim(line);
+            if (table) {
+                if (t == "|===") { close_table(); continue; }
+                if (!blank(line)) block.lines.push_back(line);
+                continue;
+            }
+            if (starts(t, "[options=") && t.find("header") != std::string::npos) { adoc_header = true; continue; }
+            if (t == "|===") {
+                append_paragraph(out, paragraph); close_table();
+                table = true; block.kind = PreviewBlockKind::Table; block.level = adoc_header ? 1 : 0;
+                adoc_header = false;
+                continue;
+            }
+        }
+        if (format == PreviewFormat::ReStructuredText) {
+            if (rst_table) {
+                std::string t = trim(line);
+                if (!t.empty() && t[0] == '+') {
+                    if (t.find('=') != std::string::npos) block.level = 1;
+                    continue;
+                }
+                if (!t.empty() && t[0] == '|') { block.lines.push_back(line); continue; }
+                close_table(); rst_table = false; i--; continue;
+            }
+            std::string t = trim(line);
+            if (starts(t, "+") && t.find('-') != std::string::npos && i + 1 < lines.size() && starts(trim(lines[i + 1]), "|")) {
+                append_paragraph(out, paragraph); close_table();
+                table = rst_table = true; block.kind = PreviewBlockKind::Table;
+                continue;
+            }
+        }
         if (blank(line)) { append_paragraph(out, paragraph); close_table(); continue; }
 
         if (format == PreviewFormat::Markdown) {
@@ -179,13 +230,18 @@ std::vector<PreviewBlock> preview_parse(const std::string &source, PreviewFormat
             if (md_fence(line, &m, &n, &lang)) {
                 append_paragraph(out, paragraph); close_table();
                 code = true; fence = m; fence_len = n;
-                block.kind = PreviewBlockKind::Code; block.language = lang;
+                block.kind = is_mermaid_lang(lang) ? PreviewBlockKind::Diagram : PreviewBlockKind::Code;
+                block.language = lang;
                 continue;
             }
-            size_t h = 0; while (h < line.size() && line[h] == '#') h++;
-            if (h && h <= 6 && h < line.size() && line[h] == ' ') {
+            size_t heading_indent = 0;
+            while (heading_indent < line.size() && heading_indent < 4 && line[heading_indent] == ' ') heading_indent++;
+            size_t h = heading_indent;
+            while (h < line.size() && line[h] == '#') h++;
+            size_t level = h - heading_indent;
+            if (level && level <= 6 && (h == line.size() || line[h] == ' ' || line[h] == '\t')) {
                 append_paragraph(out, paragraph); close_table();
-                out.push_back({PreviewBlockKind::Heading, (int)h, false, strip_hashes(line, h), {}, {}});
+                out.push_back({PreviewBlockKind::Heading, (int)level, false, strip_hashes(line.substr(heading_indent), level), {}, {}});
                 continue;
             }
             if (is_md_rule(line)) {
@@ -208,12 +264,22 @@ std::vector<PreviewBlock> preview_parse(const std::string &source, PreviewFormat
             int indent = 0; bool ordered = false; std::string item;
             if (list_marker(line, &indent, &ordered, &item, format)) {
                 append_paragraph(out, paragraph); close_table();
-                out.push_back({PreviewBlockKind::List, indent / 2, ordered, item, {}, {}}); continue;
+                PreviewBlock entry{PreviewBlockKind::List, indent / 2, ordered, item, {}, {}};
+                if (format == PreviewFormat::Markdown && item.size() >= 3 && item[0] == '[' &&
+                    (item[1] == ' ' || item[1] == 'x' || item[1] == 'X') && item[2] == ']') {
+                    entry.task = true;
+                    entry.checked = item[1] != ' ';
+                    item = trim(item.substr(3));
+                    if (!item.empty() && item[0] == ' ') item.erase(0, 1);
+                    entry.text = item;
+                }
+                out.push_back(std::move(entry)); continue;
             }
             if (line.find('|') != std::string::npos && i + 1 < lines.size() && is_table_divider(lines[i + 1])) {
                 append_paragraph(out, paragraph); close_table();
-                table = true; block.kind = PreviewBlockKind::Table;
+                table = true; block.kind = PreviewBlockKind::Table; block.level = 2;
                 block.lines.push_back(line);
+                block.lines.push_back(lines[i + 1]);
                 i++; // The divider is formatting, not a data row.
                 continue;
             }
@@ -222,10 +288,11 @@ std::vector<PreviewBlock> preview_parse(const std::string &source, PreviewFormat
             std::string t = trim(line);
             if (t == "----") {
                 append_paragraph(out, paragraph); close_table();
-                code = true; block.kind = PreviewBlockKind::Code; block.language = pending_lang; pending_lang.clear();
+                code = true; block.kind = is_mermaid_lang(pending_lang) ? PreviewBlockKind::Diagram : PreviewBlockKind::Code;
+                block.language = pending_lang; pending_lang.clear();
                 continue;
             }
-            if (starts(t, "[source,") && t.back() == ']') { pending_lang = t.substr(8, t.size() - 9); continue; }
+            if (starts(t, "[source,") && t.back() == ']') { pending_lang = trim(t.substr(8, t.size() - 9)); continue; }
             if (starts(t, "//")) continue;
             size_t h = 0; while (h < t.size() && t[h] == '=') h++;
             if (h && h <= 6 && h < t.size() && t[h] == ' ') {
@@ -250,8 +317,8 @@ std::vector<PreviewBlock> preview_parse(const std::string &source, PreviewFormat
             if (starts(t, ".. code-block::") || starts(t, ".. sourcecode::")) {
                 append_paragraph(out, paragraph); close_table();
                 size_t pos = t.find("::");
-                block.kind = PreviewBlockKind::Code;
                 block.language = trim(t.substr(pos + 2));
+                block.kind = is_mermaid_lang(block.language) ? PreviewBlockKind::Diagram : PreviewBlockKind::Code;
                 code = rst_code = true; rst_indent = -1;
                 continue;
             }

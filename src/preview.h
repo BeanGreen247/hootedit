@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-enum class PreviewFormat { None, Markdown, AsciiDoc, ReStructuredText };
-enum class PreviewBlockKind { Paragraph, Heading, Code, Quote, List, Rule, Table };
+enum class PreviewFormat { None, Markdown, AsciiDoc, ReStructuredText, Mermaid };
+enum class PreviewBlockKind { Paragraph, Heading, Code, Diagram, Quote, List, Rule, Table };
 
 struct PreviewBlock {
     PreviewBlockKind kind = PreviewBlockKind::Paragraph;
@@ -19,6 +19,8 @@ struct PreviewBlock {
     std::string text;
     std::string language;
     std::vector<std::string> lines;
+    bool task = false;
+    bool checked = false;
 };
 
 struct PreviewDiagnostic {

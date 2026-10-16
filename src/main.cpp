@@ -279,6 +279,7 @@ struct Ed {
     Atlas *atlas = nullptr;
     Renderer *r = nullptr;
     Font *font = nullptr, *big = nullptr, *ui = nullptr;
+    Font *preview_heading[6] = {};
     char gl_desc[256] = "";
     float scale = 1.f;
     int W = 0, H = 0, cw = 8, ch = 16, asc = 12, rowh = 19, rowasc = 14;   /* editor font cell, line pitch and baseline inside a row */
@@ -368,13 +369,14 @@ struct Ed {
     bool preview_open = false;
     bool preview_split = false;
     int preview_target = 0;                         /* 0 = GitHub, 1 = GitLab */
+    bool preview_light = false;
+    bool preview_mode_initialized = false;
     float preview_scroll = 0;
     uint64_t preview_revision = ~0ull;
     const Doc *preview_doc = nullptr;
     std::string preview_path;
     PreviewFormat preview_cached_format = PreviewFormat::None;
     std::vector<PreviewBlock> preview_blocks;
-    std::vector<PreviewDiagnostic> preview_diagnostics;
 
     /* workspace and sidebar */
     Tree tree;
@@ -1401,7 +1403,32 @@ std::vector<std::string> wrap_lines(const std::string &t, float w, int style = F
 
 struct PreviewSpan { std::string text; int style = FS_REGULAR; uint32_t color = 0; };
 
-uint32_t preview_link_color() { return E.preview_target ? RGBA(31, 117, 203, 255) : RGBA(9, 105, 218, 255); }
+struct PreviewPalette {
+    uint32_t bg, panel, text, muted, accent, border, table_head, table_alt;
+};
+
+void preview_mode_init() {
+    if (E.preview_mode_initialized) return;
+    double lum = (0.299 * (C_EDITOR & 255) + 0.587 * ((C_EDITOR >> 8) & 255) + 0.114 * ((C_EDITOR >> 16) & 255));
+    E.preview_light = lum > 128.0;
+    E.preview_mode_initialized = true;
+}
+
+PreviewPalette preview_palette() {
+    preview_mode_init();
+    if (E.preview_light) {
+        if (E.preview_target == 0) return {RGBA(255,255,255,255), RGBA(246,248,250,255), RGBA(31,35,40,255), RGBA(89,99,110,255),
+            RGBA(9,105,218,255), RGBA(208,215,222,255), RGBA(235,240,245,255), RGBA(246,248,250,255)};
+        return {RGBA(255,255,255,255), RGBA(248,249,250,255), RGBA(51,51,51,255), RGBA(89,95,103,255),
+            RGBA(16,120,190,255), RGBA(219,223,228,255), RGBA(232,239,246,255), RGBA(246,248,251,255)};
+    }
+    if (E.preview_target == 0) return {RGBA(13,17,23,255), RGBA(22,27,34,255), RGBA(230,237,243,255), RGBA(139,148,158,255),
+        RGBA(88,166,255,255), RGBA(48,54,61,255), RGBA(33,38,45,255), RGBA(22,27,34,255)};
+    return {RGBA(24,26,28,255), RGBA(31,34,37,255), RGBA(225,226,227,255), RGBA(160,165,170,255),
+        RGBA(74,163,223,255), RGBA(62,66,71,255), RGBA(36,43,50,255), RGBA(30,33,36,255)};
+}
+
+uint32_t preview_link_color() { return preview_palette().accent; }
 
 void preview_span(std::vector<PreviewSpan> &out, const std::string &text, int style, uint32_t color = 0) {
     if (text.empty()) return;
@@ -1518,6 +1545,186 @@ size_t preview_code_rows(const PreviewBlock &block, float width) {
     return rows;
 }
 
+uint32_t preview_token_color(uint8_t token) {
+        PreviewPalette p = preview_palette();
+        switch (token) {
+        case T_COMMENT: return p.muted;
+        case T_STRING: return p.accent;
+        case T_NUMBER: return E.preview_light ? RGBA(5,117,89,255) : RGBA(121,192,128,255);
+        case T_KEYWORD: return E.preview_light ? RGBA(130,80,223,255) : RGBA(210,168,255,255);
+        case T_TYPE: return E.preview_light ? RGBA(5,117,89,255) : RGBA(126,231,135,255);
+        case T_FUNC: return E.preview_light ? RGBA(102,57,0,255) : RGBA(255,209,102,255);
+        case T_PREPROC: return p.accent;
+        default: return p.text;
+        }
+    }
+
+std::string preview_trim(std::string s) {
+        size_t a = s.find_first_not_of(" \t\r");
+        if (a == std::string::npos) return {};
+        size_t b = s.find_last_not_of(" \t\r");
+        return s.substr(a, b - a + 1);
+    }
+
+std::vector<std::string> preview_table_cells(const std::string &row) {
+        std::vector<std::string> cells;
+        std::string cell;
+        bool code = false, escaped = false;
+        for (char c : row) {
+            if (escaped) { cell += c; escaped = false; continue; }
+            if (c == '\\') { escaped = true; continue; }
+            if (c == '`') code = !code;
+            if (c == '|' && !code) { cells.push_back(preview_trim(cell)); cell.clear(); }
+            else cell += c;
+        }
+        if (escaped) cell += '\\';
+        cells.push_back(preview_trim(cell));
+        if (!row.empty() && row.front() == '|' && !cells.empty()) cells.erase(cells.begin());
+        if (!row.empty() && row.back() == '|' && !cells.empty()) cells.pop_back();
+        return cells;
+    }
+
+std::vector<int> preview_table_align(const std::string &divider, size_t count) {
+        std::vector<std::string> cells = preview_table_cells(divider);
+        std::vector<int> out(count, 0);
+        for (size_t i = 0; i < std::min(count, cells.size()); i++) {
+            bool left = !cells[i].empty() && cells[i].front() == ':';
+            bool right = !cells[i].empty() && cells[i].back() == ':';
+            out[i] = left && right ? 1 : right ? 2 : 0; // left, center, right
+        }
+        return out;
+    }
+
+struct MermaidNode {
+        std::string id, label;
+        char shape = 'r';
+    };
+struct MermaidEdge { size_t from = 0, to = 0; std::string label; };
+struct MermaidGraph {
+        bool known = false, left_right = false, sequence = false;
+        std::vector<MermaidNode> nodes;
+        std::vector<MermaidEdge> edges;
+        std::vector<std::string> sequence_messages;
+    };
+
+size_t mermaid_node(MermaidGraph &g, std::string expr) {
+        expr = preview_trim(expr);
+        if (expr == "[*]") {
+            for (size_t i = 0; i < g.nodes.size(); i++) if (g.nodes[i].id == "__start") return i;
+            g.nodes.push_back({"__start", "", 'c'});
+            return g.nodes.size() - 1;
+        }
+        size_t label_start = expr.find_first_of("[({\"");
+        std::string id = preview_trim(expr.substr(0, label_start));
+        if (id.empty() || id == "end" || id == "subgraph") return (size_t)-1;
+        char shape = 'r';
+        std::string label = id;
+        if (label_start != std::string::npos) {
+            char open = expr[label_start];
+            char close = open == '[' ? ']' : open == '{' ? '}' : open == '(' ? ')' : '"';
+            size_t end = expr.find_last_of(close);
+            if (end != std::string::npos && end > label_start) {
+                label = expr.substr(label_start + 1, end - label_start - 1);
+                if (open == '(' && label_start + 1 < expr.size() && expr[label_start + 1] == '(') { shape = 'c'; label = expr.substr(label_start + 2, expr.find("))", label_start + 2) - (label_start + 2)); }
+                else if (open == '{') shape = 'd';
+                else if (open == '[' && label_start + 1 < expr.size() && expr[label_start + 1] == '[') shape = 's';
+                else if (open == '(') shape = 'o';
+            }
+        }
+        for (size_t i = 0; i < g.nodes.size(); i++) if (g.nodes[i].id == id) {
+            if (g.nodes[i].label == id && label != id) { g.nodes[i].label = label; g.nodes[i].shape = shape; }
+            return i;
+        }
+        g.nodes.push_back({id, label, shape});
+        return g.nodes.size() - 1;
+    }
+
+MermaidGraph preview_mermaid(const std::vector<std::string> &lines) {
+        MermaidGraph g;
+        std::string first;
+        for (const std::string &line : lines) if (!preview_trim(line).empty()) { first = preview_trim(line); break; }
+        if (first.find("sequenceDiagram") == 0) {
+            g.known = g.sequence = true;
+            for (const std::string &line0 : lines) {
+                std::string line = preview_trim(line0);
+                if (line.find("participant ") == 0 || line.find("actor ") == 0) {
+                    size_t p = line.find(' ');
+                    std::string def = preview_trim(line.substr(p + 1));
+                    size_t as = def.find(" as ");
+                    std::string id = preview_trim(def.substr(0, as));
+                    std::string label = as == std::string::npos ? id : preview_trim(def.substr(as + 4));
+                    if (!id.empty()) {
+                        size_t idx = mermaid_node(g, id + "[" + label + "]");
+                        (void)idx;
+                    }
+                }
+                size_t arrow = line.find("->>");
+                size_t arrow_n = 3;
+                if (arrow == std::string::npos) { arrow = line.find("-->>"); arrow_n = 4; }
+                if (arrow == std::string::npos) { arrow = line.find("->"); arrow_n = 2; }
+                if (arrow != std::string::npos) {
+                    std::string from = preview_trim(line.substr(0, arrow));
+                    size_t colon = line.find(':', arrow + arrow_n);
+                    std::string to = preview_trim(line.substr(arrow + arrow_n, colon == std::string::npos ? std::string::npos : colon - arrow - arrow_n));
+                    std::string label = colon == std::string::npos ? "" : preview_trim(line.substr(colon + 1));
+                    size_t a = mermaid_node(g, from), b = mermaid_node(g, to);
+                    if (a != (size_t)-1 && b != (size_t)-1) {
+                        g.edges.push_back({a, b, label});
+                        g.sequence_messages.push_back(label);
+                    }
+                }
+            }
+            return g;
+        }
+        if (first.find("flowchart") == 0 || first.find("graph ") == 0 || first.find("stateDiagram") == 0) {
+            g.known = true;
+            g.left_right = first.find("LR") != std::string::npos || first.find("RL") != std::string::npos;
+        } else return g;
+        const char *arrows[] = {"-.->", "==>", "-->", "---", "--x", "--o"};
+        for (const std::string &line0 : lines) {
+            std::string line = preview_trim(line0);
+            if (line.empty() || line[0] == '%' || line.find("flowchart") == 0 || line.find("graph ") == 0 ||
+                line.find("stateDiagram") == 0 || line.find("subgraph") == 0 || line == "end" || line.find("classDef ") == 0 ||
+                line.find("style ") == 0 || line.find("linkStyle ") == 0) continue;
+            size_t p = 0;
+            std::string previous;
+            while (p < line.size()) {
+                size_t at = std::string::npos; size_t ai = 0, an = 0;
+                for (size_t k = 0; k < sizeof arrows / sizeof *arrows; k++) {
+                    size_t found = line.find(arrows[k], p);
+                    if (found < at) { at = found; ai = k; an = strlen(arrows[k]); }
+                }
+                if (at == std::string::npos) {
+                    std::string expr = preview_trim(line.substr(p));
+                    size_t end = expr.find('|');
+                    if (end != std::string::npos) expr.resize(end);
+                    size_t id = mermaid_node(g, expr);
+                    (void)id;
+                    break;
+                }
+                std::string left = previous.empty() ? preview_trim(line.substr(p, at - p)) : previous;
+                size_t a = mermaid_node(g, left);
+                size_t rhs = at + an;
+                std::string arrow_label;
+                if (rhs < line.size() && line[rhs] == '|') {
+                    size_t end = line.find('|', rhs + 1);
+                    if (end != std::string::npos) { arrow_label = line.substr(rhs + 1, end - rhs - 1); rhs = end + 1; }
+                }
+                size_t next = std::string::npos, nextn = 0;
+                for (const char *arrow : arrows) { size_t found = line.find(arrow, rhs); if (found < next) { next = found; nextn = strlen(arrow); } }
+                std::string right = preview_trim(line.substr(rhs, next == std::string::npos ? std::string::npos : next - rhs));
+                size_t b = mermaid_node(g, right);
+                if (a != (size_t)-1 && b != (size_t)-1) g.edges.push_back({a, b, arrow_label});
+                if (next == std::string::npos) break;
+                previous = right;
+                p = next;
+                (void)ai;
+                (void)nextn;
+            }
+        }
+        return g;
+    }
+
 float preview_draw_code(const PreviewBlock &block, float x, float y, float width, bool draw) {
     const Lang *lang = preview_code_lang(block.language);
     int cw = std::max(1, E.cw);
@@ -1542,7 +1749,7 @@ float preview_draw_code(const PreviewBlock &block, float x, float y, float width
                     size_t adv = 1;
                     uint32_t cp = u8_decode(line.data() + i, end - i, &adv);
                     const AtlasGlyph *g = atlas_glyph(E.atlas, E.font, cp, FS_REGULAR);
-                    if (g && !g->blank) { RInst inst; r_make_glyph(E.r, &inst, g, pen, y + (float)E.rowasc, TOKCOL[tok[i]]); r_push(E.r, &inst, 1); }
+                    if (g && !g->blank) { RInst inst; r_make_glyph(E.r, &inst, g, pen, y + (float)E.rowasc, preview_token_color(tok[i])); r_push(E.r, &inst, 1); }
                     pen += g ? g->adv : (float)cw;
                     i += adv;
                 }
@@ -1561,7 +1768,6 @@ void preview_refresh(Doc &d) {
     std::string source;
     d.buf.copy(0, d.buf.size(), source);
     E.preview_blocks = preview_parse(source, f);
-    E.preview_diagnostics = preview_diagnose(source, f, d.path);
     E.preview_doc = &d;
     E.preview_revision = d.buf.revision();
     E.preview_path = d.path;
@@ -2754,27 +2960,106 @@ Layout layout() {
     return l;
 }
 
+float draw_mermaid(const PreviewBlock &block, float x, float y, float width, float line_h, const PreviewPalette &palette) {
+    MermaidGraph graph = preview_mermaid(block.lines);
+    float left = x + (float)S(10), available = std::max((float)S(100), width - (float)S(20));
+    if (!graph.known || graph.nodes.empty()) {
+        for (const std::string &line : block.lines) {
+            std::string text = line.empty() ? " " : line;
+            y = preview_draw_inline(text, left, y, available, line_h, E.font, FS_REGULAR, palette.muted, true);
+        }
+        return y + (float)S(8);
+    }
+    float node_w = std::min((float)S(190), std::max((float)S(112), available * (graph.left_right ? 0.24f : 0.62f)));
+    float node_h = (float)S(46), gap_x = (float)S(42), gap_y = (float)S(44);
+    size_t per_row = graph.left_right ? std::max<size_t>(1, (size_t)((available + gap_x) / (node_w + gap_x))) : 1;
+    std::vector<float> nx(graph.nodes.size()), ny(graph.nodes.size());
+    for (size_t i = 0; i < graph.nodes.size(); i++) {
+        size_t row = graph.left_right ? i / per_row : i;
+        size_t col = graph.left_right ? i % per_row : 0;
+        nx[i] = left + (float)col * (node_w + gap_x);
+        ny[i] = y + (float)row * (node_h + gap_y);
+    }
+    if (!graph.sequence) for (const MermaidEdge &edge : graph.edges) {
+        if (edge.from >= graph.nodes.size() || edge.to >= graph.nodes.size()) continue;
+        float sx, sy, ex, ey;
+        if (graph.left_right) {
+            sx = nx[edge.from] + node_w;
+            sy = ny[edge.from] + node_h / 2;
+            ex = nx[edge.to];
+            ey = ny[edge.to] + node_h / 2;
+            if (std::fabs(ey - sy) < 2.f) {
+                float w = std::max(0.f, ex - sx);
+                r_rect(E.r, sx, sy - (float)S(1), w, (float)S(2), palette.accent);
+                if (w > S(12)) draw_icon(IC_ARROW_R, ex - (float)S(14), ey - (float)S(7), S(14), palette.accent);
+            } else {
+                float mid = sx + (ex - sx) / 2;
+                r_rect(E.r, sx, sy - (float)S(1), std::max(0.f, mid - sx), (float)S(2), palette.accent);
+                r_rect(E.r, mid - (float)S(1), std::min(sy, ey), (float)S(2), std::fabs(ey - sy), palette.accent);
+                r_rect(E.r, mid, ey - (float)S(1), std::max(0.f, ex - mid), (float)S(2), palette.accent);
+            }
+            if (!edge.label.empty()) draw_text(E.ui, sx + (std::max(0.f, ex - sx) - text_width(E.ui, edge.label.c_str())) / 2, ui_base(sy - (float)S(18), (float)S(18)), edge.label.c_str(), palette.muted, available);
+        } else {
+            sx = nx[edge.from] + node_w / 2;
+            sy = ny[edge.from] + node_h;
+            ex = nx[edge.to] + node_w / 2;
+            ey = ny[edge.to];
+            float mid = sy + (ey - sy) / 2;
+            if (std::fabs(ex - sx) < 2.f) r_rect(E.r, sx - (float)S(1), sy, (float)S(2), std::max(0.f, ey - sy), palette.accent);
+            else {
+                r_rect(E.r, sx - (float)S(1), sy, (float)S(2), std::max((float)S(1), mid - sy), palette.accent);
+                r_rect(E.r, std::min(sx, ex), mid - (float)S(1), std::fabs(ex - sx), (float)S(2), palette.accent);
+                r_rect(E.r, ex - (float)S(1), mid, (float)S(2), std::max((float)S(1), ey - mid), palette.accent);
+            }
+            if (ey > sy) draw_icon(IC_CHEV_D, ex - (float)S(7), ey - (float)S(12), S(14), palette.accent);
+            if (!edge.label.empty()) draw_text(E.ui, sx + (float)S(7), ui_base(mid - (float)S(10), (float)S(18)), edge.label.c_str(), palette.muted, available);
+        }
+    }
+    if (graph.sequence) {
+        float end_y = y + (float)S(50) + (float)graph.edges.size() * (float)S(42);
+        for (size_t i = 0; i < graph.nodes.size(); i++) {
+            float cx = left + ((float)i + 0.5f) * available / (float)graph.nodes.size();
+            r_rect(E.r, cx - (float)S(1), y + node_h, (float)S(2), end_y - y - node_h, palette.border);
+            r_rrect(E.r, cx - node_w / 2, y, node_w, node_h, palette.table_head, S(6), 1);
+            float tw = text_width(E.ui, graph.nodes[i].label.c_str());
+            draw_text(E.ui, cx - tw / 2, ui_base(y, node_h), graph.nodes[i].label.c_str(), palette.text, node_w - (float)S(12));
+        }
+        for (size_t i = 0; i < graph.edges.size(); i++) {
+            const MermaidEdge &e = graph.edges[i];
+            if (e.from >= graph.nodes.size() || e.to >= graph.nodes.size()) continue;
+            float cy = y + node_h + (float)S(22) + (float)i * (float)S(42);
+            float from = left + ((float)e.from + 0.5f) * available / (float)graph.nodes.size();
+            float to = left + ((float)e.to + 0.5f) * available / (float)graph.nodes.size();
+            r_rect(E.r, std::min(from, to), cy, std::fabs(to - from), (float)S(2), palette.accent);
+            draw_icon(to >= from ? IC_ARROW_R : IC_ARROW_L, to - (float)S(7), cy - (float)S(7), S(14), palette.accent);
+            draw_text(E.ui, std::min(from, to) + (std::fabs(to - from) - text_width(E.ui, e.label.c_str())) / 2,
+                      ui_base(cy - (float)S(20), (float)S(18)), e.label.c_str(), palette.text, available);
+        }
+        return end_y + (float)S(12);
+    }
+    for (size_t i = 0; i < graph.nodes.size(); i++) {
+        const MermaidNode &node = graph.nodes[i];
+        float bx = nx[i], by = ny[i];
+        uint32_t fill = palette.panel;
+        if (node.shape == 'c') r_rrect(E.r, bx + (node_w - node_h) / 2, by, node_h, node_h, fill, (int)(node_h / 2), 1);
+        else if (node.shape == 'd') {
+            r_rrect(E.r, bx + (float)S(8), by + (float)S(4), node_w - (float)S(16), node_h - (float)S(8), fill, S(8), 1);
+        } else r_rrect(E.r, bx, by, node_w, node_h, fill, node.shape == 'o' ? (int)(node_h / 2) : S(6), 1);
+        float text_w = text_width(E.ui, node.label.c_str(), FS_BOLD);
+        draw_text(E.ui, bx + std::max((float)S(6), (node_w - text_w) / 2), ui_base(by, node_h), node.label.c_str(), palette.text, node_w - (float)S(12), FS_BOLD);
+    }
+    return y + (float)((graph.left_right ? (graph.nodes.size() + per_row - 1) / per_row : graph.nodes.size()) * (size_t)(node_h + gap_y));
+}
+
 void draw_preview(const Layout &L, float x, float width) {
     Doc &d = D();
     preview_refresh(d);
+    PreviewPalette palette = preview_palette();
     float top = (float)L.text_y + (float)S(16);
     float left = x + (float)S(24);
     float content_w = std::max((float)S(80), width - (float)S(48));
     float bottom = (float)L.ed_bottom;
-    uint32_t preview_bg = ui_mix(C_EDITOR, C_UI, E.preview_target ? 0.018f : 0.010f);
-    r_rect(E.r, x, (float)L.text_y, width, (float)(L.ed_bottom - L.text_y), preview_bg);
-    size_t warning_count = std::min<size_t>(3, E.preview_diagnostics.size());
-    for (size_t i = 0; i < warning_count; i++) {
-        const PreviewDiagnostic &diag = E.preview_diagnostics[i];
-        std::string label = "Preview note (line " + std::to_string(diag.line) + "): " + diag.message;
-        draw_text(E.ui, left, ui_base(top, (float)S(20)), label.c_str(), C_ORANGE, content_w);
-        top += (float)S(22);
-    }
-    if (E.preview_diagnostics.size() > warning_count) {
-        std::string more = std::to_string(E.preview_diagnostics.size() - warning_count) + " more preview notes";
-        draw_text(E.ui, left, ui_base(top, (float)S(20)), more.c_str(), C_ORANGE, content_w);
-        top += (float)S(22);
-    }
+    r_rect(E.r, x, (float)L.text_y, width, (float)(L.ed_bottom - L.text_y), palette.bg);
     if (E.preview_blocks.empty()) {
         draw_text(E.ui, left, ui_base(top, (float)S(24)), "Nothing to preview", C_UI_FAINT, content_w);
         return;
@@ -2790,25 +3075,38 @@ void draw_preview(const Layout &L, float x, float width) {
             if (y + (float)S(10) >= (float)L.text_y && y < bottom) r_rect(E.r, left, y + (float)S(5), content_w, (float)S(1), C_BORDER);
             y += (float)S(18);
         } else if (b.kind == PreviewBlockKind::Heading) {
-            Font *font = b.level <= 1 ? E.big : E.ui;
-            float lh = b.level <= 1 ? (float)S(34) : (float)S(27);
-            uint32_t color = C_UI;
-            y += b.level <= 1 ? (float)S(8) : (float)S(4);
-            if (y + lh >= (float)L.text_y && y < bottom) y = preview_draw_inline(b.text, left, y, content_w, lh, font, FS_BOLD, color, true);
+            int level = std::clamp(b.level, 1, 6);
+            Font *font = E.preview_heading[level - 1];
+            if (!font) font = level == 1 ? E.big : E.ui;
+            float lh = std::max((float)S(18), (float)font_cell_h(font) + (float)S(4));
+            uint32_t color = palette.text;
+            y += level <= 2 ? (float)S(8) : (float)S(5);
+            if (E.preview_target == 1 && y + lh >= (float)L.text_y && y < bottom)
+                r_rect(E.r, left, y + (float)S(3), (float)S(3), lh - (float)S(6), palette.accent);
+            if (y + lh >= (float)L.text_y && y < bottom)
+                y = preview_draw_inline(b.text, left + (E.preview_target ? (float)S(10) : 0.f), y, content_w, lh, font, FS_BOLD, color, true);
             else y += lh;
-            y += (float)S(6);
+            if (E.preview_target == 0 && level <= 2 && y < bottom) {
+                y += (float)S(4);
+                r_rect(E.r, left, y, content_w, (float)S(1), palette.border);
+            }
+            y += level <= 2 ? (float)S(9) : (float)S(6);
+        } else if (b.kind == PreviewBlockKind::Diagram) {
+            float diagram_y = y + (float)S(8);
+            float end_y = draw_mermaid(b, left, diagram_y, content_w, (float)E.rowh, palette);
+            y = std::max(end_y, diagram_y + (float)S(50)) + (float)S(12);
         } else if (b.kind == PreviewBlockKind::Code) {
             float pad = (float)S(12);
             float code_y = y + pad;
             float code_x = left + pad;
             float code_h = (float)(preview_code_rows(b, content_w - 2 * pad) + 1) * (float)E.rowh + pad * 2;
-            if (y < bottom && y + code_h >= (float)L.text_y) r_rect(E.r, left, y, content_w, code_h, ui_mix(C_BOX, preview_bg, E.preview_target ? 0.05f : 0.02f));
+            if (y < bottom && y + code_h >= (float)L.text_y) r_rect(E.r, left, y, content_w, code_h, palette.panel);
             code_y = preview_draw_code(b, code_x, code_y, content_w - 2 * pad, true);
             y = std::max(code_y, y + code_h) + (float)S(10);
         } else if (b.kind == PreviewBlockKind::Quote) {
             float lh = (float)S(22);
-            if (y + lh >= (float)L.text_y && y < bottom) r_rect(E.r, left, y, (float)S(3), lh, C_ACCENT);
-            y = preview_draw_inline(b.text, left + (float)S(12), y, content_w - (float)S(12), lh, E.ui, FS_ITALIC, C_UI_DIM,
+            if (y + lh >= (float)L.text_y && y < bottom) r_rect(E.r, left, y, (float)S(3), lh, palette.accent);
+            y = preview_draw_inline(b.text, left + (float)S(12), y, content_w - (float)S(12), lh, E.ui, FS_ITALIC, palette.muted,
                                    y + lh >= (float)L.text_y && y < bottom);
             y += (float)S(4);
         } else if (b.kind == PreviewBlockKind::List) {
@@ -2817,27 +3115,59 @@ void draw_preview(const Layout &L, float x, float width) {
             if (b.ordered) {
                 if (!was_ordered) ordered_index = 0;
                 std::string prefix = std::to_string(++ordered_index) + ".";
-                draw_text(E.ui, left + indent, ui_base(y, lh), prefix.c_str(), preview_link_color(), (float)S(24));
+                draw_text(E.ui, left + indent, ui_base(y, lh), prefix.c_str(), palette.accent, (float)S(24));
                 was_ordered = true;
-            } else draw_text(E.ui, left + indent, ui_base(y, lh), "\xE2\x80\xA2", preview_link_color(), (float)S(14));
-            y = preview_draw_inline(b.text, left + indent + (float)S(22), y, content_w - indent - (float)S(22), lh, E.ui, FS_REGULAR, C_UI,
+            } else if (b.task) {
+                float size = (float)S(14), bx = left + indent;
+                r_rrect(E.r, bx, y + (lh - size) / 2, size, size, palette.bg, S(2), 1);
+                if (b.checked) draw_icon(IC_CHECK, bx, y + (lh - size) / 2, S(14), palette.accent);
+            } else draw_text(E.ui, left + indent, ui_base(y, lh), "\xE2\x80\xA2", palette.accent, (float)S(14));
+            float text_indent = b.task ? (float)S(22) : (float)S(22);
+            y = preview_draw_inline(b.text, left + indent + text_indent, y, content_w - indent - text_indent, lh, E.ui, FS_REGULAR, palette.text,
                                    y + lh >= (float)L.text_y && y < bottom);
         } else if (b.kind == PreviewBlockKind::Table) {
-            float lh = (float)S(24);
-            for (size_t i = 0; i < b.lines.size(); i++) {
-                std::string row;
-                bool in_cell = false;
-                for (char c : b.lines[i]) {
-                    if (c == '|') { if (in_cell) row += "   |   "; in_cell = !in_cell; }
-                    else if (in_cell) row += c;
+            bool markdown_table = b.level == 2;
+            bool has_header = b.level != 0;
+            size_t first_data = markdown_table ? 2 : 0;
+            if (b.lines.size() <= first_data) continue;
+            std::vector<std::string> header = preview_table_cells(b.lines[0]);
+            size_t columns = std::max<size_t>(1, header.size());
+            std::vector<int> align = markdown_table ? preview_table_align(b.lines[1], columns) : std::vector<int>(columns, 0);
+            std::vector<float> widths(columns, content_w / (float)columns);
+            float pad = (float)S(10), line_h = (float)S(22);
+            size_t row_count = markdown_table ? b.lines.size() - 1 : b.lines.size();
+            for (size_t ri = 0; ri < row_count; ri++) {
+                bool is_header = has_header && ri == 0;
+                size_t source_row = markdown_table && ri > 0 ? ri + 1 : ri;
+                std::vector<std::string> cells = preview_table_cells(b.lines[source_row]);
+                cells.resize(columns);
+                std::vector<std::vector<std::string>> wrapped(columns);
+                size_t row_lines = 1;
+                for (size_t c = 0; c < columns; c++) {
+                    wrapped[c] = wrap_lines(cells[c], std::max((float)S(24), widths[c] - 2 * pad));
+                    row_lines = std::max(row_lines, wrapped[c].size());
                 }
-                size_t first = row.find_first_not_of(" \t");
-                if (first != std::string::npos) row.erase(0, first);
-                size_t last = row.find_last_not_of(" \t");
-                if (last != std::string::npos) row.erase(last + 1);
-                if (!row.empty() && row.find_first_not_of("|:- ") == std::string::npos) continue;
-                y = preview_draw_inline(row, left, y, content_w, lh, E.ui, i == 0 ? FS_BOLD : FS_REGULAR,
-                                        i == 0 ? C_ACCENT : C_UI, y + lh >= (float)L.text_y && y < bottom);
+                float row_h = (float)row_lines * line_h + (float)S(10);
+                bool visible = y + row_h >= (float)L.text_y && y < bottom;
+                if (visible) {
+                    uint32_t row_bg = is_header ? palette.table_head : (E.preview_target == 0 && (ri & 1) ? palette.table_alt : palette.bg);
+                    r_rect(E.r, left, y, content_w, row_h, row_bg);
+                    r_rect(E.r, left, y + row_h - (float)S(1), content_w, (float)S(1), palette.border);
+                    if (E.preview_target == 1) r_rect(E.r, left, y, content_w, (float)S(1), palette.border);
+                    for (size_t c = 0; c < columns; c++) {
+                        if (E.preview_target == 1 && c) r_rect(E.r, left + (float)c * widths[c], y, (float)S(1), row_h, palette.border);
+                        for (size_t ln = 0; ln < wrapped[c].size(); ln++) {
+                            float tx = left + (float)c * widths[c] + pad;
+                            float available = std::max(0.f, widths[c] - 2 * pad);
+                            float tw = text_width(E.ui, wrapped[c][ln].c_str(), is_header ? FS_BOLD : FS_REGULAR);
+                            if (align[c] == 1) tx += std::max(0.f, (available - tw) / 2);
+                            else if (align[c] == 2) tx += std::max(0.f, available - tw);
+                            preview_draw_inline(wrapped[c][ln], tx, y + (float)S(5) + (float)ln * line_h, available, line_h, E.ui,
+                                               is_header ? FS_BOLD : FS_REGULAR, palette.text, true);
+                        }
+                    }
+                }
+                y += row_h;
             }
             y += (float)S(8);
         } else {
@@ -2851,13 +3181,15 @@ void draw_preview(const Layout &L, float x, float width) {
 
 float preview_max_scroll(const Layout &L, float width) {
     float content_w = std::max((float)S(80), width - (float)S(48));
-    float height = (float)S(16) + (float)std::min<size_t>(4, E.preview_diagnostics.size()) * (float)S(22);
+    float height = (float)S(16);
     for (const PreviewBlock &b : E.preview_blocks) {
         if (b.kind == PreviewBlockKind::Rule) height += (float)S(18);
         else if (b.kind == PreviewBlockKind::Heading) height += (b.level <= 1 ? (float)S(48) : (float)S(37));
         else if (b.kind == PreviewBlockKind::Code) {
             height += (float)preview_code_rows(b, content_w - (float)S(24)) * (float)E.rowh;
             height += (float)S(34);
+        } else if (b.kind == PreviewBlockKind::Diagram) {
+            height += (float)std::max<size_t>(1, b.lines.size()) * (float)S(70);
         } else {
             size_t rows = wrap_lines(b.text, content_w).size();
             height += (float)std::max<size_t>(1, rows) * (float)S(22) + (b.kind == PreviewBlockKind::Paragraph ? (float)S(6) : (float)S(4));
@@ -5293,7 +5625,7 @@ void build_frame() {
     /* ---- editor column: tab row ---- */
     float ex = (float)L.ed_x, ew = (float)(E.W - L.ed_x);
     bool can_preview = !d.dv && !d.mv && preview_format(d.path) != PreviewFormat::None;
-    float preview_w = can_preview ? (float)S(188) : 0.f;
+    float preview_w = can_preview ? (float)S(260) : 0.f;
     float tab_ew = std::max(0.f, ew - preview_w);
     if (can_preview && E.preview_open && E.preview_split) {
         preview_refresh(d);
@@ -5351,10 +5683,11 @@ void build_frame() {
         if (nt && tx < ex + tab_ew) hit(tx, ty, ex + tab_ew - tx, th, H_TABSPACE, 0);   /* the empty part of the strip: a double click opens a new empty tab */
         if (can_preview) {
             float bx = ex + tab_ew, by = ty + (float)S(4), bh = th - (float)S(8);
-            float widths[3] = {(float)S(78), (float)S(48), preview_w - (float)S(126)};
-            const char *labels[3] = {E.preview_open ? "Source" : "Preview", "Split", E.preview_target ? "GitLab" : "GitHub"};
-            for (int i = 0; i < 3; i++) {
-                bool selected = i == 0 ? E.preview_open : i == 1 ? E.preview_split : false;
+            preview_mode_init();
+            float widths[4] = {(float)S(76), (float)S(48), (float)S(64), preview_w - (float)S(188)};
+            const char *labels[4] = {E.preview_open ? "Source" : "Preview", "Split", E.preview_target ? "GitLab" : "GitHub", E.preview_light ? "Light" : "Dark"};
+            for (int i = 0; i < 4; i++) {
+                bool selected = i == 0 ? E.preview_open : i == 1 ? E.preview_split : i == 2 ? true : false;
                 uint32_t bg = selected ? C_SELROW : hovered(H_PREVIEW, i) ? C_HOVER : C_CHROME;
                 r_rect(E.r, bx, by, widths[i], bh, bg);
                 if (selected) r_rect(E.r, bx, by + bh - (float)S(2), widths[i], (float)S(2), C_ACCENT);
@@ -6800,11 +7133,11 @@ void do_action(int act) {
     case A_VIEW_GIT: show_view(V_GIT); break;
     case A_LANG: open_picker(PICK_LANG); break;
     case A_PREVIEW:
-        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc and reStructuredText files";
+        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc, reStructuredText and Mermaid files";
         else { E.preview_open = !E.preview_open; E.preview_split = false; E.preview_scroll = 0; E.status_msg.clear(); }
         break;
     case A_PREVIEW_SPLIT:
-        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc and reStructuredText files";
+        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc, reStructuredText and Mermaid files";
         else { E.preview_open = true; E.preview_split = !E.preview_split; E.preview_scroll = (float)d.top * (float)E.rowh; E.status_msg.clear(); }
         break;
     case A_THEME: open_picker(PICK_THEME); break;
@@ -7394,6 +7727,7 @@ void click_hit(const Hit &h) {
         if (h.id == 0) do_action(A_PREVIEW);
         else if (h.id == 1) do_action(A_PREVIEW_SPLIT);
         else if (h.id == 2) { E.preview_target = 1 - E.preview_target; }
+        else if (h.id == 3) { preview_mode_init(); E.preview_light = !E.preview_light; }
         break;
     case H_SETCOG: if (E.mode == M_SETTINGS) set_close(); else set_open(); break;
     case H_ACTIVITY: set_close(); show_view((View)h.id); break;
@@ -7697,7 +8031,7 @@ void handle_event(const SDL_Event &e) {
             redraw();
             break;
         }
-        float tab_area = (float)(E.W - L.ed_x) - (preview_format(d.path) != PreviewFormat::None && !d.dv && !d.mv ? (float)S(188) : 0.f);
+        float tab_area = (float)(E.W - L.ed_x) - (preview_format(d.path) != PreviewFormat::None && !d.dv && !d.mv ? (float)S(260) : 0.f);
         if (E.mx >= (float)L.ed_x && E.mx < (float)L.ed_x + tab_area && E.my >= (float)L.tab_y && E.my < (float)L.text_y && !splash()) {   /* over the tab strip: slide the tabs, keep the active one */
             E.tab_scroll += (float)(e.wheel.x - e.wheel.y) * (float)S(70);
             redraw();
@@ -7906,9 +8240,10 @@ void run_script(const char *script) {
             printf("sidebar: %d\n", E.side_open ? 1 : 0);
             printf("settings: open=%d category=%d query=%s rows=%zu\n", g_set.open ? 1 : 0, g_set.cat, g_set.q.c_str(), g_set.rows.size());
             if (E.preview_open) preview_refresh(dd);
-            printf("preview: open=%d split=%d target=%s format=%d blocks=%zu notes=%zu scroll=%.0f\n", E.preview_open ? 1 : 0,
-                   E.preview_split ? 1 : 0, E.preview_target ? "GitLab" : "GitHub", (int)preview_format(dd.path), E.preview_blocks.size(),
-                   E.preview_diagnostics.size(), E.preview_scroll);
+            preview_mode_init();
+            printf("preview: open=%d split=%d target=%s mode=%s format=%d blocks=%zu scroll=%.0f\n", E.preview_open ? 1 : 0,
+                   E.preview_split ? 1 : 0, E.preview_target ? "GitLab" : "GitHub", E.preview_light ? "Light" : "Dark",
+                   (int)preview_format(dd.path), E.preview_blocks.size(), E.preview_scroll);
             printf("frame_ms: %.3f\n", E.last_build_ms);
             lint_kick(dd, true);
             if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());
@@ -8301,6 +8636,12 @@ int main(int argc, char **argv) {
     E.ui = font_open("sans", 13.0 * E.scale, false);
     E.big = font_open("sans", 34.0 * E.scale, false);
     if (!E.font || !E.ui || !E.big) { fprintf(stderr, "hootedit: no font\n"); return 1; }
+    E.preview_heading[0] = E.big;
+    E.preview_heading[1] = font_open("sans", 27.0 * E.scale, false);
+    E.preview_heading[2] = font_open("sans", 23.0 * E.scale, false);
+    E.preview_heading[3] = font_open("sans", 19.0 * E.scale, false);
+    E.preview_heading[4] = font_open("sans", 16.0 * E.scale, false);
+    E.preview_heading[5] = E.ui;
     startup_mark("fonts loaded");
     E.cw = font_cell_w(E.font); E.ch = font_cell_h(E.font); E.asc = font_ascent(E.font);
     E.rowh = std::max(E.ch, (int)lround(19.0 * E.scale));
