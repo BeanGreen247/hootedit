@@ -1,0 +1,9 @@
+# Documentation preview
+
+Open a `.md`, `.markdown`, `.mdown`, `.mkd`, `.adoc`, `.asciidoc`, `.asc`, `.rst`, `.rest`, `.mmd` or `.mermaid` file and use the **Preview** and **Split** controls at the right of the tab strip. The View menu has the same preview commands; `Ctrl+Shift+V` toggles the rendered view. Split mode keeps the source editable beside the preview and scrolling either pane moves the other pane.
+
+The tab-strip controls select a **GitHub** or **GitLab** rendering profile and a preview-only **Light** or **Dark** palette. The initial palette is chosen from the editor theme; changing it does not change the editor theme. The forge profile changes its colors and presentation rather than only changing link color.
+
+The native renderer does not execute HTML, scripts or remote content. It renders all six Markdown heading levels with separate sizes, preserves heading text case, and supports paragraphs, inline emphasis/code/links, lists and task lists, quotations, rules, tables, fenced code and Mermaid blocks. Standalone `.mmd` and `.mermaid` files open as diagrams. Flowcharts and sequence diagrams have native diagram rendering; other Mermaid diagram families may be displayed as source. It also supports common AsciiDoc headings, lists, source blocks and delimited tables, plus reStructuredText underlined headings, lists, grid tables and `code-block` / `sourcecode` directives. Recognized code blocks use Hootedit's lexer for syntax colors. Images are shown as descriptive placeholders; raw HTML is shown as text. No preview warning notes are rendered.
+
+This is a native, self-contained preview, not a full implementation of every GitHub or GitLab extension, plugin, HTML feature or diagram family. Complex documents may differ from their hosted rendering, so use the preview to review layout and content, not as a guarantee of pixel-identical forge output.

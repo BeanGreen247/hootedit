@@ -1,0 +1,45 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef HE_REMOTE_H
+#define HE_REMOTE_H
+#include <string>
+#include <vector>
+
+/* Remote workspaces over ssh, sftp, ftp/ftps and smb, driven by the ordinary command line clients (ssh, sftp, curl, smbclient).
+ * ssh and sftp keep one authenticated connection open (ControlMaster) so a password or passphrase is asked once, through the
+ * editor's own prompt (see askpass.h). ftp and smb take a password the editor asks for and hands over in the environment or a
+ * private temporary file, never on a command line. Every call blocks: run it on a worker thread. */
+struct RemoteProfile {
+    std::string name, proto;      /* proto: ssh, sftp, ftp, ftps, smb */
+    std::string host, user, path, key;   /* key: an identity file for ssh and sftp, empty for the defaults */
+    int port = 0;                 /* 0 = the protocol's default */
+    bool insecure = false;        /* ftps: accept a self-signed certificate (insecure=1 in remotes.ini) */
+};
+struct RemoteEntry { std::string name; bool dir = false; };
+
+std::vector<RemoteProfile> remote_load();
+void remote_save(const std::vector<RemoteProfile> &v);
+bool remote_tools(const RemoteProfile &p, std::string *missing);          /* the command line client for this protocol is installed */
+bool remote_needs_password(const RemoteProfile &p);                       /* ftp and smb: the editor asks and passes it in */
+
+int remote_connect(const RemoteProfile &p, const std::string &pw, std::string *err);
+void remote_disconnect(const RemoteProfile &p);
+int remote_list(const RemoteProfile &p, const std::string &pw, const std::string &dir, std::vector<RemoteEntry> &out, std::string *err);
+int remote_get(const RemoteProfile &p, const std::string &pw, const std::string &remote, const std::string &local, std::string *err);
+int remote_put(const RemoteProfile &p, const std::string &pw, const std::string &local, const std::string &remote, std::string *err);
+struct SshHost { std::string name, detail; };   /* a Host entry of ~/.ssh/config; detail is user@hostname:port as far as the file says */
+std::vector<SshHost> remote_ssh_hosts();
+
+struct RemoteHit { std::string path; int line = 0; std::string text; };
+/* text search below a folder, run by grep on the server over ssh (ssh and sftp connections): at most 300 matches, no binary files, .git and node_modules skipped */
+int remote_grep(const RemoteProfile &p, const std::string &dir, const std::string &pattern, std::vector<RemoteHit> &out, std::string *err);
+
+enum RemoteOp { ROP_NEWFILE, ROP_MKDIR, ROP_RENAME, ROP_DELETE, ROP_RMDIR };
+/* new file, new folder, rename (path -> to), delete a file, delete a folder with its contents (sftp, ftp: empty folders only) */
+int remote_op(const RemoteProfile &p, const std::string &pw, RemoteOp op, const std::string &path, const std::string &to, std::string *err);
+std::string remote_ssh_line(const RemoteProfile &p);                      /* "ssh -p 22 user@host" for a terminal */
+std::string remote_label(const RemoteProfile &p);                         /* "user@host:22" */
+#endif

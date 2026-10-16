@@ -1,0 +1,8777 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <malloc.h>
+#include <math.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <functional>
+#include <map>
+#include <set>
+#include <thread>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "appicon.h"
+#include "askpass.h"
+#include "remote.h"
+#include "doc.h"
+#include "engine/atlas.h"
+#include "engine/font.h"
+#include "engine/gl.h"
+#include "engine/render.h"
+#include "fuzzy.h"
+#include "git.h"
+#include "merge.h"
+#include "icons.h"
+#include "regex.h"
+#include "search.h"
+#include "lestrix/ui/fleetwm.h"
+#include "lestrix/ui/tcore.h"
+#include "lestrix/ui/termview.h"
+#include "lestrix/ui/workpool.h"
+#include "lestrix/ui/uitheme.h"
+#include "syntax.h"
+#include "tree.h"
+#include "vim.h"
+#include "benchcore.h"
+#include <sys/inotify.h>
+
+#include "lint.h"
+#include "lint_priv.h"
+#include "outline.h"
+#include "preview.h"
+
+static Uint32 g_ev_wake;
+static std::atomic<int> g_wake_pending;
+/* thread-safe: other threads (terminal readers, the fleetwm watcher, the search workers) call this to get the UI loop to run once */
+void app_wake(void) {
+    int exp = 0;
+    if (g_ev_wake && g_wake_pending.compare_exchange_strong(exp, 1)) {
+        SDL_Event e;
+        SDL_zero(e);
+        e.type = g_ev_wake;
+        SDL_PushEvent(&e);
+    }
+}
+
+namespace {
+
+/* Colours come from the active theme: the same built-in themes as Lestrix (vendored uitheme.cpp) and the same "follow fleetwm" mode.
+ * apply_theme() fills these in; the defaults below only matter for the first frame before a theme is applied. */
+uint32_t C_CHROME, C_MENUBAR, C_EDITOR, C_BORDER, C_SELROW, C_HOVER, C_ACCENT, C_FIELD, C_GROUP, C_UI, C_UI_DIM, C_UI_FAINT, C_FG, C_GUTTER, C_GUTTER_CUR,
+         C_CURSOR, C_MENU, C_MENU_BORDER, C_MENU_SEL, C_SEL, C_BOX, C_BOX_LINE, C_RED, C_GREEN, C_ORANGE, C_ON_ACCENT,
+         C_CURLINE, C_GUIDE, C_GUIDE_ACT, C_OCC, C_BRACKET, C_SB_THUMB, C_SB_HOT,
+         C_GIT_ADD, C_GIT_MOD, C_GIT_DEL, C_GIT_UNT, C_GIT_CONF,                 /* file status colours (VS Code's gitDecoration.*) */
+         C_GUT_ADD, C_GUT_MOD, C_GUT_DEL,                                         /* the change bars in the editor gutter (editorGutter.*) */
+         C_DIFF_ADD, C_DIFF_ADD_TXT, C_DIFF_DEL, C_DIFF_DEL_TXT, C_DIFF_FILL, C_DIFF_FOLD;   /* diff editor line and word backgrounds */
+const uint32_t C_SHADE = RGBA(0, 0, 0, 120);
+uint32_t TOKCOL[T_COUNT];   /* indexed by Tok */
+const double BLINK_FOR = 10.0;   /* the cursor stops blinking this long after the last input: an idle editor draws nothing */
+const int TAB_W = 4;
+
+double now_s() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+long proc_rss_kb() {
+    FILE *f = fopen("/proc/self/statm", "r");
+    long pages = 0, rss = 0;
+    if (f) { if (fscanf(f, "%ld %ld", &pages, &rss) != 2) rss = 0; fclose(f); }
+    return rss * (sysconf(_SC_PAGESIZE) / 1024);
+}
+
+long proc_cpu_ticks() {
+    FILE *f = fopen("/proc/self/stat", "r");
+    long ut = 0, st = 0;
+    if (f) {
+        char b[1024];
+        size_t n = fread(b, 1, sizeof b - 1, f);
+        b[n] = 0;
+        char *rp = strrchr(b, ')');
+        if (rp && sscanf(rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %ld %ld", &ut, &st) != 2) ut = st = 0;
+        fclose(f);
+    }
+    return ut + st;
+}
+
+void fmt_count(double v, char *out, size_t cap) {
+    if (v >= 1e9) snprintf(out, cap, "%.2fG", v / 1e9);
+    else if (v >= 1e6) snprintf(out, cap, "%.2fM", v / 1e6);
+    else if (v >= 1e4) snprintf(out, cap, "%.1fk", v / 1e3);
+    else snprintf(out, cap, "%.0f", v);
+}
+
+std::string fmt_mb(double bytes) {
+    char b[32];
+    if (bytes >= 1048576) snprintf(b, sizeof b, "%.1f MB", bytes / 1048576); else snprintf(b, sizeof b, "%.0f KB", bytes / 1024);
+    return b;
+}
+
+std::string fmt_ms(double ms);
+std::string sfmt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+std::string sfmt(const char *fmt, ...) {
+    char b[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    return b;
+}
+
+size_t u8_len(unsigned char c) { return c < 0x80 ? 1 : c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1; }
+uint32_t u8_decode(const char *s, size_t n, size_t *adv) {
+    unsigned char c = (unsigned char)s[0];
+    size_t l = u8_len(c);
+    if (l > n) l = 1;
+    *adv = l;
+    if (l == 1) return c;
+    uint32_t cp = c & (0xff >> (l + 1));
+    for (size_t i = 1; i < l; i++) {
+        if (((unsigned char)s[i] & 0xc0) != 0x80) { *adv = 1; return c; }
+        cp = (cp << 6) | ((unsigned char)s[i] & 0x3f);
+    }
+    return cp;
+}
+
+int col_of(const std::string &t, size_t byte) {
+    int col = 0;
+    for (size_t i = 0; i < t.size() && i < byte;) {
+        size_t a;
+        uint32_t cp = u8_decode(t.data() + i, t.size() - i, &a);
+        col = cp == '\t' ? (col / TAB_W + 1) * TAB_W : col + 1;
+        i += a;
+    }
+    return col;
+}
+
+size_t byte_of(const std::string &t, int col) {
+    int c = 0;
+    size_t i = 0;
+    while (i < t.size()) {
+        size_t a;
+        uint32_t cp = u8_decode(t.data() + i, t.size() - i, &a);
+        int nc = cp == '\t' ? (c / TAB_W + 1) * TAB_W : c + 1;
+        if (nc > col) break;
+        c = nc;
+        i += a;
+    }
+    return i;
+}
+
+uint64_t fnv1a(const void *p, size_t n, uint64_t h) {
+    const unsigned char *s = static_cast<const unsigned char *>(p);
+    for (size_t i = 0; i < n; i++) { h ^= s[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 'Z') c = (char)(c + 32); return s; }
+
+/* ---- actions: one table drives the menus, the shortcuts and the --script test hook ---- */
+
+enum Act {
+    A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S,         A_K8S_CRD, A_SETTINGS, A_PREVIEW, A_PREVIEW_SPLIT, A_COUNT
+};
+const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes", "reload_crds", "settings", "preview", "preview_split"};
+
+const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
+                                  "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems",                                   "toggle live checks", "insert ansible task", "insert kubernetes resource", "reload crds", "settings page", "toggle document preview", "toggle split document preview"};
+
+struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
+struct Menu { const char *name; std::vector<MenuItem> items; };
+const std::vector<Menu> MENUS = {
+    {"File", {{"New File", "Ctrl+N", A_NEW}, {"Open File...", "Ctrl+O", A_OPEN_FILE}, {"Open Folder...", "Ctrl+K Ctrl+O", A_OPEN_FOLDER}, {"Quick Open...", "Ctrl+P", A_QUICK}, {"", "", A_NONE},
+              {"Save", "Ctrl+S", A_SAVE}, {"Save As...", "Ctrl+Shift+S", A_SAVEAS}, {"", "", A_NONE}, {"Close Tab", "Ctrl+W", A_CLOSE}, {"", "", A_NONE}, {"Settings...", "Ctrl+,", A_SETTINGS}, {"Exit", "Ctrl+Q", A_QUIT}}},
+    {"Edit", {{"Undo", "Ctrl+Z", A_UNDO}, {"Redo", "Ctrl+Y", A_REDO}, {"", "", A_NONE}, {"Cut", "Ctrl+X", A_CUT}, {"Copy", "Ctrl+C", A_COPY}, {"Paste", "Ctrl+V", A_PASTE},
+              {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
+    {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
+              {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
+              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"Document Preview", "Ctrl+Shift+V", A_PREVIEW}, {"Split Document Preview", "", A_PREVIEW_SPLIT}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"Reload Kubernetes CRDs", "", A_K8S_CRD}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+    {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
+                  {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
+    {"Help", {{"Keyboard Shortcuts", "Ctrl+K Ctrl+H", A_SHORTCUTS}, {"", "", A_NONE}, {"About Hootedit", "", A_ABOUT}}},
+};
+
+struct Hit { float x, y, w, h; int kind, id; };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL, H_SETCOG, H_SIDETOG, H_PREVIEW };
+enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX, M_SETTINGS };
+enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
+enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
+enum Pending { P_NONE, P_CLOSE, P_QUIT };
+enum PromptKind { PK_SAVEAS, PK_OPEN_FILE, PK_OPEN_FOLDER };
+enum View { V_EXPLORER, V_SEARCH, V_GIT, V_REMOTE };
+
+struct GitUi {
+    std::string msg;                                   /* the commit message being typed */
+    bool open_staged = true, open_changes = true, open_graph = true, open_tl = true, open_merge = true;
+    std::vector<GitCommit> log;                        /* the branch history, newest first */
+    struct Lane { int col = 0; std::vector<uint8_t> top, bot; std::vector<int> conv, out; };   /* the graph drawing of one commit row, see graph_lanes */
+    std::vector<Lane> lanes;
+    int lane_cols = 1;
+    int log_sel = -1;                                  /* the expanded commit, or -1 */
+    std::vector<GitFile> sel_files;                    /* its files, or the files that differ between two commits */
+    std::string cmp_a, cmp_b;                          /* set while sel_files is a comparison of two commits */
+    std::vector<GitCommit> tl;                         /* history of the active file */
+    std::string tl_path;
+    std::string mark_hash, mark_label;                 /* "Select for compare": Ctrl+click marks, Shift+click compares with the mark */
+    std::string err;                                   /* the last commit failure */
+    bool blame_inline = false;                          /* the faint "who changed this line" text after the cursor line */
+    double blame_t0 = 0;
+    bool tree_view = false;                            /* the file lists as a folder tree instead of a flat list */
+    std::set<std::string> collapsed;                   /* tree folders the user closed, as "<section>:<dir>" */
+    int smart_commit = 0;                              /* nothing staged: 0 ask, 1 always stage all, 2 never */
+    bool sync_confirm = true;                          /* ask before Sync Changes */
+};
+
+/* A VS Code style modal: a message, optional detail, an optional input, and buttons left to right. done gets the button index, or -1 for Esc. */
+struct Dialog {
+    std::string title, detail, text, placeholder;
+    bool input = false, mask = false;
+    bool fresh = false;                  /* the prefilled text is selected: the next key replaces it */
+    std::vector<std::string> btns;
+    int focus = 0;
+    std::function<void(int, const std::string &)> done;
+};
+
+/* A context menu. Submenus open to the right while the pointer is over their item. */
+struct CtxItem {
+    std::string label, hint;
+    bool sep = false, enabled = true, checked = false;
+    std::function<void()> act;
+    std::vector<CtxItem> sub;
+};
+struct CtxMenu { float x = 0, y = 0; std::vector<CtxItem> items; std::vector<int> open; };   /* open: the item index opened at each level */
+
+/* One git command on a worker thread, so a slow push or pull does not freeze the window. */
+struct GitJob {
+    std::thread th;
+    std::atomic<bool> done{false};
+    bool running = false;
+    std::string label, out;
+    int code = 0;
+    std::function<void(int, const std::string &)> cb;
+};
+
+struct Ed {
+    SDL_Window *win = nullptr;
+    SDL_GLContext gl = nullptr;
+    Atlas *atlas = nullptr;
+    Renderer *r = nullptr;
+    Font *font = nullptr, *big = nullptr, *ui = nullptr;
+    Font *preview_heading[6] = {};
+    char gl_desc[256] = "";
+    float scale = 1.f;
+    int W = 0, H = 0, cw = 8, ch = 16, asc = 12, rowh = 19, rowasc = 14;   /* editor font cell, line pitch and baseline inside a row */
+    int uh = 16, uasc = 12;                                                 /* UI font */
+    double now = 0;
+
+    std::vector<std::unique_ptr<Doc>> docs;
+    int active = 0, next_untitled = 1;
+    Mode mode = M_EDIT;
+    Pending pending = P_NONE;
+    PromptKind prompt_kind = PK_SAVEAS;
+    int confirm_idx = 0;
+    std::string find_q, find_msg, prompt_q, quick_q;
+    std::string repl_q;                                  /* the replacement typed in the Replace box */
+    bool repl_on = false, repl_focus = false;            /* the Replace box is open; the keyboard goes to it */
+    struct PItem { std::string label; int id; bool current; };
+    PickKind pick_kind = PICK_LANG;
+    std::string pick_filter;
+    int pick_sel = 0, pick_scroll = 0;
+    std::vector<PItem> pick_items;
+    std::string pick_title;
+    std::function<void(const PItem &)> pick_cb;
+    Dialog dlg;
+    CtxMenu ctx;
+    Mode mode_before = M_EDIT;                       /* where to return when a dialog or menu closes */
+    /* terminal panel (the Lestrix terminal engine) */
+    struct Term { TermCore *core = nullptr; std::string title = "shell"; bool dead = false; };
+    std::vector<std::unique_ptr<Term>> terms;
+    int term_active = -1;
+    bool term_open = false, term_focus = false, term_drag = false, split_drag = false, sb_drag = false;
+    const Doc *br_doc = nullptr;                     /* bracket match cache: which document, cursor and revision it was computed for */
+    size_t br_cur = ~(size_t)0;
+    uint64_t br_rev = 0;
+    long br_a = -1, br_b = -1;
+    int panel_logical = 260;                         /* panel height in logical pixels; saved in settings */
+    std::string term_choice = "builtin";             /* "builtin" or "external:<command>" */
+    struct ExtTerm { std::string name, dirflag; };
+    std::vector<ExtTerm> term_ext;
+    float term_rx = 0, term_ry = 0, term_rw = 0, term_rh = 0;   /* body rectangle of the last frame, for mouse routing */
+    /* file browser dialog (Open File, Open Folder, Save As) */
+    struct FdEntry { std::string name; bool dir; };
+    struct FileDlg {
+        FdKind kind = FD_OPEN_FILE;
+        std::string dir, filter, name, msg;
+        std::vector<FdEntry> all;
+        int sel = 0, scroll = 0;
+        bool hidden = false, name_focus = false, overwrite_armed = false, picked = false;   /* picked: the user chose a row (arrow keys or click), not just the default */
+    } fd;
+    const UiTheme *theme = nullptr;
+    bool follow_fleet = false;
+    FleetCfg fleet;
+    bool fleet_watch = false;
+    double next_fleet = 0;
+    TermPalette pal = {};
+    int menu_open = -1, menu_sel = 0;
+    std::vector<std::string> quick_files, quick_hits, side_hits;
+    std::vector<std::vector<int>> quick_pos;          /* matched character positions of each quick-open hit, for highlighting */
+    std::string side_q;
+    /* workspace search */
+    Searcher search;
+    std::string sq;
+    bool sq_regex = false, sq_case = false, sq_word = false;
+    bool find_regex = false, find_case = false;       /* the same toggles for the in-file find */
+    std::shared_ptr<const std::vector<std::string>> sfiles;
+    std::vector<SearchHit> sres;
+    SearchStats sstat;
+    struct SRow { int file; int hit; int count; };    /* hit < 0: a file header */
+    std::vector<SRow> srows;
+    uint64_t s_seen_scanned = ~0ull, s_seen_hits = ~0ull;
+    bool s_seen_done = false, s_active = false;
+    int sel_hit = -1;
+    std::vector<std::vector<int>> side_pos;           /* highlight positions for the files-tab fuzzy results */
+    int quick_sel = 0;
+    bool follow = true, dragging = false;
+    std::vector<Hit> hits;
+    int hover_kind = 0, hover_id = -1;
+    unsigned long use_clock = 0;                         /* stamps Doc::used */
+    std::vector<Doc *> mru_walk;                         /* the tab order while Ctrl is held down during Ctrl+Tab */
+    int mru_pos = -1;
+    float mx = -1, my = -1;
+    double tip_at = 0;                                   /* when the pointer has rested long enough for a tooltip, 0 = none pending */
+    bool tip_on = false;
+    std::string title_last;
+    bool blank_tab = false;                          /* the placeholder document has been turned into a real empty tab (double click or Ctrl+N) */
+    float hit_floor = 1e9f;                          /* hit boxes are cut off at this y: nothing behind the status bar can be clicked */
+    std::string git_for;                             /* the folder the Git tab was last computed for */
+    bool preview_open = false;
+    bool preview_split = false;
+    int preview_target = 0;                         /* 0 = GitHub, 1 = GitLab */
+    bool preview_light = false;
+    bool preview_mode_initialized = false;
+    float preview_scroll = 0;
+    uint64_t preview_revision = ~0ull;
+    const Doc *preview_doc = nullptr;
+    std::string preview_path;
+    PreviewFormat preview_cached_format = PreviewFormat::None;
+    std::vector<PreviewBlock> preview_blocks;
+
+    /* workspace and sidebar */
+    Tree tree;
+    GitInfo git;
+    View view = V_EXPLORER;
+    bool pinned = true, side_open = true, root_open = true, opened_open = true, outline_open = true;
+    std::unordered_map<std::string, char> deco;        /* absolute path -> git status letter, for file and folder rows in the Explorer */
+    bool outline_on = false;
+    bool preview_tabs = true, hot_reload = true, compact_folders = true, show_hud = true;   /* Settings page */
+    std::string lint_ignore;                           /* check codes left out of the live checks, space separated */
+    bool lint_on = true;                               /* live checks (src/lint.cpp), View > Live Checks */
+    double lint_at = 0;                                /* when a pending re-check is due */                           /* Explorer shows the symbols of the active file (View > Outline, off by default) */
+    bool vim_on = false;                               /* modal editing */
+    double side_close_at = 0;
+    float side_scroll = 0;
+    GitUi g;
+    float tab_scroll = 0;                            /* how far the tab strip is scrolled, in pixels */
+    bool tab_reveal = false;                         /* bring the active tab into view on the next frame */
+    int tab_press = -1;                              /* tab under the mouse button, -1 none */
+    float tab_press_x = 0;
+    bool tab_dragging = false;
+    std::vector<float> tab_x, tab_w;                 /* the last frame's tab geometry (strip coordinates, unscrolled) */
+    std::vector<std::string> closed_tabs;            /* paths of closed tabs, newest last, for Ctrl+Shift+T */
+    bool chord_k = false;                            /* Ctrl+K was pressed: the next key finishes the chord */
+
+    bool dirty = true, running = true, show_stats = false, blink_on = true, focused = true;
+    std::string status_msg;
+    double last_active = 0, last_blink = 0, next_hud = 0;
+
+    /* row cache: finished instances for one line at local origin, keyed by text + language + lexer state + font + atlas generation + left column */
+    struct Row { std::vector<RInst> v; };
+    std::unordered_map<uint64_t, Row> rows;
+    std::vector<uint8_t> tok;
+
+    uint64_t frames = 0, prev_frames = 0;
+    double prev_time = 0, frame_cost = 0;
+    long prev_ticks = 0;
+    CacheStats prev_cache = {};
+    char hud[192] = "", hud_last[192] = "";
+    /* operation timing: from the input event to the frame that shows its result being submitted to GL (vsync and scan-out are not included) */
+    struct OpRec { std::string name; double ms; int n; double build_ms; double work_ms; std::string brief; };   /* brief: the name without the (details), for the status bar */
+    double last_build_ms = 0, op_work = 0;
+    std::vector<OpRec> ops;
+    bool op_pending = false;
+    std::string op_name, op_detail;
+    double op_t0 = 0, ev_t0 = 0;
+    bool timing = false;                 /* --bench: split the frame cost by section */
+    double t_top = 0, t_rows = 0, t_gutter = 0, t_status = 0, t_flush = 0;
+};
+
+Ed E;
+volatile sig_atomic_t g_print_stats;
+bool g_scripted = false, g_timed = false;
+int g_clicks = 1;   /* click count of the latest mouse press, for double-click handling */
+const Uint32 SCRIPT_MOUSE = 0x5c11b7u;
+void on_usr1(int) { g_print_stats = 1; }
+
+Doc &D() { return *E.docs[(size_t)E.active]; }
+
+/* what is known about one open file's relation to git: the HEAD text and the changed line ranges (gutter bars), and blame */
+struct GutterCache {
+    uint64_t rev = ~0ull;                          /* buffer revision the hunks were computed for */
+    bool base_stale = true, computed = false, tracked_ok = false;
+    std::vector<std::string> base_lines;
+    std::unordered_map<std::string, int> ids;      /* line text -> id, over the HEAD text */
+    std::vector<DiffHunk> hunks;                   /* HEAD lines against the buffer's lines */
+    std::vector<GitBlame> blame;
+    bool blame_tried = false, blame_ok = false;
+    std::shared_ptr<struct BlameJob> blame_job;    /* git blame runs on a thread: a big file in a big repository takes a while */
+};
+std::unordered_map<const Doc *, GutterCache> g_gutter;
+std::atomic<bool> g_async_ready{false};            /* a background job finished: draw again */
+struct BlameJob { std::atomic<bool> done{false}; bool ok = false; std::vector<GitBlame> v; };
+/* merge conflict blocks of the open files (see conflicts_for) */
+struct Conflict { long a = -1, base = -1, mid = -1, b = -1; };   /* line numbers of the four marker lines (base: the ||||||| line of diff3 style, else -1) */
+struct ConflictCache { uint64_t rev = ~0ull; bool listed = false; std::vector<Conflict> v; };
+std::unordered_map<const Doc *, ConflictCache> g_conf;
+struct Peek { const Doc *doc = nullptr; int b0 = -1; } g_peek;   /* the inline diff of one change under its lines, opened from a change bar */
+
+void gutter_invalidate() { g_conf.clear(); for (auto &kv : g_gutter) { kv.second.base_stale = true; kv.second.computed = false; kv.second.blame_tried = false; kv.second.blame_ok = false; } }
+/* no file and nothing typed: the start screen shows, with no tab strip */
+bool splash() { return E.docs.size() == 1 && D().pristine() && !E.blank_tab; }
+Ed::Term *cur_term();
+std::vector<int> fd_view();
+void git_refresh();
+void remote_push_changed();
+void git_ui_reload();
+void git_ui_timeline();
+void diff_reload_all();
+void gutter_invalidate();
+void git_follow_active();
+void launch_external(std::string name);
+void detect_externals();
+int S(float n) { return (int)lroundf(n * E.scale); }
+
+std::string cache_stats_text(bool all_ops = false) {
+    auto pct = [](uint64_t hit, uint64_t miss) { return hit + miss ? 100.0 * (double)hit / (double)(hit + miss) : 0.0; };
+    std::string o = sfmt("Glyph atlas: %u glyphs cached, ASCII %d/512 filled, texture %dx%d, cleared %u time(s)\n", (unsigned)atlas_count(E.atlas),
+                         atlas_ascii_filled(E.atlas), atlas_size(E.atlas), atlas_size(E.atlas), (unsigned)atlas_generation(E.atlas));
+    o += sfmt("Glyph cache: %llu hits, %llu misses (%.1f%% hit), %llu dropped by atlas clears\n", (unsigned long long)sd_cache.glyph_hit,
+              (unsigned long long)sd_cache.glyph_miss, pct(sd_cache.glyph_hit, sd_cache.glyph_miss), (unsigned long long)sd_cache.glyph_recycle);
+    o += sfmt("Row cache: %llu hits, %llu misses (%.1f%% hit), %llu evicted when the cache filled\n", (unsigned long long)sd_cache.row_hit,
+              (unsigned long long)sd_cache.row_miss, pct(sd_cache.row_hit, sd_cache.row_miss), (unsigned long long)sd_cache.row_recycle);
+    o += sfmt("Frames: %llu drawn, average cost %.2f ms (%s)\n", (unsigned long long)E.frames, E.frame_cost * 1000.0, E.gl_desc);
+    Doc &d = D();
+    if (!E.ops.empty()) {
+        o += "Recent operations (input event to frame submitted):\n";
+        for (size_t i = E.ops.size(); i-- > (all_ops || E.ops.size() <= 10 ? 0 : E.ops.size() - 10);) o += "  " + fmt_ms(E.ops[i].ms) + (E.ops[i].work_ms >= 0 ? "  [work " + fmt_ms(E.ops[i].work_ms) + "]" : std::string()) + (E.ops[i].build_ms >= 0 ? "  [frame build " + fmt_ms(E.ops[i].build_ms) + "]" : std::string()) + "   " + E.ops[i].name + (E.ops[i].n > 1 ? sfmt("   (x%d, last shown)", E.ops[i].n) : std::string()) + "\n";
+    }
+    o += sfmt("Document: %s, %zu bytes, %zu lines, %zu pieces; language %s%s; %zu tab(s); memory %s", d.name().c_str(), d.buf.size(), d.buf.lines(), d.buf.pieces(),
+              lang_name(d.lang), d.lang_forced ? " (picked)" : " (auto)", E.docs.size(), fmt_mb((double)proc_rss_kb() * 1024).c_str());
+    return o;
+}
+
+void redraw() { E.dirty = true; }
+void touch() { E.last_active = E.now; E.blink_on = true; E.last_blink = E.now; redraw(); }
+
+std::string fmt_ms(double ms) {
+    char b[32];
+    if (ms < 10) snprintf(b, sizeof b, "%.2f ms", ms);
+    else if (ms < 1000) snprintf(b, sizeof b, "%.0f ms", ms);
+    else snprintf(b, sizeof b, "%.2f s", ms / 1000);
+    return b;
+}
+
+struct WorkTimer {   /* adds the time spent in the real work of an operation, apart from drawing the result */
+    double t0 = now_s();
+    ~WorkTimer() { E.op_work += (now_s() - t0) * 1000.0; }
+};
+
+/* start timing an operation; it ends when the next frame has been built and submitted */
+void begin_op(const std::string &name, const std::string &detail = "") {
+    E.op_pending = true;
+    E.op_work = 0;
+    E.op_name = name;
+    E.op_detail = detail;
+    E.op_t0 = E.ev_t0 > 0 ? E.ev_t0 : now_s();
+}
+
+void record_op(const std::string &name, double ms, double build_ms = -1, double work_ms = -1, const std::string &brief = std::string()) {
+    if (!E.ops.empty() && E.ops.back().name == name) { E.ops.back().ms = ms; E.ops.back().n++; E.ops.back().build_ms = build_ms; E.ops.back().work_ms = work_ms; E.ops.back().brief = brief; }   /* repeated keystrokes keep one line */
+    else { E.ops.push_back({name, ms, 1, build_ms, work_ms, brief}); if (E.ops.size() > 64) E.ops.erase(E.ops.begin()); }
+}
+
+void end_op_if_pending() {
+    if (!E.op_pending) return;
+    double ms = (now_s() - E.op_t0) * 1000.0;
+    record_op(E.op_name + (E.op_detail.empty() ? "" : " (" + E.op_detail + ")"), ms, E.last_build_ms, E.op_work > 0 ? E.op_work : -1, E.op_name);
+    E.op_pending = false;
+    E.op_t0 = 0;
+}
+
+/* ---- settings (the part that must survive a restart: pin state and sidebar view) ---- */
+
+std::string settings_path() {
+    const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
+    std::string dir = x && *x ? x : std::string(h ? h : ".") + "/.config";
+    return dir + "/hootedit/settings.ini";
+}
+
+Vim g_vim;
+bool vim_active() { return E.vim_on; }
+void vim_reset() { g_vim.reset(vim_active()); }
+
+void settings_load() {
+    FILE *f = fopen(settings_path().c_str(), "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *v = eq + 1;
+        v[strcspn(v, "\r\n")] = 0;
+        if (!strcmp(line, "sidebar_pinned")) E.pinned = atoi(v) != 0;
+        else if (!strcmp(line, "sidebar_view")) E.view = !strcmp(v, "git") ? V_GIT : !strcmp(v, "search") ? V_SEARCH : !strcmp(v, "remote") ? V_REMOTE : V_EXPLORER;
+        else if (!strcmp(line, "theme")) E.theme = ui_theme_find(v);
+        else if (!strcmp(line, "follow_fleetwm")) E.follow_fleet = atoi(v) != 0;
+        else if (!strcmp(line, "terminal")) E.term_choice = v;
+        else if (!strcmp(line, "git_smart_commit")) E.g.smart_commit = atoi(v);
+        else if (!strcmp(line, "git_sync_confirm")) E.g.sync_confirm = atoi(v) != 0;
+        else if (!strcmp(line, "outline")) E.outline_on = atoi(v) != 0;
+        else if (!strcmp(line, "lint")) E.lint_on = atoi(v) != 0;
+        else if (!strcmp(line, "lint_ignore")) E.lint_ignore = v;
+        else if (!strcmp(line, "preview_tabs")) E.preview_tabs = atoi(v) != 0;
+        else if (!strcmp(line, "hot_reload")) E.hot_reload = atoi(v) != 0;
+        else if (!strcmp(line, "show_hud")) E.show_hud = atoi(v) != 0;
+        else if (!strcmp(line, "compact_folders")) { E.compact_folders = atoi(v) != 0; Tree::set_compact(E.compact_folders); }
+        else if (!strcmp(line, "vim_keys")) E.vim_on = atoi(v) != 0;
+        else if (!strcmp(line, "git_tree")) E.g.tree_view = atoi(v) != 0;
+        else if (!strcmp(line, "panel_height")) E.panel_logical = std::max(80, std::min(1200, atoi(v)));
+    }
+    fclose(f);
+}
+
+void settings_save() {
+    std::string p = settings_path();
+    size_t s = p.rfind('/');
+    std::string dir = p.substr(0, s);
+    mkdir(dir.substr(0, dir.rfind('/')).c_str(), 0755);
+    mkdir(dir.c_str(), 0755);
+    FILE *f = fopen(p.c_str(), "w");
+    if (!f) return;
+    fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : E.view == V_REMOTE ? "remote" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
+    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\nlint_ignore=%s\npreview_tabs=%d\nhot_reload=%d\ncompact_folders=%d\nshow_hud=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0, E.lint_ignore.c_str(), E.preview_tabs ? 1 : 0, E.hot_reload ? 1 : 0, E.compact_folders ? 1 : 0, E.show_hud ? 1 : 0);
+    fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0);
+    fclose(f);
+}
+
+/* ---- documents and tabs ---- */
+
+Doc &new_doc(bool untitled = true) {
+    E.docs.push_back(std::make_unique<Doc>());
+    if (untitled) E.docs.back()->untitled = E.next_untitled++;
+    return *E.docs.back();
+}
+
+void set_active(int i) {
+    if (i < 0 || i >= (int)E.docs.size()) return;
+    E.active = i;
+    if (E.mru_pos < 0) D().used = ++E.use_clock;
+    E.follow = true;
+    E.tab_reveal = true;
+    E.find_msg.clear();
+    E.status_msg.clear();
+    std::string t = D().name() + " - Hootedit";
+    if (t != E.title_last) { E.title_last = t; SDL_SetWindowTitle(E.win, t.c_str()); }
+    if (!D().path.empty() && E.tree.root().size() && D().path.compare(0, E.tree.root().size(), E.tree.root()) == 0) E.tree.reveal(D().path);
+    git_follow_active();
+    if (E.view == V_GIT) git_ui_timeline();
+    redraw();
+}
+
+void lint_forget(const Doc *d);
+
+void remove_doc(int i) {
+    g_gutter.erase(E.docs[(size_t)i].get());
+    lint_forget(E.docs[(size_t)i].get());
+    if (!E.docs[(size_t)i]->path.empty()) { E.closed_tabs.push_back(E.docs[(size_t)i]->path); if (E.closed_tabs.size() > 30) E.closed_tabs.erase(E.closed_tabs.begin()); }
+    E.docs.erase(E.docs.begin() + i);
+    if (E.docs.empty()) { new_doc(); E.blank_tab = false; }   /* the last tab is gone: back to the start screen */
+    set_active(std::min(E.active > i ? E.active - 1 : E.active, (int)E.docs.size() - 1));
+}
+
+/* when the workspace itself is not a repository, the Git tab follows the file in the active tab */
+void git_follow_active() {
+    if (E.git.repo && E.git_for == E.tree.root()) return;
+    if (D().path.empty()) return;
+    std::string dir = D().path.substr(0, D().path.rfind('/'));
+    if (dir != E.git_for) git_refresh();
+}
+
+char change_status(const GitChange &c) {
+    if (c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D')) return 'C';
+    if (c.x == '?') return '?';
+    return c.y != ' ' ? c.y : c.x;
+}
+
+/* what the Explorer shows from git: coloured names, a status letter, folders marked when something inside changed, deleted files as ghost rows */
+void git_deco_rebuild() {
+    E.deco.clear();
+    std::vector<std::string> ghosts;
+    if (E.git.repo) {
+        for (const GitChange &c : E.git.changes) {
+            std::string abs = E.git.root + "/" + c.path;
+            char st = change_status(c);
+            if (!c.path.empty() && c.path.back() == '/') abs.pop_back();   /* an untracked directory */
+            E.deco[abs] = st;
+            if (st == 'D') { struct stat sb; if (stat(abs.c_str(), &sb) != 0) ghosts.push_back(abs); }
+            char dc = st == 'C' ? 'C' : st == '?' ? '?' : 'M';
+            for (size_t sl = abs.rfind('/'); sl != std::string::npos && sl > E.git.root.size(); sl = abs.rfind('/', sl - 1)) {
+                std::string dir = abs.substr(0, sl);
+                auto it = E.deco.find(dir);
+                if (it == E.deco.end() || (it->second == '?' && dc != '?') || dc == 'C') E.deco[dir] = dc;
+                if (sl == 0) break;
+            }
+        }
+    }
+    std::sort(ghosts.begin(), ghosts.end());
+    std::vector<std::string> old = E.tree.ghosts();
+    std::sort(old.begin(), old.end());
+    if (old != ghosts) { E.tree.set_ghosts(ghosts); E.tree.refresh(); }
+}
+
+/* git_refresh for start-up: the git commands run on a thread, the window is drawn meanwhile, the result is applied by git_startup_poll */
+struct GitStartup { std::mutex mu; bool ready = false; GitInfo g; std::string where; };
+GitStartup *g_gs = new GitStartup;
+
+void git_apply(const GitInfo &g, const std::string &where);
+
+void git_refresh_async() {
+    std::string ws = E.tree.root().empty() ? "." : E.tree.root();
+    std::string alt = !E.docs.empty() && !D().path.empty() ? D().path.substr(0, D().path.rfind('/')) : std::string();
+    std::thread([ws, alt] {
+        GitInfo g = git_query(ws);
+        std::string where = ws;
+        if (!g.repo && !alt.empty()) { GitInfo g2 = git_query(alt); if (g2.repo) { g = g2; where = alt; } }
+        { std::lock_guard<std::mutex> l(g_gs->mu); g_gs->g = std::move(g); g_gs->where = where; g_gs->ready = true; }
+        g_async_ready = true;
+        app_wake();
+    }).detach();
+}
+
+void git_startup_poll() {
+    GitInfo g;
+    std::string where;
+    {
+        std::lock_guard<std::mutex> l(g_gs->mu);
+        if (!g_gs->ready) return;
+        g = std::move(g_gs->g); where = g_gs->where; g_gs->ready = false;
+    }
+    git_apply(g, where);
+}
+
+void git_refresh() {
+    std::string ws = E.tree.root().empty() ? "." : E.tree.root();
+    E.git = git_query(ws);
+    E.git_for = ws;
+    if (!E.git.repo && !E.docs.empty() && !D().path.empty()) {   /* the workspace is no repository: show the one the open file belongs to */
+        std::string dir = D().path.substr(0, D().path.rfind('/'));
+        GitInfo g2 = git_query(dir);
+        if (g2.repo) { E.git = g2; E.git_for = dir; }
+    }
+    git_apply(E.git, E.git_for);
+}
+
+void git_apply(const GitInfo &g, const std::string &where) {
+    E.git = g;
+    E.git_for = where;
+    E.quick_files.clear();
+    E.sfiles.reset();                           /* the file list is rebuilt on the next search or quick open */
+    git_deco_rebuild();
+    git_ui_reload();
+    diff_reload_all();
+    gutter_invalidate();
+    redraw();
+}
+
+/* Ctrl+Tab goes to the previously used tab; more presses with Ctrl still held walk back through the tabs in order of use */
+void mru_cycle(int dir) {
+    if (E.docs.size() < 2) return;
+    if (E.mru_pos < 0) {
+        E.mru_walk.clear();
+        for (auto &dp : E.docs) E.mru_walk.push_back(dp.get());
+        std::stable_sort(E.mru_walk.begin(), E.mru_walk.end(), [](const Doc *a, const Doc *b) { return a->used > b->used; });
+        E.mru_pos = 0;
+    }
+    int n = (int)E.mru_walk.size();
+    int target = ((E.mru_pos + dir) % n + n) % n;
+    for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i].get() == E.mru_walk[(size_t)target]) { set_active((int)i); break; }
+    E.mru_pos = target;
+}
+
+void mru_end() {
+    if (E.mru_pos < 0) return;
+    E.mru_pos = -1;
+    E.mru_walk.clear();
+    if (!E.docs.empty()) D().used = ++E.use_clock;
+}
+
+void open_path(const std::string &path, bool preview = false) {   /* preview: a single click in the Explorer; the tab is italic and the next preview replaces it */
+    for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i]->path == path) { if (!preview) E.docs[i]->preview = false; set_active((int)i); return; }
+    bool replace_first = E.docs.size() == 1 && D().pristine();
+    Doc &d = new_doc(false);
+    double t_open = now_s();
+    bool opened = d.open(path.c_str());
+    t_open = (now_s() - t_open) * 1000.0;
+    E.op_work = 0;
+    if (opened) { size_t sl = path.rfind('/'); E.op_work = 0; begin_op("open " + (sl == std::string::npos ? path : path.substr(sl + 1)), "map + index " + fmt_ms(t_open) + ", " + fmt_mb((double)d.buf.size()) + ", " + std::to_string(d.buf.lines()) + " lines"); E.op_work = t_open; }
+    if (!opened) { E.docs.pop_back(); E.status_msg = "cannot open " + path; redraw(); return; }
+    if (preview) {
+        d.preview = true;
+        for (size_t i = 0; i + 1 < E.docs.size(); i++) if (E.docs[i]->preview && !E.docs[i]->modified()) { E.docs.erase(E.docs.begin() + (long)i); break; }
+    }
+    if (replace_first) E.docs.erase(E.docs.begin());
+    set_active((int)E.docs.size() - 1);
+}
+
+void set_workspace(const std::string &dir, bool async_git = false) {
+    char real[4096];
+    std::string d = realpath(dir.c_str(), real) ? real : dir;
+    E.tree.set_root(d);
+    E.side_scroll = 0;
+    if (async_git) git_refresh_async(); else git_refresh();
+}
+
+/* ---- diff tabs: both sides come from git (a revision, the index) or from the file on disk ---- */
+
+std::string rel_to_root(const std::string &abs) {
+    const std::string &r = E.git.root;
+    return !r.empty() && abs.size() > r.size() + 1 && abs.compare(0, r.size(), r) == 0 && abs[r.size()] == '/' ? abs.substr(r.size() + 1) : std::string();
+}
+
+std::string diff_fetch(const DiffView &v, const std::string &rev) {
+    if (rev.empty()) return std::string();
+    if (rev != "WORK") return git_show(v.root, rev, v.path);
+    std::string out;
+    FILE *f = fopen((v.root + "/" + v.path).c_str(), "rb");
+    if (!f) return out;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0 && out.size() < (8u << 20)) out.append(buf, n);
+    fclose(f);
+    return out;
+}
+
+void lex_states(const Lang *lang, const std::vector<std::string> &lines, std::vector<uint8_t> &st) {
+    st.assign(lines.size() + 1, 0);
+    std::vector<uint8_t> tok(256);
+    uint8_t state = 0;
+    for (size_t i = 0; i < lines.size(); i++) {
+        st[i] = state;
+        if (lang == lang_plain()) continue;
+        if (tok.size() < lines[i].size() + 1) tok.resize(lines[i].size() + 64);
+        state = lex_line(lang, lines[i].data(), lines[i].size(), state, tok.data());
+    }
+    st[lines.size()] = state;
+}
+
+void diff_load(DiffView &v) {
+    std::string l = diff_fetch(v, v.left_rev), r = diff_fetch(v, v.right_rev);
+    v.binary = memchr(l.data(), 0, std::min<size_t>(l.size(), 8192)) || memchr(r.data(), 0, std::min<size_t>(r.size(), 8192));
+    v.too_big = l.size() > (4u << 20) || r.size() > (4u << 20);
+    v.m = DiffModel();
+    v.sa.clear(); v.sb.clear();
+    if (!v.binary && !v.too_big) {
+        diff_build(v.m, l, r);
+        const std::string &first = !v.m.b.empty() ? v.m.b[0] : !v.m.a.empty() ? v.m.a[0] : std::string();
+        v.lang = lang_detect(v.path.c_str(), first.data(), first.size());
+        lex_states(v.lang, v.m.a, v.sa);
+        lex_states(v.lang, v.m.b, v.sb);
+    } else v.lang = lang_plain();
+    v.vdirty = true;
+}
+
+void diff_reload_all() {
+    for (auto &dp : E.docs) {
+        if (!dp->dv) continue;
+        DiffView &v = *dp->dv;
+        if (v.root != E.git.root) continue;
+        bool live = v.left_rev == "WORK" || v.right_rev == "WORK" || v.left_rev == ":" || v.right_rev == ":" || v.left_rev == "HEAD" || v.right_rev == "HEAD";
+        if (live) diff_load(v);
+    }
+}
+
+Doc &open_diff_spec(const std::string &path, const std::string &lrev, const std::string &rrev, const std::string &llabel, const std::string &rlabel, const std::string &title, const std::string &info) {
+    for (size_t i = 0; i < E.docs.size(); i++) {
+        Doc &o = *E.docs[i];
+        if (o.dv && o.dv->root == E.git.root && o.dv->path == path && o.dv->left_rev == lrev && o.dv->right_rev == rrev) { diff_load(*o.dv); set_active((int)i); return o; }
+    }
+    bool replace_first = E.docs.size() == 1 && D().pristine() && !E.blank_tab;
+    Doc &d = new_doc(false);
+    d.title = title;
+    d.dv = std::make_shared<DiffView>();
+    DiffView &v = *d.dv;
+    v.root = E.git.root; v.path = path; v.left_rev = lrev; v.right_rev = rrev;
+    v.left_label = llabel; v.right_label = rlabel; v.info = info;
+    diff_load(v);
+    d.lang = v.lang;
+    if (replace_first) E.docs.erase(E.docs.begin());
+    set_active((int)E.docs.size() - 1);
+    return D();
+}
+
+std::string base_name(const std::string &p) { size_t sl = p.rfind('/'); return sl == std::string::npos ? p : p.substr(sl + 1); }
+
+void open_change_diff(const GitChange &c, bool staged) {
+    std::string name = base_name(c.path);
+    if (c.x == '?' && c.y == '?') { open_diff_spec(c.path, "", "WORK", "(untracked)", "Working Tree", name + " (Untracked)", "New file, not tracked yet"); return; }
+    if (staged) open_diff_spec(c.path, "HEAD", ":", "HEAD", "Index", name + " (Index)", "Staged changes: HEAD against the index");
+    else open_diff_spec(c.path, ":", "WORK", "Index", "Working Tree", name + " (Working Tree)", "Unstaged changes: the index against the file on disk");
+}
+
+void open_commit_diff(const GitCommit &c, const GitFile &f) {
+    std::string h7 = c.hash.substr(0, 7);
+    std::string info = h7 + "  " + c.subject + "   " + c.author + ", " + git_ago(c.date, (long)time(nullptr));
+    open_diff_spec(f.path, f.status == 'A' ? std::string() : c.hash + "^", f.status == 'D' ? std::string() : c.hash, f.status == 'A' ? "(new file)" : h7 + "^", f.status == 'D' ? "(deleted)" : h7, base_name(f.path) + " (" + h7 + ")", info);
+}
+
+void open_compare_diff(const std::string &path, const std::string &a, const std::string &b) {
+    open_diff_spec(path, a, b, a.substr(0, 7), b.substr(0, 7), base_name(path) + " (" + a.substr(0, 7) + " .. " + b.substr(0, 7) + ")", "Comparing two revisions of " + path);
+}
+
+/* ---- the Source Control lists that come from git log ---- */
+
+void git_ui_timeline() {
+    GitUi &g = E.g;
+    std::string rel = E.git.repo && !E.docs.empty() && !D().dv ? rel_to_root(D().path) : std::string();
+    if (rel == g.tl_path && !rel.empty()) return;
+    g.tl_path = rel;
+    g.tl.clear();
+    if (!rel.empty()) g.tl = git_log(E.git.root, 60, rel);
+}
+
+/* Lanes for the history graph: each lane waits for the hash of the commit it leads to. A commit takes the lane that waits for it
+ * (new one if none does), its first parent continues in that lane, other parents get a lane of their own (or join one that
+ * already waits for them), and further lanes that waited for the same commit end here. */
+void graph_lanes(GitUi &g) {
+    g.lanes.assign(g.log.size(), GitUi::Lane());
+    std::vector<std::string> L;
+    size_t maxc = 1;
+    for (size_t i = 0; i < g.log.size(); i++) {
+        const GitCommit &c = g.log[i];
+        GitUi::Lane &r = g.lanes[i];
+        int col = -1;
+        for (size_t k = 0; k < L.size(); k++) if (L[k] == c.hash) { col = (int)k; break; }
+        r.top.assign(L.size(), 0);
+        for (size_t k = 0; k < L.size(); k++) r.top[k] = L[k].empty() ? 0 : 1;
+        if (col < 0) {
+            for (size_t k = 0; k < L.size(); k++) if (L[k].empty()) { col = (int)k; break; }
+            if (col < 0) { col = (int)L.size(); L.push_back(""); }
+            r.top.resize(L.size(), 0);
+            r.top[(size_t)col] = 0;   /* a branch tip: nothing comes in from above */
+        } else {
+            for (size_t k = 0; k < L.size(); k++) if ((int)k != col && L[k] == c.hash) { r.conv.push_back((int)k); L[k].clear(); }
+        }
+        r.col = col;
+        L[(size_t)col].clear();
+        for (size_t pi = 0; pi < c.parent_hashes.size(); pi++) {
+            const std::string &ph = c.parent_hashes[pi];
+            if (pi == 0) { L[(size_t)col] = ph; continue; }   /* the first parent keeps the lane; lanes that wait for the same commit join up when it is reached */
+            int at = -1;
+            for (size_t k = 0; k < L.size(); k++) if (L[k] == ph) { at = (int)k; break; }
+            if (at < 0) {
+                for (size_t k = 0; k < L.size(); k++) if (L[k].empty() && (int)k != col) { at = (int)k; break; }
+                if (at < 0) { at = (int)L.size(); L.push_back(""); }
+                L[(size_t)at] = ph;
+            }
+            r.out.push_back(at);
+        }
+        r.bot.assign(L.size(), 0);
+        for (size_t k = 0; k < L.size(); k++) r.bot[k] = L[k].empty() ? 0 : 1;
+        r.top.resize(L.size(), 0);
+        maxc = std::max(maxc, L.size());
+        while (!L.empty() && L.back().empty()) L.pop_back();
+    }
+    g.lane_cols = (int)std::min<size_t>(maxc, 5);
+}
+
+void git_ui_reload() {
+    GitUi &g = E.g;
+    if (!E.git.repo) { g.log.clear(); g.tl.clear(); g.tl_path.clear(); g.log_sel = -1; g.sel_files.clear(); return; }
+    if (E.view != V_GIT) { g.tl_path = "\x01"; return; }   /* loaded when the tab is shown */
+    std::string keep = g.log_sel >= 0 && (size_t)g.log_sel < g.log.size() ? g.log[(size_t)g.log_sel].hash : std::string();
+    g.log = git_log(E.git.root, 120, "", true);
+    graph_lanes(g);
+    g.log_sel = -1;
+    if (!keep.empty() && g.cmp_a.empty()) for (size_t i = 0; i < g.log.size(); i++) if (g.log[i].hash == keep) g.log_sel = (int)i;
+    if (g.log_sel < 0) { g.sel_files.clear(); g.cmp_a.clear(); g.cmp_b.clear(); }
+    g.tl_path = "\x01";   /* force the timeline to reload */
+    git_ui_timeline();
+}
+
+void git_do(bool ok, const char *what) {
+    if (!ok) E.status_msg = std::string("git ") + what + " failed";
+    git_refresh();
+}
+
+void close_confirmed() {
+    int i = E.confirm_idx;
+    E.mode = M_EDIT;
+    E.pending = P_NONE;
+    remove_doc(i);
+}
+
+void request_quit();
+
+void open_filedlg(FdKind k);
+
+void begin_prompt(PromptKind k) {
+    begin_op(k == PK_SAVEAS ? "save-as dialog" : k == PK_OPEN_FILE ? "open-file dialog" : "open-folder dialog");
+    open_filedlg(k == PK_SAVEAS ? FD_SAVE : k == PK_OPEN_FILE ? FD_OPEN_FILE : FD_OPEN_FOLDER);
+    return;
+    Doc &d = D();
+    E.prompt_kind = k;
+    char cwd[1024];
+    std::string base = E.tree.root().empty() ? (getcwd(cwd, sizeof cwd) ? cwd : ".") : E.tree.root();
+    if (k == PK_SAVEAS) E.prompt_q = d.path.empty() ? base + "/" : d.path;
+    else E.prompt_q = base + "/";
+    E.mode = M_PROMPT;
+    redraw();
+}
+
+void after_save() {
+    E.mode = M_EDIT;
+    if (E.pending == P_CLOSE) { close_confirmed(); }
+    else if (E.pending == P_QUIT) { E.pending = P_NONE; remove_doc(E.confirm_idx); request_quit(); }
+    if (E.git.repo) git_refresh();
+    remote_push_changed();
+    redraw();
+}
+
+void ask_confirm(int idx, Pending p) {
+    set_active(idx);
+    E.confirm_idx = idx;
+    E.pending = p;
+    E.mode = M_CONFIRM;
+    redraw();
+}
+
+void close_tab(int i) {
+    if (E.docs[(size_t)i]->modified()) ask_confirm(i, P_CLOSE);
+    else { E.confirm_idx = i; remove_doc(i); }
+}
+
+void request_quit() {
+    for (size_t i = 0; i < E.docs.size(); i++)
+        if (E.docs[i]->modified()) { ask_confirm((int)i, P_QUIT); return; }
+    E.running = false;
+}
+
+void save_active() {
+    Doc &d = D();
+    if (d.path.empty()) { begin_prompt(PK_SAVEAS); return; }
+    bool ok = d.save(nullptr);
+    E.status_msg = ok ? "saved " + d.path : "SAVE FAILED, buffer kept: " + d.path;
+    if (ok && E.git.repo) git_refresh();
+    if (ok) remote_push_changed();
+    redraw();
+}
+
+std::string expand_path(std::string p) {
+    if (!p.empty() && p[0] == '~' && getenv("HOME")) p = std::string(getenv("HOME")) + p.substr(1);
+    if (!p.empty() && p[0] != '/') { char cwd[1024]; if (getcwd(cwd, sizeof cwd)) p = std::string(cwd) + "/" + p; }
+    return p;
+}
+
+void finish_prompt() {
+    std::string p = expand_path(E.prompt_q);
+    if (E.prompt_kind == PK_SAVEAS) {
+        if (p.empty() || p.back() == '/') { E.status_msg = "type a file name"; redraw(); return; }
+        Doc &d = *E.docs[(size_t)(E.pending == P_NONE ? E.active : E.confirm_idx)];
+        if (!d.save(p.c_str())) { E.status_msg = "SAVE FAILED: " + p; redraw(); return; }
+        E.status_msg = "saved " + p;
+        std::string t = d.name() + " - Hootedit";
+        E.title_last = t;
+        SDL_SetWindowTitle(E.win, t.c_str());
+        E.rows.clear();
+        after_save();
+        return;
+    }
+    struct stat st;
+    if (stat(p.c_str(), &st) != 0) { E.status_msg = "not found: " + p; redraw(); return; }
+    E.mode = M_EDIT;
+    E.status_msg.clear();
+    if (E.prompt_kind == PK_OPEN_FOLDER) { if (S_ISDIR(st.st_mode)) set_workspace(p); else E.status_msg = "not a folder: " + p; }
+    else { if (S_ISREG(st.st_mode)) open_path(p); else E.status_msg = "not a file: " + p; }
+    redraw();
+}
+
+/* ---- search (in the file, from the command box) ---- */
+
+/* Scanning a whole file line by line with a copy per line costs ~600 ns a line; Matcher::scan walks the flat text with the DFA and only
+ * hands back the lines that match (about 8x faster on a 40 MB file). These helpers are what find, replace, vim search and :s sit on. */
+
+/* first non-empty match starting at or after byte `start`, looking only before byte `limit`; absolute offsets */
+bool match_after(Matcher &m, const char *fb, const Buffer &b, size_t start, size_t limit, size_t *ms_o, size_t *me_o) {
+    size_t a = b.line_start(b.line_of(std::min(start, b.size())));
+    if (limit <= a) return false;
+    bool found = false;
+    m.scan(fb + a, limit - a, [&](size_t ls0, size_t le0) {
+        size_t base = a + ls0, len = le0 - ls0;
+        const char *t = fb + base;
+        size_t from = base < start ? start - base : 0;
+        while (from <= len) {
+            size_t ms, me;
+            if (!m.find(t, len, from, &ms, &me)) break;
+            if (me == ms) { from = ms + 1; continue; }   /* an empty match is not something to select */
+            *ms_o = base + ms; *me_o = base + me; found = true;
+            return false;
+        }
+        return true;
+    });
+    return found;
+}
+
+/* the last non-empty match that starts before byte `before` inside [a, b) */
+bool match_last(Matcher &m, const char *fb, size_t a, size_t b, size_t before, size_t *ms_o, size_t *me_o) {
+    if (b <= a) return false;
+    bool found = false;
+    m.scan(fb + a, b - a, [&](size_t ls0, size_t le0) {
+        size_t base = a + ls0, len = le0 - ls0, from = 0;
+        const char *t = fb + base;
+        if (base >= before) return false;
+        while (from <= len) {
+            size_t ms, me;
+            if (!m.find(t, len, from, &ms, &me)) break;
+            if (me == ms) { from = ms + 1; continue; }
+            if (base + ms >= before) break;
+            *ms_o = base + ms; *me_o = base + me; found = true;
+            from = ms + 1;
+        }
+        return true;
+    });
+    return found;
+}
+
+struct SubResult { size_t first = (size_t)-1, last = 0, count = 0, lines = 0; std::string out; };
+
+/* every matching line of fb[a, b) with its matches replaced by emit(); the result covers only the span from the first to the last changed line */
+void subst_scan(Matcher &m, const char *fb, size_t a, size_t b, bool global, const std::function<void(std::string &, const char *, size_t, size_t)> &emit, SubResult &r) {
+    size_t cp = 0;
+    if (b <= a) return;
+    m.scan(fb + a, b - a, [&](size_t ls0, size_t le0) {
+        size_t ls = a + ls0, le = a + le0, len = le - ls, from = 0, e = 0, c = 0;
+        const char *t = fb + ls;
+        std::string o;
+        while (from <= len) {
+            size_t ms, me;
+            if (!m.find(t, len, from, &ms, &me)) break;
+            if (me == ms) { if (ms >= len) break; from = ms + 1; continue; }
+            o.append(t + e, ms - e);
+            emit(o, t, ms, me);
+            e = me; from = me; c++;
+            if (!global) break;
+        }
+        if (!c) return true;
+        o.append(t + e, len - e);
+        if (r.first == (size_t)-1) { r.first = ls; cp = ls; }
+        r.out.append(fb + cp, ls - cp);
+        r.out += o;
+        cp = le; r.last = le; r.count += c; r.lines++;
+        return true;
+    });
+}
+
+bool find_from(size_t start) {
+    WorkTimer wt;
+    Doc &d = D();
+    if (E.find_q.empty()) { E.find_msg.clear(); return false; }
+    bool icase = !E.find_case;
+    if (icase) for (unsigned char c : E.find_q) if (c >= 'A' && c <= 'Z') icase = false;   /* smart case */
+    Regex re;
+    std::string err;
+    if (!re.compile(E.find_regex ? E.find_q : Searcher::escape_literal(E.find_q), icase, &err)) { E.find_msg = "invalid: " + err; return false; }
+    Matcher m(re);
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    size_t ms, me;
+    bool ok = match_after(m, fb, d.buf, start, fn, &ms, &me);
+    if (!ok) {   /* wrap: from the top up to where we began */
+        size_t l0 = d.buf.line_of(std::min(start, d.buf.size()));
+        size_t lim = l0 + 1 < d.buf.lines() ? d.buf.line_start(l0 + 1) : fn;
+        ok = match_after(m, fb, d.buf, 0, lim, &ms, &me) && ms < start;
+    }
+    if (ok) {
+        d.break_group();
+        d.anchor = ms;
+        d.move_to(me, true, false);
+        E.follow = true;
+        E.find_msg.clear();
+        return true;
+    }
+    E.find_msg = "No results";
+    return false;
+}
+
+/* Replace: the selection when it is a match of the find text, then on to the next one; Replace All is one undo step */
+bool find_matcher(Regex &re) {
+    if (E.find_q.empty()) return false;
+    bool icase = !E.find_case;
+    if (icase) for (unsigned char c : E.find_q) if (c >= 'A' && c <= 'Z') icase = false;
+    std::string err;
+    if (!re.compile(E.find_regex ? E.find_q : Searcher::escape_literal(E.find_q), icase, &err)) { E.find_msg = "invalid: " + err; return false; }
+    return true;
+}
+
+void replace_one() {
+    Doc &d = D();
+    Regex re;
+    if (!find_matcher(re)) return;
+    if (d.has_sel()) {   /* is what is selected one whole match? */
+        std::string sel = d.selection();
+        Matcher m(re);
+        size_t ms, me;
+        if (sel.find('\n') == std::string::npos && m.find(sel.data(), sel.size(), 0, &ms, &me) && ms == 0 && me == sel.size()) {
+            size_t lo = d.sel_lo();
+            d.break_group();
+            d.replace(lo, sel.size(), E.repl_q.data(), E.repl_q.size());
+            d.break_group();
+            find_from(lo + E.repl_q.size());
+            return;
+        }
+    }
+    find_from(d.sel_lo());   /* nothing matching selected yet: select the next match first */
+}
+
+void replace_all() {
+    Doc &d = D();
+    Regex re;
+    if (!find_matcher(re)) return;
+    Matcher m(re);
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    SubResult r;
+    subst_scan(m, fb, 0, fn, true, [](std::string &o, const char *, size_t, size_t) { o += E.repl_q; }, r);
+    if (!r.count) { E.find_msg = "No results"; return; }
+    size_t keep = d.cur, top = d.top;
+    d.break_group();
+    d.replace(r.first, r.last - r.first, r.out.data(), r.out.size());   /* only the span that changed, one undo step */
+    d.break_group();
+    d.move_to(std::min(keep, d.buf.size()), false, false);
+    d.top = std::min(top, d.buf.lines() - 1);
+    E.status_msg = sfmt("replaced %zu occurrence%s", r.count, r.count == 1 ? "" : "s");
+    E.find_msg.clear();
+}
+
+/* ---- workspace search (sidebar SEARCH tab) ---- */
+
+void ensure_files() {
+    if (!E.sfiles) E.sfiles = std::make_shared<const std::vector<std::string>>(list_workspace_files(E.tree.root(), E.git.repo));
+}
+
+void start_search() {
+    E.s_active = !E.sq.empty();
+    E.sel_hit = -1;
+    E.side_scroll = 0;
+    if (!E.s_active) { E.search.cancel(); E.sres.clear(); E.srows.clear(); E.sstat = SearchStats(); redraw(); return; }
+    ensure_files();
+    SearchQuery q;
+    q.text = E.sq;
+    q.regex = E.sq_regex;
+    q.word = E.sq_word;
+    q.casing = E.sq_case ? SearchQuery::SENSITIVE : SearchQuery::SMART;
+    E.search.start(E.sfiles, q, app_wake);
+    E.s_seen_scanned = ~0ull; E.s_seen_hits = ~0ull; E.s_seen_done = false;
+    redraw();
+}
+
+void search_poll() {
+    if (!E.s_active) return;
+    SearchStats st = E.search.stats();
+    if (st.files_scanned == E.s_seen_scanned && st.hits == E.s_seen_hits && st.done == E.s_seen_done) return;
+    E.s_seen_scanned = st.files_scanned; E.s_seen_hits = st.hits; E.s_seen_done = st.done;
+    E.search.results(E.sres);
+    E.srows.clear();
+    for (size_t i = 0; i < E.sres.size();) {
+        size_t j = i;
+        while (j < E.sres.size() && E.sres[j].file == E.sres[i].file) j++;
+        E.srows.push_back({(int)E.sres[i].file, -1, (int)(j - i)});
+        for (size_t k = i; k < j; k++) E.srows.push_back({(int)E.sres[k].file, (int)k, 0});
+        i = j;
+    }
+    if (st.done && E.s_active && st.error.empty()) record_op("search \"" + E.sq.substr(0, 24) + "\" (" + std::to_string(st.hits) + " hits, " + std::to_string(st.files_total) + " files, " + fmt_mb((double)st.bytes) + ")", st.ms, -1, st.ms);
+    E.sstat = st;
+    redraw();
+}
+
+/* ---- fuzzy file filter shared by quick open and the files tab ---- */
+
+/* the best `cap` files for query q (fzf-style scoring on the path relative to the workspace), with matched character positions in that relative path */
+void fuzzy_filter(const std::vector<std::string> &files, const std::string &q, size_t cap, std::vector<std::string> &out, std::vector<std::vector<int>> &pos) {
+    out.clear();
+    pos.clear();
+    size_t rl = E.tree.root().size() + 1;
+    FuzzyQuery fq;
+    fq.parse(q);
+    struct Cand { int score; size_t idx; };
+    std::vector<Cand> c;
+    for (size_t i = 0; i < files.size(); i++) {
+        const std::string &f = files[i];
+        const char *rel = f.c_str() + std::min(rl, f.size());
+        int sc = 0;
+        if (fq.match(rel, f.size() - std::min(rl, f.size()), &sc, nullptr)) c.push_back({sc, i});
+    }
+    size_t keep = std::min(c.size(), cap);
+    std::partial_sort(c.begin(), c.begin() + (long)keep, c.end(), [&](const Cand &a, const Cand &b) {
+        return a.score != b.score ? a.score > b.score : files[a.idx].size() != files[b.idx].size() ? files[a.idx].size() < files[b.idx].size() : files[a.idx] < files[b.idx];
+    });
+    for (size_t i = 0; i < keep; i++) {
+        const std::string &f = files[c[i].idx];
+        const char *rel = f.c_str() + std::min(rl, f.size());
+        std::vector<int> p;
+        int sc;
+        fq.match(rel, f.size() - std::min(rl, f.size()), &sc, &p);
+        out.push_back(f);
+        pos.push_back(std::move(p));
+    }
+}
+
+/* ---- quick open (Ctrl+P) ---- */
+
+/* Ctrl+P shows each file in a preview tab as the arrow keys move through the list; Esc puts everything back */
+const Doc *g_qp_prev = nullptr, *g_qp_new = nullptr;
+
+int doc_index(const Doc *d) { for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i].get() == d) return (int)i; return -1; }
+
+void quick_preview() {
+    if (E.quick_hits.empty() || (!E.quick_q.empty() && E.quick_q[0] == ':')) return;
+    const std::string &path = E.quick_hits[(size_t)std::min<int>(E.quick_sel, (int)E.quick_hits.size() - 1)];
+    if (!g_qp_prev && !E.docs.empty()) g_qp_prev = &D();
+    int old = doc_index(g_qp_new);
+    if (old >= 0 && E.docs[(size_t)old]->preview && !E.docs[(size_t)old]->modified() && E.docs[(size_t)old]->path != path) remove_doc(old);
+    g_qp_new = nullptr;
+    bool existed = false;
+    for (auto &dp : E.docs) if (dp->path == path) existed = true;
+    open_path(path, true);
+    if (!existed) g_qp_new = &D();
+}
+
+void quick_end(bool accept) {
+    if (!accept) {
+        int n = doc_index(g_qp_new);
+        if (n >= 0 && E.docs[(size_t)n]->preview && !E.docs[(size_t)n]->modified()) remove_doc(n);
+        int p = doc_index(g_qp_prev);
+        if (p >= 0) set_active(p);
+    }
+    g_qp_prev = g_qp_new = nullptr;
+}
+
+void quick_update() {
+    WorkTimer wt;
+    if (E.quick_files.empty()) { ensure_files(); E.quick_files = *E.sfiles; }
+    if (!E.quick_q.empty() && E.quick_q[0] == ':') { E.quick_hits.clear(); E.quick_pos.clear(); return; }   /* ":42" is a line number, not a file name */
+    fuzzy_filter(E.quick_files, E.quick_q, 12, E.quick_hits, E.quick_pos);
+    E.quick_sel = std::min(E.quick_sel, std::max(0, (int)E.quick_hits.size() - 1));
+}
+
+/* ---- drawing helpers ---- */
+
+float text_width(Font *f, const char *s, int style = FS_REGULAR) {
+    float w = 0;
+    for (size_t i = 0; s[i];) {
+        size_t a;
+        uint32_t cp = u8_decode(s + i, strlen(s + i), &a);
+        i += a;
+        const AtlasGlyph *g = atlas_glyph(E.atlas, f, cp, style);   /* the atlas caches the advance; font_advance would run FT_Load_Glyph every call */
+        w += g ? g->adv : (float)font_cell_w(f);
+    }
+    return w;
+}
+
+/* draws s clipped to maxw; returns the pen x after the last drawn glyph */
+float draw_text(Font *f, float x, float y_baseline, const char *s, uint32_t rgba, float maxw, int style = FS_REGULAR) {
+    float pen = x;
+    for (size_t i = 0; s[i];) {
+        size_t a;
+        uint32_t cp = u8_decode(s + i, strlen(s + i), &a);
+        i += a;
+        const AtlasGlyph *g = atlas_glyph(E.atlas, f, cp, style);
+        if (!g) continue;
+        if (pen + g->adv > x + maxw) break;
+        if (!g->blank) {
+            RInst inst;
+            r_make_glyph(E.r, &inst, g, pen, y_baseline, rgba);
+            r_push(E.r, &inst, 1);
+        }
+        pen += g->adv;
+    }
+    return pen;
+}
+
+/* like draw_text, but characters whose byte offset (plus `shift`) is in the sorted list `pos` are drawn in `hl` */
+float draw_text_hl(Font *f, float x, float y_baseline, const std::string &s, const std::vector<int> &pos, int shift, uint32_t rgba, uint32_t hl, float maxw) {
+    float pen = x;
+    for (size_t i = 0; i < s.size();) {
+        size_t a;
+        uint32_t cp = u8_decode(s.data() + i, s.size() - i, &a);
+        bool on = std::binary_search(pos.begin(), pos.end(), (int)i + shift);
+        i += a;
+        const AtlasGlyph *g = atlas_glyph(E.atlas, f, cp, on ? FS_BOLD : FS_REGULAR);
+        if (!g) continue;
+        if (pen + g->adv > x + maxw) break;
+        if (!g->blank) {
+            RInst inst;
+            r_make_glyph(E.r, &inst, g, pen, y_baseline, on ? hl : rgba);
+            r_push(E.r, &inst, 1);
+        }
+        pen += g->adv;
+    }
+    return pen;
+}
+
+void draw_icon(Icon ic, float x, float y, int size, uint32_t rgba) {
+    const AtlasGlyph *g = icon_glyph(E.atlas, ic, size);
+    if (!g || g->blank) return;
+    RInst inst;
+    r_make_glyph(E.r, &inst, g, x, y, rgba);
+    r_push(E.r, &inst, 1);
+}
+
+void hit(float x, float y, float w, float h, int kind, int id) {
+    if (y >= E.hit_floor) return;
+    if (y + h > E.hit_floor) h = E.hit_floor - y;   /* a row that peeks under the status bar must not be clickable there */
+    E.hits.push_back({x, y, w, h, kind, id});
+}
+float ui_base(float y, float h) { return y + (h - (float)E.uh) / 2 + (float)E.uasc; }
+void draw_dot(float cx, float cy, int size, uint32_t rgba);
+bool hovered(int kind, int id);
+
+/* ---- modal dialog and context menu (the VS Code look: a warning message, detail text, buttons) ---- */
+
+GitJob g_job;
+
+std::vector<std::string> wrap_lines(const std::string &t, float w, int style = FS_REGULAR) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= t.size()) {
+        size_t e = t.find('\n', pos);
+        std::string para = t.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+        std::string line;
+        size_t p = 0;
+        while (p < para.size()) {
+            size_t sp = para.find(' ', p);
+            std::string word = para.substr(p, sp == std::string::npos ? std::string::npos : sp - p);
+            std::string trial = line.empty() ? word : line + " " + word;
+            if (!line.empty() && text_width(E.ui, trial.c_str(), style) > w) { out.push_back(line); line = word; }
+            else line = trial;
+            while (text_width(E.ui, line.c_str(), style) > w && line.size() > 8) {   /* one word longer than the box: break it */
+                size_t k = line.size();
+                while (k > 1 && text_width(E.ui, line.substr(0, k).c_str(), style) > w) k--;
+                out.push_back(line.substr(0, k));
+                line = line.substr(k);
+            }
+            if (sp == std::string::npos) break;
+            p = sp + 1;
+        }
+        out.push_back(line);
+        if (e == std::string::npos) break;
+        pos = e + 1;
+    }
+    return out;
+}
+
+struct PreviewSpan { std::string text; int style = FS_REGULAR; uint32_t color = 0; };
+
+struct PreviewPalette {
+    uint32_t bg, panel, text, muted, accent, border, table_head, table_alt;
+};
+
+void preview_mode_init() {
+    if (E.preview_mode_initialized) return;
+    double lum = (0.299 * (C_EDITOR & 255) + 0.587 * ((C_EDITOR >> 8) & 255) + 0.114 * ((C_EDITOR >> 16) & 255));
+    E.preview_light = lum > 128.0;
+    E.preview_mode_initialized = true;
+}
+
+PreviewPalette preview_palette() {
+    preview_mode_init();
+    if (E.preview_light) {
+        if (E.preview_target == 0) return {RGBA(255,255,255,255), RGBA(246,248,250,255), RGBA(31,35,40,255), RGBA(89,99,110,255),
+            RGBA(9,105,218,255), RGBA(208,215,222,255), RGBA(235,240,245,255), RGBA(246,248,250,255)};
+        return {RGBA(255,255,255,255), RGBA(248,249,250,255), RGBA(51,51,51,255), RGBA(89,95,103,255),
+            RGBA(16,120,190,255), RGBA(219,223,228,255), RGBA(232,239,246,255), RGBA(246,248,251,255)};
+    }
+    if (E.preview_target == 0) return {RGBA(13,17,23,255), RGBA(22,27,34,255), RGBA(230,237,243,255), RGBA(139,148,158,255),
+        RGBA(88,166,255,255), RGBA(48,54,61,255), RGBA(33,38,45,255), RGBA(22,27,34,255)};
+    return {RGBA(24,26,28,255), RGBA(31,34,37,255), RGBA(225,226,227,255), RGBA(160,165,170,255),
+        RGBA(74,163,223,255), RGBA(62,66,71,255), RGBA(36,43,50,255), RGBA(30,33,36,255)};
+}
+
+uint32_t preview_link_color() { return preview_palette().accent; }
+
+void preview_span(std::vector<PreviewSpan> &out, const std::string &text, int style, uint32_t color = 0) {
+    if (text.empty()) return;
+    if (!out.empty() && out.back().style == style && out.back().color == color) out.back().text += text;
+    else out.push_back({text, style, color});
+}
+
+std::vector<PreviewSpan> preview_inline(const std::string &s) {
+    std::vector<PreviewSpan> out;
+    size_t i = 0, plain = 0;
+    auto close_at = [&](const char *mark, size_t from) {
+        size_t p = s.find(mark, from);
+        return p;
+    };
+    while (i < s.size()) {
+        if (s[i] == '!' && i + 1 < s.size() && s[i + 1] == '[') {
+            size_t mid = s.find("](", i + 2), end = mid == std::string::npos ? mid : s.find(')', mid + 2);
+            if (mid != std::string::npos && end != std::string::npos) {
+                preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+                preview_span(out, "[Image: " + s.substr(i + 2, mid - i - 2) + "]", FS_REGULAR, preview_link_color());
+                i = end + 1; plain = i; continue;
+            }
+        }
+        if (s[i] == '[') {
+            size_t mid = s.find("](", i + 1), end = mid == std::string::npos ? mid : s.find(')', mid + 2);
+            if (mid != std::string::npos && end != std::string::npos) {
+                preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+                preview_span(out, s.substr(i + 1, mid - i - 1), FS_REGULAR, preview_link_color());
+                i = end + 1; plain = i; continue;
+            }
+        }
+        if (s.compare(i, 5, "link:") == 0) {
+            size_t l = s.find('[', i + 5), r = l == std::string::npos ? l : s.find(']', l + 1);
+            if (l != std::string::npos && r != std::string::npos) {
+                preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+                preview_span(out, s.substr(l + 1, r - l - 1), FS_REGULAR, preview_link_color());
+                i = r + 1; plain = i; continue;
+            }
+        }
+        const char *marks[] = {"**", "__", "``", "''", "*", "_", "`"};
+        bool parsed = false;
+        for (const char *m : marks) {
+            size_t n = strlen(m);
+            if (s.compare(i, n, m) != 0) continue;
+            size_t end = close_at(m, i + n);
+            if (end == std::string::npos || end == i + n) continue;
+            preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+            int style = (n == 2 && (m[0] == '*' || m[0] == '_')) ? FS_BOLD : n == 1 && (m[0] == '*' || m[0] == '_') ? FS_ITALIC : FS_REGULAR;
+            uint32_t color = (m[0] == '`' || m[0] == '\'') ? TOKCOL[T_STRING] : 0;
+            preview_span(out, s.substr(i + n, end - i - n), style, color);
+            i = end + n; plain = i; parsed = true; break;
+        }
+        if (!parsed) {
+            size_t adv = 1;
+            u8_decode(s.data() + i, s.size() - i, &adv);
+            i += adv;
+        }
+    }
+    preview_span(out, s.substr(plain), FS_REGULAR);
+    return out;
+}
+
+const Lang *preview_code_lang(const std::string &name) {
+    std::string n = lower_ascii(name);
+    if (n == "py" || n == "python") return lang_detect("preview.py", nullptr, 0);
+    if (n == "js" || n == "javascript" || n == "jsx") return lang_detect("preview.js", nullptr, 0);
+    if (n == "ts" || n == "typescript" || n == "tsx") return lang_detect("preview.ts", nullptr, 0);
+    if (n == "sh" || n == "shell" || n == "bash" || n == "console") return lang_detect("preview.sh", nullptr, 0);
+    if (n == "json") return lang_detect("preview.json", nullptr, 0);
+    if (n == "yaml" || n == "yml") return lang_detect("preview.yaml", nullptr, 0);
+    if (n == "toml") return lang_detect("preview.toml", nullptr, 0);
+    if (n == "c") return lang_detect("preview.c", nullptr, 0);
+    if (n == "cpp" || n == "c++") return lang_detect("preview.cpp", nullptr, 0);
+    if (n == "rust" || n == "rs") return lang_detect("preview.rs", nullptr, 0);
+    if (n == "go") return lang_detect("preview.go", nullptr, 0);
+    if (n == "html" || n == "xml") return lang_detect("preview.html", nullptr, 0);
+    if (n == "css") return lang_detect("preview.css", nullptr, 0);
+    if (n == "sql") return lang_detect("preview.sql", nullptr, 0);
+    return lang_plain();
+}
+
+float preview_draw_inline(const std::string &text, float x, float y, float width, float line_h, Font *font, int base_style,
+                          uint32_t base_color, bool draw) {
+    std::vector<PreviewSpan> spans = preview_inline(text);
+    float start_x = x, pen = x;
+    for (const PreviewSpan &span : spans) {
+        int style = span.style == FS_REGULAR ? base_style : (span.style == FS_BOLD ? FS_BOLD : span.style == FS_ITALIC ? FS_ITALIC : FS_BOLD_ITALIC);
+        for (size_t i = 0; i < span.text.size();) {
+            size_t adv = 1;
+            uint32_t cp = u8_decode(span.text.data() + i, span.text.size() - i, &adv);
+            const AtlasGlyph *g = atlas_glyph(E.atlas, font, cp, style);
+            float gw = g ? g->adv : (float)font_cell_w(font);
+            if (pen > start_x && pen + gw > start_x + width) { pen = start_x; y += line_h; }
+            if (draw && g && !g->blank) {
+                RInst inst;
+                r_make_glyph(E.r, &inst, g, pen, y + (float)font_ascent(font), span.color ? span.color : base_color);
+                r_push(E.r, &inst, 1);
+            }
+            pen += gw;
+            i += adv;
+        }
+    }
+    return y + line_h;
+}
+
+size_t preview_code_rows(const PreviewBlock &block, float width) {
+    int cols = std::max(1, (int)(width / (float)std::max(1, E.cw)));
+    size_t rows = 0;
+    for (const std::string &line : block.lines) {
+        size_t chars = 0;
+        for (size_t p = 0; p < line.size();) { size_t n = 1; u8_decode(line.data() + p, line.size() - p, &n); p += n; chars++; }
+        rows += std::max<size_t>(1, (chars + (size_t)cols - 1) / (size_t)cols);
+    }
+    return rows;
+}
+
+uint32_t preview_token_color(uint8_t token) {
+        PreviewPalette p = preview_palette();
+        switch (token) {
+        case T_COMMENT: return p.muted;
+        case T_STRING: return p.accent;
+        case T_NUMBER: return E.preview_light ? RGBA(5,117,89,255) : RGBA(121,192,128,255);
+        case T_KEYWORD: return E.preview_light ? RGBA(130,80,223,255) : RGBA(210,168,255,255);
+        case T_TYPE: return E.preview_light ? RGBA(5,117,89,255) : RGBA(126,231,135,255);
+        case T_FUNC: return E.preview_light ? RGBA(102,57,0,255) : RGBA(255,209,102,255);
+        case T_PREPROC: return p.accent;
+        default: return p.text;
+        }
+    }
+
+std::string preview_trim(std::string s) {
+        size_t a = s.find_first_not_of(" \t\r");
+        if (a == std::string::npos) return {};
+        size_t b = s.find_last_not_of(" \t\r");
+        return s.substr(a, b - a + 1);
+    }
+
+std::vector<std::string> preview_table_cells(const std::string &row) {
+        std::vector<std::string> cells;
+        std::string cell;
+        bool code = false, escaped = false;
+        for (char c : row) {
+            if (escaped) { cell += c; escaped = false; continue; }
+            if (c == '\\') { escaped = true; continue; }
+            if (c == '`') code = !code;
+            if (c == '|' && !code) { cells.push_back(preview_trim(cell)); cell.clear(); }
+            else cell += c;
+        }
+        if (escaped) cell += '\\';
+        cells.push_back(preview_trim(cell));
+        if (!row.empty() && row.front() == '|' && !cells.empty()) cells.erase(cells.begin());
+        if (!row.empty() && row.back() == '|' && !cells.empty()) cells.pop_back();
+        return cells;
+    }
+
+std::vector<int> preview_table_align(const std::string &divider, size_t count) {
+        std::vector<std::string> cells = preview_table_cells(divider);
+        std::vector<int> out(count, 0);
+        for (size_t i = 0; i < std::min(count, cells.size()); i++) {
+            bool left = !cells[i].empty() && cells[i].front() == ':';
+            bool right = !cells[i].empty() && cells[i].back() == ':';
+            out[i] = left && right ? 1 : right ? 2 : 0; // left, center, right
+        }
+        return out;
+    }
+
+struct MermaidNode {
+        std::string id, label;
+        char shape = 'r';
+    };
+struct MermaidEdge { size_t from = 0, to = 0; std::string label; };
+struct MermaidGraph {
+        bool known = false, left_right = false, sequence = false;
+        std::vector<MermaidNode> nodes;
+        std::vector<MermaidEdge> edges;
+        std::vector<std::string> sequence_messages;
+    };
+
+size_t mermaid_node(MermaidGraph &g, std::string expr) {
+        expr = preview_trim(expr);
+        if (expr == "[*]") {
+            for (size_t i = 0; i < g.nodes.size(); i++) if (g.nodes[i].id == "__start") return i;
+            g.nodes.push_back({"__start", "", 'c'});
+            return g.nodes.size() - 1;
+        }
+        size_t label_start = expr.find_first_of("[({\"");
+        std::string id = preview_trim(expr.substr(0, label_start));
+        if (id.empty() || id == "end" || id == "subgraph") return (size_t)-1;
+        char shape = 'r';
+        std::string label = id;
+        if (label_start != std::string::npos) {
+            char open = expr[label_start];
+            char close = open == '[' ? ']' : open == '{' ? '}' : open == '(' ? ')' : '"';
+            size_t end = expr.find_last_of(close);
+            if (end != std::string::npos && end > label_start) {
+                label = expr.substr(label_start + 1, end - label_start - 1);
+                if (open == '(' && label_start + 1 < expr.size() && expr[label_start + 1] == '(') { shape = 'c'; label = expr.substr(label_start + 2, expr.find("))", label_start + 2) - (label_start + 2)); }
+                else if (open == '{') shape = 'd';
+                else if (open == '[' && label_start + 1 < expr.size() && expr[label_start + 1] == '[') shape = 's';
+                else if (open == '(') shape = 'o';
+            }
+        }
+        for (size_t i = 0; i < g.nodes.size(); i++) if (g.nodes[i].id == id) {
+            if (g.nodes[i].label == id && label != id) { g.nodes[i].label = label; g.nodes[i].shape = shape; }
+            return i;
+        }
+        g.nodes.push_back({id, label, shape});
+        return g.nodes.size() - 1;
+    }
+
+MermaidGraph preview_mermaid(const std::vector<std::string> &lines) {
+        MermaidGraph g;
+        std::string first;
+        for (const std::string &line : lines) if (!preview_trim(line).empty()) { first = preview_trim(line); break; }
+        if (first.find("sequenceDiagram") == 0) {
+            g.known = g.sequence = true;
+            for (const std::string &line0 : lines) {
+                std::string line = preview_trim(line0);
+                if (line.find("participant ") == 0 || line.find("actor ") == 0) {
+                    size_t p = line.find(' ');
+                    std::string def = preview_trim(line.substr(p + 1));
+                    size_t as = def.find(" as ");
+                    std::string id = preview_trim(def.substr(0, as));
+                    std::string label = as == std::string::npos ? id : preview_trim(def.substr(as + 4));
+                    if (!id.empty()) {
+                        size_t idx = mermaid_node(g, id + "[" + label + "]");
+                        (void)idx;
+                    }
+                }
+                size_t arrow = line.find("->>");
+                size_t arrow_n = 3;
+                if (arrow == std::string::npos) { arrow = line.find("-->>"); arrow_n = 4; }
+                if (arrow == std::string::npos) { arrow = line.find("->"); arrow_n = 2; }
+                if (arrow != std::string::npos) {
+                    std::string from = preview_trim(line.substr(0, arrow));
+                    size_t colon = line.find(':', arrow + arrow_n);
+                    std::string to = preview_trim(line.substr(arrow + arrow_n, colon == std::string::npos ? std::string::npos : colon - arrow - arrow_n));
+                    std::string label = colon == std::string::npos ? "" : preview_trim(line.substr(colon + 1));
+                    size_t a = mermaid_node(g, from), b = mermaid_node(g, to);
+                    if (a != (size_t)-1 && b != (size_t)-1) {
+                        g.edges.push_back({a, b, label});
+                        g.sequence_messages.push_back(label);
+                    }
+                }
+            }
+            return g;
+        }
+        if (first.find("flowchart") == 0 || first.find("graph ") == 0 || first.find("stateDiagram") == 0) {
+            g.known = true;
+            g.left_right = first.find("LR") != std::string::npos || first.find("RL") != std::string::npos;
+        } else return g;
+        const char *arrows[] = {"-.->", "==>", "-->", "---", "--x", "--o"};
+        for (const std::string &line0 : lines) {
+            std::string line = preview_trim(line0);
+            if (line.empty() || line[0] == '%' || line.find("flowchart") == 0 || line.find("graph ") == 0 ||
+                line.find("stateDiagram") == 0 || line.find("subgraph") == 0 || line == "end" || line.find("classDef ") == 0 ||
+                line.find("style ") == 0 || line.find("linkStyle ") == 0) continue;
+            size_t p = 0;
+            std::string previous;
+            while (p < line.size()) {
+                size_t at = std::string::npos; size_t ai = 0, an = 0;
+                for (size_t k = 0; k < sizeof arrows / sizeof *arrows; k++) {
+                    size_t found = line.find(arrows[k], p);
+                    if (found < at) { at = found; ai = k; an = strlen(arrows[k]); }
+                }
+                if (at == std::string::npos) {
+                    std::string expr = preview_trim(line.substr(p));
+                    size_t end = expr.find('|');
+                    if (end != std::string::npos) expr.resize(end);
+                    size_t id = mermaid_node(g, expr);
+                    (void)id;
+                    break;
+                }
+                std::string left = previous.empty() ? preview_trim(line.substr(p, at - p)) : previous;
+                size_t a = mermaid_node(g, left);
+                size_t rhs = at + an;
+                std::string arrow_label;
+                if (rhs < line.size() && line[rhs] == '|') {
+                    size_t end = line.find('|', rhs + 1);
+                    if (end != std::string::npos) { arrow_label = line.substr(rhs + 1, end - rhs - 1); rhs = end + 1; }
+                }
+                size_t next = std::string::npos, nextn = 0;
+                for (const char *arrow : arrows) { size_t found = line.find(arrow, rhs); if (found < next) { next = found; nextn = strlen(arrow); } }
+                std::string right = preview_trim(line.substr(rhs, next == std::string::npos ? std::string::npos : next - rhs));
+                size_t b = mermaid_node(g, right);
+                if (a != (size_t)-1 && b != (size_t)-1) g.edges.push_back({a, b, arrow_label});
+                if (next == std::string::npos) break;
+                previous = right;
+                p = next;
+                (void)ai;
+                (void)nextn;
+            }
+        }
+        return g;
+    }
+
+float preview_draw_code(const PreviewBlock &block, float x, float y, float width, bool draw) {
+    const Lang *lang = preview_code_lang(block.language);
+    int cw = std::max(1, E.cw);
+    int cols = std::max(1, (int)(width / (float)cw));
+    uint8_t state = 0;
+    float line_h = (float)E.rowh;
+    for (const std::string &line : block.lines) {
+        std::vector<uint8_t> tok(line.size(), T_PLAIN);
+        if (lang != lang_plain()) state = lex_line(lang, line.data(), line.size(), state, tok.data());
+        else state = 0;
+        size_t pos = 0;
+        while (pos < line.size() || (line.empty() && pos == 0)) {
+            size_t end = pos;
+            for (int col = 0; col < cols && end < line.size(); col++) {
+                size_t adv = 1;
+                u8_decode(line.data() + end, line.size() - end, &adv);
+                end += adv;
+            }
+            if (draw) {
+                float pen = x;
+                for (size_t i = pos; i < end;) {
+                    size_t adv = 1;
+                    uint32_t cp = u8_decode(line.data() + i, end - i, &adv);
+                    const AtlasGlyph *g = atlas_glyph(E.atlas, E.font, cp, FS_REGULAR);
+                    if (g && !g->blank) { RInst inst; r_make_glyph(E.r, &inst, g, pen, y + (float)E.rowasc, preview_token_color(tok[i])); r_push(E.r, &inst, 1); }
+                    pen += g ? g->adv : (float)cw;
+                    i += adv;
+                }
+            }
+            y += line_h;
+            if (end >= line.size()) break;
+            pos = end;
+        }
+    }
+    return y;
+}
+
+void preview_refresh(Doc &d) {
+    PreviewFormat f = preview_format(d.path);
+    if (E.preview_doc == &d && E.preview_revision == d.buf.revision() && E.preview_path == d.path && E.preview_cached_format == f) return;
+    std::string source;
+    d.buf.copy(0, d.buf.size(), source);
+    E.preview_blocks = preview_parse(source, f);
+    E.preview_doc = &d;
+    E.preview_revision = d.buf.revision();
+    E.preview_path = d.path;
+    E.preview_cached_format = f;
+    E.preview_scroll = 0;
+}
+
+void dlg_show(const std::string &title, const std::string &detail, std::vector<std::string> btns, std::function<void(int, const std::string &)> done,
+              bool input = false, const std::string &text = "", const std::string &ph = "", bool mask = false) {
+    Dialog &d = E.dlg;
+    d.mask = mask;
+    d.title = title; d.detail = detail; d.btns = std::move(btns); d.done = std::move(done);
+    d.input = input; d.text = text; d.placeholder = ph; d.focus = 0; d.fresh = input && !text.empty() && !mask;
+    E.mode = M_DIALOG;
+    redraw();
+}
+
+void dlg_finish(int idx) {
+    auto cb = std::move(E.dlg.done);
+    std::string txt = E.dlg.text;
+    E.dlg.done = nullptr;
+    E.mode = M_EDIT;
+    redraw();
+    if (cb) cb(idx, txt);
+}
+
+void ctx_show(float x, float y, std::vector<CtxItem> items) {
+    E.ctx.x = x; E.ctx.y = y; E.ctx.items = std::move(items); E.ctx.open.clear();
+    E.mode = M_CTX;
+    redraw();
+}
+
+CtxItem ci(const std::string &label, std::function<void()> act, const std::string &hint = "", bool enabled = true, bool checked = false) {
+    CtxItem c; c.label = label; c.act = std::move(act); c.hint = hint; c.enabled = enabled; c.checked = checked; return c;
+}
+CtxItem ci_sep() { CtxItem c; c.sep = true; return c; }
+CtxItem ci_sub(const std::string &label, std::vector<CtxItem> sub) { CtxItem c; c.label = label; c.sub = std::move(sub); return c; }
+
+struct CtxGeom { float x, y, w, h; const std::vector<CtxItem> *items; };
+float ctx_row_h(const CtxItem &c) { return (float)S(c.sep ? 9 : 26); }
+CtxGeom ctx_geom(int level) {
+    const std::vector<CtxItem> *items = &E.ctx.items;
+    float x = E.ctx.x, y = E.ctx.y, w = 0, h = 0;
+    float px = 0, pw = 0;
+    for (int l = 0; l <= level; l++) {
+        w = 0; h = (float)S(8);
+        for (const CtxItem &c : *items) {
+            h += ctx_row_h(c);
+            if (c.sep) continue;
+            float lw = text_width(E.ui, c.label.c_str()) + (c.hint.empty() ? 0.f : text_width(E.ui, c.hint.c_str()) + (float)S(28));
+            w = std::max(w, lw);
+        }
+        w += (float)S(58);
+        if (l == 0) {
+            x = std::max(0.f, std::min(x, (float)E.W - w - (float)S(4)));
+            y = std::max(0.f, std::min(y, (float)E.H - h - (float)S(4)));
+        } else {
+            x = px + pw - (float)S(2);
+            if (x + w > (float)E.W - (float)S(4)) x = std::max(0.f, px - w + (float)S(2));
+            y = std::max(0.f, std::min(y, (float)E.H - h - (float)S(4)));
+        }
+        if (l < level) {
+            int oi = E.ctx.open[(size_t)l];
+            float iy = y + (float)S(4);
+            for (int i = 0; i < oi; i++) iy += ctx_row_h((*items)[(size_t)i]);
+            px = x; pw = w; y = iy - (float)S(4);
+            items = &(*items)[(size_t)oi].sub;
+        }
+    }
+    return {x, y, w, h, items};
+}
+
+void draw_ctx_menu() {
+    hit(0, 0, (float)E.W, (float)E.H, H_CTXBG, 0);
+    for (int l = 0; l <= (int)E.ctx.open.size(); l++) {
+        CtxGeom g = ctx_geom(l);
+        r_rect(E.r, g.x - 1, g.y - 1, g.w + 2, g.h + 2, C_MENU_BORDER);
+        r_rect(E.r, g.x, g.y, g.w, g.h, C_MENU);
+        float y = g.y + (float)S(4);
+        for (size_t i = 0; i < g.items->size(); i++) {
+            const CtxItem &c = (*g.items)[i];
+            float rh = ctx_row_h(c);
+            if (c.sep) { r_rect(E.r, g.x + (float)S(8), y + rh / 2, g.w - (float)S(16), 1, C_MENU_BORDER); y += rh; continue; }
+            int id = (l << 12) | (int)i;
+            bool open_here = l < (int)E.ctx.open.size() && E.ctx.open[(size_t)l] == (int)i;
+            if (c.enabled && (hovered(H_CTXITEM, id) || open_here)) r_rect(E.r, g.x + (float)S(3), y, g.w - (float)S(6), rh, C_MENU_SEL);
+            uint32_t col = c.enabled ? C_UI : C_UI_FAINT;
+            if (c.checked) draw_icon(IC_CHECK, g.x + (float)S(8), y + (rh - (float)S(14)) / 2, S(14), col);
+            draw_text(E.ui, g.x + (float)S(28), ui_base(y, rh), c.label.c_str(), col, g.w - (float)S(40));
+            if (!c.hint.empty()) draw_text(E.ui, g.x + g.w - (float)S(14) - text_width(E.ui, c.hint.c_str()), ui_base(y, rh), c.hint.c_str(), C_UI_FAINT, g.w);
+            if (!c.sub.empty()) draw_icon(IC_CHEV_R, g.x + g.w - (float)S(22), y + (rh - (float)S(16)) / 2, S(16), col);
+            hit(g.x, y, g.w, rh, H_CTXITEM, id);
+            y += rh;
+        }
+    }
+}
+
+void ctx_click(int id) {
+    int l = id >> 12, i = id & 0xfff;
+    CtxGeom g = ctx_geom(l);
+    if (i < 0 || (size_t)i >= g.items->size()) return;
+    const CtxItem &c = (*g.items)[(size_t)i];
+    if (c.sep || !c.enabled) return;
+    if (!c.sub.empty()) { E.ctx.open.resize((size_t)l); E.ctx.open.push_back(i); redraw(); return; }
+    auto act = c.act;
+    E.mode = M_EDIT;
+    E.ctx.items.clear(); E.ctx.open.clear();
+    redraw();
+    if (act) act();
+}
+
+void ctx_hover() {   /* a submenu opens while its item is hovered; moving to a sibling closes it */
+    if (E.mode != M_CTX || E.hover_kind != H_CTXITEM) return;
+    int l = E.hover_id >> 12, i = E.hover_id & 0xfff;
+    if (l > (int)E.ctx.open.size()) return;
+    CtxGeom g = ctx_geom(l);
+    if (i < 0 || (size_t)i >= g.items->size()) return;
+    bool want = !(*g.items)[(size_t)i].sub.empty() && (*g.items)[(size_t)i].enabled;
+    bool has = (int)E.ctx.open.size() > l && E.ctx.open[(size_t)l] == i;
+    if (has && want) return;
+    if ((int)E.ctx.open.size() > l) E.ctx.open.resize((size_t)l);
+    if (want) E.ctx.open.push_back(i);
+    redraw();
+}
+
+void draw_dialog() {
+    Dialog &d = E.dlg;
+    r_rect(E.r, 0, 0, (float)E.W, (float)E.H, C_SHADE);
+    hit(0, 0, (float)E.W, (float)E.H, H_DLGBG, 0);
+    float pad = (float)S(22), lh = (float)S(21);
+    float pw = std::min((float)E.W - (float)S(24), (float)S(540)), iw = pw - 2 * pad;
+    std::vector<std::string> tl = wrap_lines(d.title, iw - (float)S(30), FS_BOLD), dl = wrap_lines(d.detail, iw - (float)S(30));
+    float bw_sum = 0;
+    std::vector<float> bw;
+    for (const std::string &b : d.btns) { bw.push_back(text_width(E.ui, b.c_str()) + (float)S(30)); bw_sum += bw.back() + (float)S(8); }
+    bool stack = bw_sum - (float)S(8) > iw;
+    float bh = (float)S(30), btn_h = stack ? (float)d.btns.size() * (bh + (float)S(8)) - (float)S(8) : bh;
+    float fixed = pad * 2 + btn_h + (d.input ? (float)S(44) : 0.f) + (float)S(16);
+    size_t max_lines = (size_t)std::max(3.f, ((float)E.H - (float)S(24) - fixed) / lh);
+    while (tl.size() + dl.size() > max_lines && dl.size() > 1) dl.pop_back();
+    float ph = fixed + (float)(tl.size() + dl.size()) * lh + (dl.empty() ? 0.f : (float)S(8));
+    float px = ((float)E.W - pw) / 2, py = std::max((float)S(12), ((float)E.H - ph) / 3);
+    r_rect(E.r, px - 1, py - 1, pw + 2, ph + 2, C_MENU_BORDER);
+    r_rect(E.r, px, py, pw, ph, C_MENU);
+    r_rect(E.r, px, py, pw, (float)S(2), C_ACCENT);
+    float y = py + pad;
+    draw_dot(px + pad + (float)S(9), y + lh / 2, S(30), C_GIT_MOD);   /* the warning mark */
+    draw_text(E.ui, px + pad + (float)S(9) - text_width(E.ui, "!", FS_BOLD) / 2, ui_base(y, lh), "!", C_EDITOR, (float)S(12), FS_BOLD);
+    float tx = px + pad + (float)S(30);
+    for (const std::string &l : tl) { draw_text(E.ui, tx, ui_base(y, lh), l.c_str(), C_UI, iw - (float)S(30), FS_BOLD); y += lh; }
+    if (!dl.empty()) y += (float)S(8);
+    for (const std::string &l : dl) { draw_text(E.ui, tx, ui_base(y, lh), l.c_str(), C_UI_DIM, iw - (float)S(30)); y += lh; }
+    if (d.input) {
+        y += (float)S(8);
+        r_rect(E.r, px + pad, y, iw, (float)S(30), C_ACCENT);
+        r_rect(E.r, px + pad + 1, y + 1, iw - 2, (float)S(28), C_FIELD);
+        float pen = px + pad + (float)S(8);
+        if (d.text.empty()) draw_text(E.ui, pen, ui_base(y, (float)S(30)), d.placeholder.c_str(), C_UI_FAINT, iw - (float)S(16));
+        else {
+            std::string shown = d.mask ? std::string(d.text.size() > 40 ? 40 : d.text.size(), '*') : d.text;
+            float p0 = pen;
+            if (d.fresh) r_rect(E.r, p0, y + (float)S(4), std::min(iw - (float)S(16), text_width(E.ui, shown.c_str())), (float)S(22), C_SELROW);
+            pen = draw_text(E.ui, pen, ui_base(y, (float)S(30)), shown.c_str(), C_UI, iw - (float)S(16));
+        }
+        if (E.blink_on) r_rect(E.r, pen + 1, y + (float)S(6), std::max(1.f, E.scale), (float)S(18), C_CURSOR);
+        y += (float)S(36);
+    }
+    y = py + ph - pad - btn_h;
+    float bx = px + pw - pad;
+    if (stack) {
+        for (size_t k = 0; k < d.btns.size(); k++) {
+            bool f = (int)k == d.focus;
+            r_rect(E.r, px + pad, y, iw, bh, f ? C_ACCENT : hovered(H_DLGBTN, (int)k) ? C_SELROW : C_HOVER);
+            float lw = text_width(E.ui, d.btns[k].c_str());
+            draw_text(E.ui, px + pad + (iw - lw) / 2, ui_base(y, bh), d.btns[k].c_str(), f ? C_ON_ACCENT : C_UI, iw);
+            hit(px + pad, y, iw, bh, H_DLGBTN, (int)k);
+            y += bh + (float)S(8);
+        }
+    } else {
+        for (size_t k = d.btns.size(); k-- > 0;) {   /* right aligned, in the order given: the first is the primary one */
+            bx -= bw[k];
+            bool f = (int)k == d.focus;
+            r_rect(E.r, bx, y, bw[k], bh, f ? C_ACCENT : hovered(H_DLGBTN, (int)k) ? C_SELROW : C_HOVER);
+            draw_text(E.ui, bx + (float)S(15), ui_base(y, bh), d.btns[k].c_str(), f ? C_ON_ACCENT : C_UI, bw[k]);
+            hit(bx, y, bw[k], bh, H_DLGBTN, (int)k);
+            bx -= (float)S(8);
+        }
+    }
+}
+
+/* ---- source control actions: commit, discard, sync, branches, stash, tags (VS Code's wording and confirmations) ---- */
+
+void pick_custom(const std::string &title, std::vector<Ed::PItem> items, std::function<void(const Ed::PItem &)> cb);
+void settings_save();
+void open_side(bool open);
+bool new_terminal();
+
+std::string trim_nl(std::string m) {
+    while (!m.empty() && (m.back() == '\n' || m.back() == ' ' || m.back() == '\r')) m.pop_back();
+    size_t b = 0;
+    while (b < m.size() && (m[b] == '\n' || m[b] == ' ')) b++;
+    return m.substr(b);
+}
+
+void git_error(const std::string &what, const std::string &out) {
+    std::string d = trim_nl(out);
+    if (d.size() > 700) d = d.substr(0, 700) + "...";
+    dlg_show("Git: " + what + " failed", d.empty() ? "git reported an error without a message." : d, {"OK"}, nullptr);
+}
+
+/* an open tab whose file git just rewrote: re-read it unless it has unsaved edits */
+void reload_open_docs() {
+    for (size_t i = 0; i < E.docs.size(); i++) {
+        Doc &o = *E.docs[i];
+        if (o.dv || o.mv || o.path.empty() || o.modified()) continue;
+        struct stat st;
+        if (stat(o.path.c_str(), &st) != 0) continue;
+        auto nd = std::make_unique<Doc>();
+        if (!nd->open(o.path.c_str())) continue;
+        nd->top = std::min(o.top, nd->buf.lines() ? nd->buf.lines() - 1 : 0);
+        nd->cur = nd->anchor = std::min(o.cur, nd->buf.size());
+        g_gutter.erase(&o);
+        E.docs[i] = std::move(nd);
+    }
+    E.rows.clear();
+}
+
+bool git_sync_run(const std::string &what, const std::string &args, std::string *out = nullptr, bool show_error = true) {
+    std::string o;
+    int c = git_exec(E.git.root, args, &o);
+    if (out) *out = o;
+    if (c != 0 && show_error) git_error(what, o);
+    return c == 0;
+}
+
+void job_start(GitJob &j, const std::string &label, std::function<int(std::string &)> fn, std::function<void(int, const std::string &)> cb);
+
+void git_start(const std::string &label, const std::string &args, std::function<void(int, const std::string &)> cb) {
+    if (g_job.running) { E.status_msg = "git is busy: " + g_job.label; redraw(); return; }
+    askpass_start();
+    std::string root = E.git.root;
+    job_start(g_job, label, [root, args](std::string &out) { return git_exec(root, args, &out); }, [cb](int c, const std::string &o) { E.status_msg.clear(); if (cb) cb(c, o); });
+    E.status_msg = label + "..."; redraw();
+}
+
+void git_job_poll();
+
+std::string git_remote_name() {
+    std::string o;
+    git_exec(E.git.root, "remote", &o);
+    return git_first_line(o);
+}
+
+void git_pull_flow(std::function<void()> then = nullptr) {
+    begin_op("git pull");
+    git_start("Pulling", "pull", [then](int c, const std::string &o) {
+        git_refresh(); reload_open_docs();
+        if (c != 0) git_error("pull", o); else { E.status_msg = "pulled"; if (then) then(); }
+    });
+}
+
+void git_push_flow(std::function<void()> then = nullptr) {
+    if (!E.git.has_remote) { dlg_show("Your repository has no remotes configured to push to.", "", {"OK"}, nullptr); return; }
+    auto go = [then](const std::string &args, const char *label) {
+        git_start(label, args, [then](int c, const std::string &o) {
+            git_refresh();
+            if (c == 0) { E.status_msg = "pushed"; if (then) then(); return; }
+            if (o.find("rejected") != std::string::npos || o.find("non-fast-forward") != std::string::npos || o.find("fetch first") != std::string::npos)
+                dlg_show("Can't push refs to remote. Try running \"Pull\" first to integrate your changes.", git_first_line(o), {"Pull", "Cancel"}, [](int i, const std::string &) { if (i == 0) git_pull_flow(); });
+            else git_error("push", o);
+        });
+    };
+    if (E.git.upstream.empty()) {
+        std::string br = E.git.branch, rem = git_remote_name();
+        dlg_show("The branch '" + br + "' has no remote branch. Would you like to publish this branch?", "", {"OK", "Cancel"},
+                 [go, br, rem](int i, const std::string &) { if (i == 0) go("push -u " + git_quote(rem) + " " + git_quote(br), "Publishing"); });
+    } else go("push", "Pushing");
+}
+
+void git_sync_flow() {
+    if (E.git.upstream.empty()) { git_push_flow(); return; }
+    auto run = [] { git_pull_flow([] { git_push_flow(); }); };
+    if (!E.g.sync_confirm) { run(); return; }
+    dlg_show("This action will pull and push commits from and to \"" + E.git.upstream + "\".", "", {"OK", "OK, Don't Show Again", "Cancel"}, [run](int i, const std::string &) {
+        if (i == 1) { E.g.sync_confirm = false; settings_save(); }
+        if (i == 0 || i == 1) run();
+    });
+}
+
+void git_fetch_flow() {
+    begin_op("git fetch");
+    git_start("Fetching", "fetch --prune", [](int c, const std::string &o) { git_refresh(); if (c != 0) git_error("fetch", o); else E.status_msg = "fetched"; });
+}
+
+/* variant: 0 commit, 1 amend, 2 signed off, 3 commit and push, 4 commit and sync */
+void git_commit_flow(int variant) {
+    GitUi &g = E.g;
+    std::string m = trim_nl(g.msg);
+    bool amend = variant == 1;
+    if (m.empty() && !amend) { g.err = "Please provide a commit message"; redraw(); return; }
+    bool have_staged = false;
+    for (const GitChange &c : E.git.changes) if (c.x != ' ' && c.x != '?') have_staged = true;
+    auto go = [variant, m, amend](bool stage_all) {
+        GitUi &g2 = E.g;
+        begin_op("git commit");
+        if (stage_all) git_stage_all(E.git.root);
+        std::string out;
+        std::string args = "commit" + std::string(amend ? " --amend" : "") + (variant == 2 ? " -s" : "") + (m.empty() ? " --no-edit" : " -m " + git_quote(m));
+        if (!git_sync_run("commit", args, &out, false)) { g2.err = git_first_line(out); if (g2.err.empty()) g2.err = "commit failed"; git_refresh(); return; }
+        g2.msg.clear(); g2.err.clear(); E.status_msg = "committed";
+        git_refresh();
+        if (variant == 3) git_push_flow();
+        else if (variant == 4) git_sync_flow();
+    };
+    if (!have_staged && !amend) {
+        if (E.git.changes.empty()) { g.err = "Nothing to commit"; redraw(); return; }
+        if (g.smart_commit == 2) { g.err = "There are no staged changes to commit"; redraw(); return; }
+        if (g.smart_commit == 0) {
+            dlg_show("There are no staged changes to commit.\n\nWould you like to stage all your changes and commit them directly?", "", {"Yes", "Always", "Never"}, [go](int i, const std::string &) {
+                if (i == 1) { E.g.smart_commit = 1; settings_save(); }
+                if (i == 2) { E.g.smart_commit = 2; settings_save(); return; }
+                if (i == 0 || i == 1) go(true);
+            });
+            return;
+        }
+        go(true);
+        return;
+    }
+    go(false);
+}
+
+void git_commit_now() { git_commit_flow(0); }
+
+void git_undo_last_commit() {
+    std::string msg;
+    git_exec(E.git.root, "log -1 --format=%B", &msg);
+    std::string out;
+    if (!git_sync_run("undo last commit", "reset --soft HEAD~1", &out, false)) {
+        if (!git_sync_run("undo last commit", "update-ref -d HEAD", &out)) return;   /* the first commit has no parent */
+    }
+    if (trim_nl(E.g.msg).empty()) E.g.msg = trim_nl(msg);
+    git_refresh();
+}
+
+/* Discard Changes, as VS Code words it. tracked paths are restored from the index; untracked ones are deleted. */
+void do_discard(const std::vector<std::string> &tracked, const std::vector<std::string> &untracked) {
+    begin_op("git discard", std::to_string(tracked.size() + untracked.size()) + " files");
+    auto chunk = [&](const char *verb, const std::vector<std::string> &v) {
+        for (size_t i = 0; i < v.size(); i += 80) {
+            std::string a = verb;
+            for (size_t k = i; k < v.size() && k < i + 80; k++) a += " " + git_quote(v[k]);
+            std::string o;
+            if (!git_sync_run("discard changes", a, &o)) return false;
+        }
+        return true;
+    };
+    if (!tracked.empty() && !chunk("restore --", tracked)) { git_refresh(); return; }
+    if (!untracked.empty() && !chunk("clean -fdq --", untracked)) { git_refresh(); return; }
+    git_refresh();
+    reload_open_docs();
+    E.status_msg = "discarded changes";
+}
+
+void discard_files(const std::vector<int> &idxs) {   /* indexes into E.git.changes, all from the Changes group */
+    std::vector<std::string> tr, un, all_del;
+    int deleted = 0;
+    for (int i : idxs) {
+        if ((size_t)i >= E.git.changes.size()) continue;
+        const GitChange &c = E.git.changes[(size_t)i];
+        if (c.x == '?' && c.y == '?') un.push_back(c.path); else { tr.push_back(c.path); if (c.y == 'D') deleted++; }
+    }
+    size_t n = tr.size() + un.size();
+    if (!n) return;
+    std::string title, detail, yes;
+    if (n == 1) {
+        std::string nm = base_name(un.empty() ? tr[0] : un[0]);
+        if (!un.empty()) { title = "Are you sure you want to DELETE '" + nm + "'?"; detail = "This is IRREVERSIBLE!\nThis file will be FOREVER LOST if you proceed."; yes = "Delete File"; }
+        else if (deleted) { title = "Are you sure you want to restore '" + nm + "'?"; yes = "Restore File"; }
+        else { title = "Are you sure you want to discard changes in '" + nm + "'?"; detail = "This action is irreversible!"; yes = "Discard 1 File"; }
+    } else {
+        title = "Are you sure you want to discard " + std::to_string(n) + " files?";
+        detail = "This is IRREVERSIBLE!\nYour current working set will be FOREVER LOST.";
+        if (!un.empty()) detail += "\n\nThis will DELETE " + std::to_string(un.size()) + " untracked file" + (un.size() == 1 ? "" : "s") + "!";
+        yes = "Discard " + std::to_string(n) + " Files";
+    }
+    dlg_show(title, detail, {yes, "Cancel"}, [tr, un](int i, const std::string &) { if (i == 0) do_discard(tr, un); });
+}
+
+void discard_all_changes() {
+    std::vector<int> idx;
+    for (size_t i = 0; i < E.git.changes.size(); i++) { const GitChange &c = E.git.changes[i]; if ((c.x == '?' && c.y == '?') || (c.y != ' ' && c.y != '?')) idx.push_back((int)i); }
+    if (idx.empty()) { E.status_msg = "There are no changes to discard"; redraw(); return; }
+    if (idx.size() == 1) { discard_files(idx); return; }
+    std::vector<std::string> tr, un;
+    for (int i : idx) { const GitChange &c = E.git.changes[(size_t)i]; (c.x == '?' && c.y == '?' ? un : tr).push_back(c.path); }
+    size_t n = idx.size();
+    std::string detail = "This is IRREVERSIBLE!\nYour current working set will be FOREVER LOST.";
+    std::vector<std::string> btns = {"Discard All " + std::to_string(n) + " Files"};
+    if (!un.empty()) { detail += "\n\nThis will DELETE " + std::to_string(un.size()) + " untracked file" + (un.size() == 1 ? "" : "s") + "!"; btns.push_back("Discard Tracked Changes"); }
+    btns.push_back("Cancel");
+    dlg_show("Are you sure you want to discard ALL changes in " + std::to_string(n) + " files?", detail, btns, [tr, un](int i, const std::string &) {
+        if (i == 0) do_discard(tr, un);
+        else if (i == 1 && !un.empty()) do_discard(tr, {});
+    });
+}
+
+void git_add_ignore(const std::string &path) {
+    std::string f = E.git.root + "/.gitignore";
+    FILE *fp = fopen(f.c_str(), "a");
+    if (!fp) { E.status_msg = "cannot write .gitignore"; return; }
+    fprintf(fp, "/%s\n", path.c_str());
+    fclose(fp);
+    git_refresh();
+}
+
+/* ---- branches ---- */
+std::vector<Ed::PItem> branch_items(bool include_remote, bool skip_current) {
+    std::string o;
+    git_exec(E.git.root, "for-each-ref --format=%(HEAD)%(refname) refs/heads" + std::string(include_remote ? " refs/remotes" : ""), &o);
+    std::vector<Ed::PItem> v;
+    size_t pos = 0;
+    while (pos < o.size()) {
+        size_t e = o.find('\n', pos);
+        if (e == std::string::npos) e = o.size();
+        std::string l = o.substr(pos, e - pos);
+        pos = e + 1;
+        if (l.size() < 2) continue;
+        bool cur = l[0] == '*';
+        std::string ref = l.substr(1);
+        bool rem = ref.compare(0, 13, "refs/remotes/") == 0;
+        std::string name = ref.substr(rem ? 13 : 11);
+        if (rem && name.size() >= 5 && name.compare(name.size() - 5, 5, "/HEAD") == 0) continue;
+        if (cur && skip_current) continue;
+        v.push_back({name, rem ? 1 : 0, cur});
+    }
+    return v;
+}
+
+void git_checkout(const std::string &ref, bool remote) {
+    std::string o;
+    std::string args = remote ? "checkout --track " + git_quote(ref) : "checkout " + git_quote(ref);
+    if (git_exec(E.git.root, args, &o) == 0) { git_refresh(); reload_open_docs(); E.status_msg = "checked out " + ref; return; }
+    if (o.find("overwritten") != std::string::npos || o.find("commit your changes or stash") != std::string::npos) {
+        dlg_show("Your local changes would be overwritten by checkout.", "Please clean your repository working tree before checkout.", {"Stash & Checkout", "Force Checkout", "Cancel"}, [ref, remote](int i, const std::string &) {
+            std::string o2;
+            if (i == 0) { if (!git_sync_run("stash", "stash push --include-untracked", &o2)) return; }
+            else if (i == 1) { if (!git_sync_run("checkout", std::string("checkout -f ") + (remote ? "--track " : "") + git_quote(ref), &o2)) return; git_refresh(); reload_open_docs(); return; }
+            else return;
+            if (git_sync_run("checkout", std::string("checkout ") + (remote ? "--track " : "") + git_quote(ref), &o2)) { git_refresh(); reload_open_docs(); }
+        });
+        return;
+    }
+    git_error("checkout", o);
+}
+
+std::string branch_clean(std::string n) { for (char &c : n) if (c == ' ') c = '-'; return n; }
+
+void git_create_branch(const std::string &from) {
+    dlg_show("Create Branch", from.empty() ? "Please provide a new branch name" : "Please provide a new branch name (from " + from + ")", {"OK", "Cancel"}, [from](int i, const std::string &t) {
+        std::string n = branch_clean(trim_nl(t));
+        if (i != 0 || n.empty()) return;
+        std::string o;
+        if (git_sync_run("create branch", "checkout -b " + git_quote(n) + (from.empty() ? "" : " " + git_quote(from)), &o)) { git_refresh(); E.status_msg = "created branch " + n; }
+    }, true, "", "Branch name");
+}
+
+void git_branch_picker() {   /* the status bar branch / the "Checkout to..." command */
+    std::vector<Ed::PItem> items = {{"+ Create new branch...", -1, false}, {"+ Create new branch from...", -2, false}};
+    for (auto &b : branch_items(true, false)) items.push_back({b.label, b.id, b.current});
+    pick_custom("Select a branch or tag to checkout", items, [](const Ed::PItem &it) {
+        if (it.id == -1) git_create_branch("");
+        else if (it.id == -2) pick_custom("Select a ref to create the branch from", [] { std::vector<Ed::PItem> v; for (auto &b : branch_items(true, false)) v.push_back({b.label, b.id, false}); return v; }(), [](const Ed::PItem &r) { git_create_branch(r.label); });
+        else if (!it.current) git_checkout(it.label, it.id == 1);
+    });
+}
+
+void git_branch_ops(int which) {   /* 0 delete, 1 rename, 2 merge */
+    if (which == 1) {
+        dlg_show("Rename Branch", "Please provide a new branch name", {"OK", "Cancel"}, [](int i, const std::string &t) {
+            std::string n = branch_clean(trim_nl(t));
+            if (i == 0 && !n.empty() && git_sync_run("rename branch", "branch -m " + git_quote(n))) git_refresh();
+        }, true, E.git.branch, "Branch name");
+        return;
+    }
+    auto items = branch_items(false, true);
+    if (items.empty()) { E.status_msg = "no other branches"; redraw(); return; }
+    pick_custom(which == 0 ? "Select a branch to delete" : "Select a branch to merge from", items, [which](const Ed::PItem &it) {
+        std::string name = it.label, o;
+        if (which == 2) { if (git_sync_run("merge", "merge " + git_quote(name))) { git_refresh(); reload_open_docs(); E.status_msg = "merged " + name; } return; }
+        if (git_exec(E.git.root, "branch -d " + git_quote(name), &o) == 0) { git_refresh(); return; }
+        if (o.find("not fully merged") != std::string::npos)
+            dlg_show("The branch '" + name + "' is not fully merged. Delete anyway?", "", {"Delete Branch", "Cancel"}, [name](int i, const std::string &) { if (i == 0 && git_sync_run("delete branch", "branch -D " + git_quote(name))) git_refresh(); });
+        else git_error("delete branch", o);
+    });
+}
+
+/* ---- remotes, pull variants and rebase ---- */
+std::vector<std::string> git_remotes() {
+    std::string o;
+    git_exec(E.git.root, "remote", &o);
+    std::vector<std::string> v;
+    size_t pos = 0;
+    while (pos < o.size()) { size_t e = o.find('\n', pos); if (e == std::string::npos) e = o.size(); if (e > pos) v.push_back(o.substr(pos, e - pos)); pos = e + 1; }
+    return v;
+}
+
+void git_pick_remote(const std::string &title, std::function<void(const std::string &)> then) {
+    std::vector<std::string> rs = git_remotes();
+    if (rs.empty()) { dlg_show("Your repository has no remotes configured.", "", {"OK"}, nullptr); return; }
+    if (rs.size() == 1) { then(rs[0]); return; }
+    std::vector<Ed::PItem> items;
+    for (const std::string &r : rs) items.push_back({r, 0, false});
+    pick_custom(title, items, [then](const Ed::PItem &it) { then(it.label); });
+}
+
+void git_pull_rebase() {
+    begin_op("git pull --rebase");
+    git_start("Pulling (rebase)", "pull --rebase", [](int c, const std::string &o) {
+        git_refresh(); reload_open_docs();
+        if (c != 0 && !E.git.op.empty()) E.status_msg = "rebase stopped: resolve the conflicts, stage the files, then Continue";
+        else if (c != 0) git_error("pull --rebase", o); else E.status_msg = "pulled (rebase)";
+    });
+}
+
+void git_pull_from() {
+    git_pick_remote("Select a remote to pull from", [](const std::string &rem) {
+        std::vector<Ed::PItem> items;
+        for (auto &b : branch_items(true, false)) if (b.id == 1 && b.label.compare(0, rem.size() + 1, rem + "/") == 0) items.push_back({b.label.substr(rem.size() + 1), 0, false});
+        if (items.empty()) { dlg_show("No branches known for '" + rem + "'. Fetch first.", "", {"OK"}, nullptr); return; }
+        pick_custom("Select a branch to pull from " + rem, items, [rem](const Ed::PItem &it) {
+            begin_op("git pull");
+            git_start("Pulling", "pull " + git_quote(rem) + " " + git_quote(it.label), [](int c, const std::string &o) { git_refresh(); reload_open_docs(); if (c != 0) git_error("pull", o); else E.status_msg = "pulled"; });
+        });
+    });
+}
+
+void git_push_to() {
+    git_pick_remote("Select a remote to push to", [](const std::string &rem) {
+        begin_op("git push");
+        git_start("Pushing", "push -u " + git_quote(rem) + " " + git_quote(E.git.branch), [](int c, const std::string &o) { git_refresh(); if (c != 0) git_error("push", o); else E.status_msg = "pushed"; });
+    });
+}
+
+void git_rebase_onto() {
+    auto items = branch_items(true, true);
+    if (items.empty()) { E.status_msg = "no other branches"; redraw(); return; }
+    pick_custom("Select a branch to rebase '" + E.git.branch + "' onto", items, [](const Ed::PItem &it) {
+        std::string name = it.label;
+        dlg_show("Rebase '" + E.git.branch + "' onto '" + name + "'?", "Your commits are replayed on top of it. Stop with Abort if it goes wrong.", {"Rebase", "Cancel"}, [name](int i, const std::string &) {
+            if (i != 0) return;
+            begin_op("git rebase");
+            git_start("Rebasing", "rebase " + git_quote(name), [name](int c, const std::string &o) {
+                git_refresh(); reload_open_docs();
+                if (c != 0 && !E.git.op.empty()) E.status_msg = "rebase stopped: resolve the conflicts, stage the files, then Continue";
+                else if (c != 0) git_error("rebase", o); else E.status_msg = "rebased onto " + name;
+            });
+        });
+    });
+}
+
+void git_remote_add() {
+    dlg_show("Add Remote", "Remote name", {"Next", "Cancel"}, [](int i, const std::string &t) {
+        std::string n = trim_nl(t);
+        if (i != 0 || n.empty()) return;
+        if (n.find_first_of(" \t/") != std::string::npos) { dlg_show("Not a valid remote name", "A remote name cannot contain spaces or slashes.", {"OK"}, nullptr); return; }
+        dlg_show("Add Remote", "URL of '" + n + "'", {"Add", "Cancel"}, [n](int i2, const std::string &t2) {
+            std::string u = trim_nl(t2);
+            if (i2 == 0 && !u.empty() && git_sync_run("add remote", "remote add " + git_quote(n) + " " + git_quote(u))) { git_refresh(); E.status_msg = "added remote " + n; }
+        }, true, "", "https://... or git@host:path.git");
+    }, true, "", "origin");
+}
+
+void git_remote_remove() {
+    std::vector<std::string> rs = git_remotes();
+    if (rs.empty()) { dlg_show("Your repository has no remotes configured.", "", {"OK"}, nullptr); return; }
+    std::vector<Ed::PItem> items;
+    for (const std::string &r : rs) items.push_back({r, 0, false});
+    pick_custom("Select a remote to remove", items, [](const Ed::PItem &it) {
+        std::string n = it.label;
+        dlg_show("Remove the remote '" + n + "'?", "Its remote-tracking branches are removed too. Nothing changes on the server.", {"Remove Remote", "Cancel"}, [n](int i, const std::string &) {
+            if (i == 0 && git_sync_run("remove remote", "remote remove " + git_quote(n))) { git_refresh(); E.status_msg = "removed remote " + n; }
+        });
+    });
+}
+
+/* continue, skip or abort an unfinished merge, rebase, cherry-pick or revert: 0 continue, 1 skip, 2 abort */
+void git_op_do(int what) {
+    const std::string op = E.git.op;
+    if (op.empty()) return;
+    std::string args;
+    if (what == 0) args = op == "merge" ? "commit --no-edit" : "-c core.editor=true " + op + " --continue";
+    else if (what == 1) args = op + " --skip";
+    else args = op + " --abort";
+    if (what == 1 && op != "rebase" && op != "cherry-pick") return;
+    auto go = [op, args, what] {
+        begin_op("git " + op);
+        git_start(what == 0 ? "Continuing" : what == 1 ? "Skipping" : "Aborting", args, [op, what](int c, const std::string &o) {
+            git_refresh(); reload_open_docs();
+            if (c != 0) git_error(op + (what == 0 ? " --continue" : what == 1 ? " --skip" : " --abort"), o);
+            else E.status_msg = what == 2 ? op + " aborted" : E.git.op.empty() ? op + " finished" : op + " continues: more conflicts to resolve";
+        });
+    };
+    if (what == 2) dlg_show("Abort the " + op + "?", "Everything done since it started is thrown away.", {"Abort " + op, "Cancel"}, [go](int i, const std::string &) { if (i == 0) go(); });
+    else go();
+}
+
+/* ---- stash and tags ---- */
+void git_stash_push(bool untracked) {
+    if (E.git.changes.empty()) { dlg_show("There are no changes to stash.", "", {"OK"}, nullptr); return; }
+    dlg_show("Stash", "Optionally provide a stash message", {"OK", "Cancel"}, [untracked](int i, const std::string &t) {
+        if (i != 0) return;
+        std::string m = trim_nl(t);
+        if (git_sync_run("stash", std::string("stash push") + (untracked ? " --include-untracked" : "") + (m.empty() ? "" : " -m " + git_quote(m)))) { git_refresh(); reload_open_docs(); E.status_msg = "stashed"; }
+    }, true, "", "Stash message");
+}
+
+std::vector<Ed::PItem> stash_items() {
+    std::string o;
+    git_exec(E.git.root, "stash list", &o);
+    std::vector<Ed::PItem> v;
+    size_t pos = 0;
+    int n = 0;
+    while (pos < o.size()) { size_t e = o.find('\n', pos); if (e == std::string::npos) e = o.size(); if (e > pos) v.push_back({o.substr(pos, e - pos), n++, false}); pos = e + 1; }
+    return v;
+}
+
+void git_stash_op(const char *verb, bool latest) {   /* apply, pop, drop */
+    auto items = stash_items();
+    if (items.empty()) { dlg_show("There are no stashes in the repository.", "", {"OK"}, nullptr); return; }
+    std::string v = verb;
+    auto go = [v](int n) {
+        std::string ref = "stash@{" + std::to_string(n) + "}", o;
+        if (git_exec(E.git.root, "stash " + v + " " + git_quote(ref), &o) != 0) { git_error("stash " + v, o); git_refresh(); return; }
+        git_refresh(); reload_open_docs();
+    };
+    if (latest) go(0); else pick_custom("Pick a stash to " + v, items, [go](const Ed::PItem &it) { go(it.id); });
+}
+
+void git_stash_drop_all() {
+    dlg_show("Are you sure you want to drop ALL stashes?", "This is IRREVERSIBLE!\nYour stashes will be FOREVER LOST.", {"Drop All Stashes", "Cancel"}, [](int i, const std::string &) { if (i == 0 && git_sync_run("stash", "stash clear")) git_refresh(); });
+}
+
+void git_tag_create(const std::string &at) {
+    dlg_show("Create Tag", "Tag name", {"OK", "Cancel"}, [at](int i, const std::string &t) {
+        std::string n = branch_clean(trim_nl(t));
+        if (i == 0 && !n.empty() && git_sync_run("tag", "tag " + git_quote(n) + (at.empty() ? "" : " " + git_quote(at)))) { git_refresh(); E.status_msg = "created tag " + n; }
+    }, true, "", "Tag name");
+}
+
+void git_tag_delete() {
+    std::string o;
+    git_exec(E.git.root, "tag", &o);
+    std::vector<Ed::PItem> v;
+    size_t pos = 0;
+    while (pos < o.size()) { size_t e = o.find('\n', pos); if (e == std::string::npos) e = o.size(); if (e > pos) v.push_back({o.substr(pos, e - pos), 0, false}); pos = e + 1; }
+    if (v.empty()) { dlg_show("This repository has no tags.", "", {"OK"}, nullptr); return; }
+    pick_custom("Select a tag to delete", v, [](const Ed::PItem &it) { if (git_sync_run("delete tag", "tag -d " + git_quote(it.label))) git_refresh(); });
+}
+
+/* ---- the menus ---- */
+void git_more_menu(float x, float y) {
+    GitUi &g = E.g;
+    bool ch = !E.git.changes.empty();
+    std::vector<CtxItem> commit = {ci("Commit", [] { git_commit_flow(0); }), ci("Commit (Amend)", [] { git_commit_flow(1); }), ci("Commit (Signed Off)", [] { git_commit_flow(2); }), ci_sep(),
+                                   ci("Commit and Push", [] { git_commit_flow(3); }), ci("Commit and Sync", [] { git_commit_flow(4); }), ci_sep(), ci("Undo Last Commit", [] { git_undo_last_commit(); })};
+    std::vector<CtxItem> changes = {ci("Stage All Changes", [] { git_stage_all(E.git.root); git_refresh(); }, "", ch), ci("Unstage All Changes", [] { git_unstage(E.git.root, "."); git_refresh(); }, "", ch),
+                                    ci("Discard All Changes", [] { discard_all_changes(); }, "", ch)};
+    std::vector<CtxItem> branch = {ci("Merge...", [] { git_branch_ops(2); }), ci("Rebase Branch...", [] { git_rebase_onto(); }), ci_sep(), ci("Create Branch...", [] { git_create_branch(""); }), ci("Create Branch From...", [] {
+                                       pick_custom("Select a ref to create the branch from", [] { std::vector<Ed::PItem> v; for (auto &b : branch_items(true, false)) v.push_back({b.label, b.id, false}); return v; }(), [](const Ed::PItem &r) { git_create_branch(r.label); }); }),
+                                   ci_sep(), ci("Rename Branch...", [] { git_branch_ops(1); }), ci("Delete Branch...", [] { git_branch_ops(0); }), ci_sep(), ci("Publish Branch...", [] { git_push_flow(); }, "", E.git.upstream.empty())};
+    std::vector<CtxItem> stash = {ci("Stash", [] { git_stash_push(false); }), ci("Stash (Include Untracked)", [] { git_stash_push(true); }), ci_sep(), ci("Apply Latest Stash", [] { git_stash_op("apply", true); }),
+                                  ci("Apply Stash...", [] { git_stash_op("apply", false); }), ci_sep(), ci("Pop Latest Stash", [] { git_stash_op("pop", true); }), ci("Pop Stash...", [] { git_stash_op("pop", false); }), ci_sep(),
+                                  ci("Drop Stash...", [] { git_stash_op("drop", false); }), ci("Drop All Stashes...", [] { git_stash_drop_all(); })};
+    std::vector<CtxItem> tags = {ci("Create Tag...", [] { git_tag_create(""); }), ci("Delete Tag...", [] { git_tag_delete(); })};
+    std::vector<CtxItem> remote = {ci("Add Remote...", [] { git_remote_add(); }), ci("Remove Remote...", [] { git_remote_remove(); }, "", E.git.has_remote), ci_sep(), ci("Fetch From All Remotes", [] { begin_op("git fetch --all"); git_start("Fetching", "fetch --all --prune", [](int c, const std::string &o) { git_refresh(); if (c != 0) git_error("fetch", o); else E.status_msg = "fetched"; }); }, "", E.git.has_remote)};
+    std::vector<CtxItem> pull = {ci("Pull", [] { git_pull_flow(); }), ci("Pull (Rebase)", [] { git_pull_rebase(); }), ci("Pull from...", [] { git_pull_from(); })};
+    std::vector<CtxItem> push = {ci("Push", [] { git_push_flow(); }), ci("Push to...", [] { git_push_to(); })};
+    std::vector<CtxItem> items = {ci_sub("Pull", pull), ci_sub("Push", push), ci("Fetch", [] { git_fetch_flow(); }), ci("Sync", [] { git_sync_flow(); }), ci_sep(),
+                                  ci("Checkout to...", [] { git_branch_picker(); }), ci_sep(), ci_sub("Commit", commit), ci_sub("Changes", changes), ci_sub("Branch", branch), ci_sub("Remote", remote), ci_sub("Stash", stash), ci_sub("Tags", tags), ci_sep(),
+                                  ci(g.tree_view ? "View as List" : "View as Tree", [] { E.g.tree_view = !E.g.tree_view; settings_save(); redraw(); })};
+    ctx_show(x, y, std::move(items));
+}
+
+void git_commit_menu(float x, float y) {   /* the arrow on the Commit button */
+    ctx_show(x, y, {ci("Commit", [] { git_commit_flow(0); }), ci("Commit (Amend)", [] { git_commit_flow(1); }), ci("Commit (Signed Off)", [] { git_commit_flow(2); }), ci_sep(),
+                    ci("Commit and Push", [] { git_commit_flow(3); }), ci("Commit and Sync", [] { git_commit_flow(4); }), ci_sep(), ci("Undo Last Commit", [] { git_undo_last_commit(); })});
+}
+
+/* ---- the Remote tab: saved connections (ssh, sftp, ftp, ftps, smb), their folders, and files edited in place ---- */
+
+struct RConn {
+    bool connected = false, busy = false, open = true;
+    std::string pw, err;                                         /* the password lives in memory for this session only */
+    std::map<std::string, std::vector<RemoteEntry>> dirs;
+    std::set<std::string> expanded, loading;
+};
+struct RemoteUi {
+    std::vector<RemoteProfile> profiles;
+    std::vector<RConn> conns;
+    bool loaded = false;
+    struct Opened { int prof; std::string remote; long mtime; };
+    std::map<std::string, Opened> files;                         /* local copy -> where it came from, to upload on save */
+};
+RemoteUi g_rem;
+GitJob g_rjob;
+struct RRow { int prof; std::string path; int kind; };          /* kind: 0 connection, 1 folder, 2 file, 3 loading */
+std::vector<RRow> g_rrows;
+
+void remote_ensure() {
+    if (g_rem.loaded) return;
+    g_rem.loaded = true;
+    g_rem.profiles = remote_load();
+    g_rem.conns.assign(g_rem.profiles.size(), RConn());
+}
+
+std::string remote_root(const RemoteProfile &p) { return p.path.empty() ? (p.proto == "ssh" || p.proto == "sftp" ? "." : "/") : p.path; }
+
+void job_start(GitJob &j, const std::string &label, std::function<int(std::string &)> fn, std::function<void(int, const std::string &)> cb) {
+    if (j.th.joinable()) j.th.join();
+    j.running = true; j.done = false; j.label = label; j.cb = std::move(cb); j.out.clear();
+    j.th = std::thread([&j, fn] { std::string o; int c = fn(o); j.out = o; j.code = c; j.done = true; app_wake(); });
+}
+
+void job_poll(GitJob &j) {
+    if (!j.running || !j.done) return;
+    j.th.join();
+    j.running = false;
+    auto cb = std::move(j.cb);
+    int c = j.code;
+    std::string o = j.out;
+    if (cb) cb(c, o);
+    redraw();
+}
+
+std::string remote_cache_path(const RemoteProfile &p, const std::string &remote) {
+    const char *x = getenv("XDG_CACHE_HOME"), *h = getenv("HOME");
+    std::string d = x && *x ? x : std::string(h ? h : ".") + "/.cache";
+    mkdir(d.c_str(), 0755);
+    d += "/hootedit";
+    mkdir(d.c_str(), 0755);
+    d += "/remote";
+    mkdir(d.c_str(), 0755);
+    std::string nm = p.name;
+    for (char &c : nm) if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '_';
+    d += "/" + nm;
+    mkdir(d.c_str(), 0700);
+    std::string rel = remote;
+    while (!rel.empty() && (rel[0] == '/' || rel[0] == '.')) rel.erase(0, 1);
+    size_t pos = 0;
+    while ((pos = rel.find('/', pos)) != std::string::npos) { mkdir((d + "/" + rel.substr(0, pos)).c_str(), 0700); pos++; }
+    return d + "/" + rel;
+}
+
+void remote_error(const std::string &what, const std::string &msg) { dlg_show(what, msg, {"OK"}, nullptr); }
+
+void remote_list_dir(int pi, const std::string &path, bool then_open = true) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    RConn &c = g_rem.conns[(size_t)pi];
+    if (c.loading.count(path) || g_rjob.running) return;
+    c.loading.insert(path);
+    if (then_open) c.expanded.insert(path);
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string pw = c.pw;
+    auto res = std::make_shared<std::vector<RemoteEntry>>();
+    job_start(g_rjob, "Listing " + p.name, [p, pw, path, res](std::string &err) { return remote_list(p, pw, path, *res, &err); }, [pi, path, res](int code, const std::string &err) {
+        if (pi >= (int)g_rem.conns.size()) return;
+        RConn &c2 = g_rem.conns[(size_t)pi];
+        c2.loading.erase(path);
+        if (code != 0) { c2.expanded.erase(path); remote_error("Cannot list " + path, err); return; }
+        std::sort(res->begin(), res->end(), [](const RemoteEntry &a, const RemoteEntry &b) { return a.dir != b.dir ? a.dir : a.name < b.name; });
+        c2.dirs[path] = *res;
+    });
+}
+
+std::string remote_parent(const std::string &path) {
+    size_t sl = path.rfind('/');
+    return sl == std::string::npos ? "." : sl == 0 ? "/" : path.substr(0, sl);
+}
+std::string remote_join(const std::string &dir, const std::string &name) { return dir == "." || dir.empty() ? name : dir.back() == '/' ? dir + name : dir + "/" + name; }
+
+/* run one change on the server in the background, then list the folder it touched again */
+void remote_change(int pi, RemoteOp op, const std::string &path, const std::string &to, const std::string &done) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    if (g_rjob.running) { E.status_msg = "another remote operation is running"; return; }
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string pw = g_rem.conns[(size_t)pi].pw;
+    job_start(g_rjob, "Working on " + p.name, [p, pw, op, path, to](std::string &err) { return remote_op(p, pw, op, path, to, &err); }, [pi, op, path, to, done](int code, const std::string &err) {
+        if (code != 0) { remote_error("The server could not complete this", err); return; }
+        if (pi >= (int)g_rem.conns.size()) return;
+        RConn &c = g_rem.conns[(size_t)pi];
+        for (auto &f : g_rem.files) if (f.second.prof == pi && op == ROP_RENAME && f.second.remote == path) f.second.remote = to;   /* an open tab keeps saving to the new name */
+        for (auto it = c.dirs.begin(); it != c.dirs.end();) { if (op == ROP_DELETE || op == ROP_RMDIR || op == ROP_RENAME) { if (it->first == path || it->first.compare(0, path.size() + 1, path + "/") == 0) { c.expanded.erase(it->first); it = c.dirs.erase(it); continue; } } ++it; }
+        std::string par = remote_parent(op == ROP_RENAME ? to : path);
+        c.dirs.erase(par);
+        if (op == ROP_RENAME && remote_parent(path) != par) c.dirs.erase(remote_parent(path));
+        E.status_msg = done;
+        remote_list_dir(pi, par, false);
+    });
+}
+
+void remote_ask_name(int pi, const std::string &dir, RemoteOp op) {
+    bool dirq = op == ROP_MKDIR;
+    dlg_show(dirq ? "New folder in " + dir : "New file in " + dir, "Created on the server right away.", {"Create", "Cancel"}, [pi, dir, op, dirq](int i, const std::string &t) {
+        std::string n = trim_nl(t);
+        if (i != 0 || n.empty()) return;
+        if (n.find('/') != std::string::npos) { remote_error("Not a valid name", "A name cannot contain a slash."); return; }
+        remote_change(pi, op, remote_join(dir, n), "", dirq ? "folder created" : "file created");
+    }, true, "", dirq ? "folder name" : "file name");
+}
+
+void remote_ask_rename(int pi, const std::string &path, bool is_dir) {
+    std::string cur = path.substr(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1);
+    dlg_show("Rename " + cur, "The new name on the server.", {"Rename", "Cancel"}, [pi, path, is_dir](int i, const std::string &t) {
+        std::string n = trim_nl(t);
+        if (i != 0 || n.empty()) return;
+        if (n.find('/') != std::string::npos) { remote_error("Not a valid name", "A name cannot contain a slash."); return; }
+        remote_change(pi, ROP_RENAME, path, remote_join(remote_parent(path), n), is_dir ? "folder renamed" : "file renamed");
+    }, true, cur, "new name");
+}
+
+void remote_ask_delete(int pi, const std::string &path, bool is_dir) {
+    std::string cur = path.substr(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1);
+    dlg_show(is_dir ? "Are you sure you want to delete the folder '" + cur + "' and its contents?" : "Are you sure you want to delete '" + cur + "'?", "It is removed on the server. This action is irreversible!", {"Delete", "Cancel"}, [pi, path, is_dir](int i, const std::string &) {
+        if (i == 0) remote_change(pi, is_dir ? ROP_RMDIR : ROP_DELETE, path, "", is_dir ? "folder deleted" : "file deleted");
+    });
+}
+
+void remote_open_file(int pi, const std::string &path, int line = 0);
+void goto_line(const std::string &q);
+
+void remote_search(int pi, const std::string &dir) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    dlg_show("Search in " + dir, "Text to find in the files below this folder, searched on the server with grep (case is ignored unless you type a capital).", {"Search", "Cancel"}, [pi, dir](int i, const std::string &t) {
+        std::string pat = trim_nl(t);
+        if (i != 0 || pat.empty() || g_rjob.running) return;
+        RemoteProfile p = g_rem.profiles[(size_t)pi];
+        auto res = std::make_shared<std::vector<RemoteHit>>();
+        job_start(g_rjob, "Searching " + p.name, [p, dir, pat, res](std::string &err) { return remote_grep(p, dir, pat, *res, &err); }, [pi, dir, res](int code, const std::string &err) {
+            if (code != 0) { remote_error("The search failed", err); return; }
+            if (res->empty()) { E.status_msg = "no matches"; return; }
+            std::vector<Ed::PItem> items;
+            for (size_t k = 0; k < res->size(); k++) { const RemoteHit &h = (*res)[k]; std::string rel = h.path.compare(0, dir.size() + 1, dir + "/") == 0 ? h.path.substr(dir.size() + 1) : h.path; items.push_back({rel + ":" + std::to_string(h.line) + "    " + h.text, (int)k, false}); }
+            pick_custom(std::to_string(res->size()) + (res->size() >= 300 ? "+" : "") + " matches", items, [pi, res](const Ed::PItem &it) {
+                const RemoteHit &h = (*res)[(size_t)it.id];
+                remote_open_file(pi, h.path, h.line);
+            });
+        });
+    }, true, "", "text");
+}
+
+void remote_connect_now(int pi) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    RConn &c = g_rem.conns[(size_t)pi];
+    if (c.busy || g_rjob.running) { E.status_msg = "another remote operation is running"; return; }
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string missing;
+    if (!remote_tools(p, &missing)) { remote_error("'" + missing + "' is not installed", "Hootedit uses the " + missing + " command to talk to " + p.proto + " servers. Install it and try again."); return; }
+    if (!askpass_start() && (p.proto == "ssh" || p.proto == "sftp")) E.status_msg = "password prompts are unavailable";
+    c.busy = true; c.err.clear();
+    std::string pw = c.pw, root = remote_root(p);
+    auto res = std::make_shared<std::vector<RemoteEntry>>();
+    job_start(g_rjob, "Connecting to " + p.name, [p, pw, root, res](std::string &err) {
+        int rc = 0;
+        if (p.proto == "ssh" || p.proto == "sftp") rc = remote_connect(p, pw, &err);
+        if (rc == 0) rc = remote_list(p, pw, root, *res, &err);   /* ftp and smb have no session: the first listing is the login check */
+        return rc;
+    }, [pi, root, res, p](int code, const std::string &err) {
+        if (pi >= (int)g_rem.conns.size()) return;
+        RConn &c2 = g_rem.conns[(size_t)pi];
+        c2.busy = false;
+        if (code != 0) { c2.connected = false; c2.pw.clear(); c2.err = err; remote_error("Cannot connect to " + p.name, err); return; }
+        std::sort(res->begin(), res->end(), [](const RemoteEntry &a, const RemoteEntry &b) { return a.dir != b.dir ? a.dir : a.name < b.name; });
+        c2.connected = true; c2.open = true;
+        c2.dirs[root] = *res;
+        E.status_msg = "connected to " + p.name;
+    });
+}
+
+void remote_connect(int pi) {
+    remote_ensure();
+    if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) return;
+    const RemoteProfile &p = g_rem.profiles[(size_t)pi];
+    if (remote_needs_password(p) && g_rem.conns[(size_t)pi].pw.empty() && !p.user.empty() && p.user != "anonymous") {
+        dlg_show("Password for " + remote_label(p), "Used for this session only. Hootedit does not store passwords.", {"Connect", "Cancel"}, [pi](int i, const std::string &t) {
+            if (i != 0 || (size_t)pi >= g_rem.conns.size()) return;
+            g_rem.conns[(size_t)pi].pw = t;
+            remote_connect_now(pi);
+        }, true, "", "Password", true);
+        return;
+    }
+    remote_connect_now(pi);
+}
+
+void remote_disconnect_now(int pi) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size()) return;
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    RConn &c = g_rem.conns[(size_t)pi];
+    c.connected = false; c.dirs.clear(); c.expanded.clear(); c.pw.clear();
+    std::thread([p] { remote_disconnect(p); }).detach();
+    E.status_msg = "disconnected from " + p.name;
+}
+
+void remote_open_file(int pi, const std::string &path, int line) {
+    if (pi < 0 || (size_t)pi >= g_rem.conns.size() || g_rjob.running) return;
+    RemoteProfile p = g_rem.profiles[(size_t)pi];
+    std::string pw = g_rem.conns[(size_t)pi].pw, local = remote_cache_path(p, path);
+    job_start(g_rjob, "Downloading " + base_name(path), [p, pw, path, local](std::string &err) { return remote_get(p, pw, path, local, &err); }, [pi, path, local, line](int code, const std::string &err) {
+        if (code != 0) { remote_error("Cannot open " + base_name(path), err); return; }
+        struct stat st;
+        long mt = stat(local.c_str(), &st) == 0 ? (long)st.st_mtime : 0;
+        g_rem.files[local] = {pi, path, mt};
+        if (!E.pinned) open_side(false);
+        open_path(local);
+        if (line > 0) goto_line(std::to_string(line));
+        E.status_msg = "opened " + path + " (saving uploads it)";
+    });
+}
+
+/* after a save: any open tab that came from a server and changed on disk is uploaded again */
+void remote_push_changed() {
+    if (g_rem.files.empty() || g_rjob.running) return;
+    for (auto &dp : E.docs) {
+        auto it = g_rem.files.find(dp->path);
+        if (it == g_rem.files.end() || dp->modified()) continue;
+        struct stat st;
+        if (stat(dp->path.c_str(), &st) != 0 || (long)st.st_mtime == it->second.mtime) continue;
+        it->second.mtime = (long)st.st_mtime;
+        int pi = it->second.prof;
+        if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) continue;
+        RemoteProfile p = g_rem.profiles[(size_t)pi];
+        std::string pw = g_rem.conns[(size_t)pi].pw, local = dp->path, remote = it->second.remote;
+        job_start(g_rjob, "Uploading " + base_name(remote), [p, pw, local, remote](std::string &err) { return remote_put(p, pw, local, remote, &err); }, [remote](int code, const std::string &err) {
+            if (code != 0) remote_error("Upload failed: " + remote, err + "\nYour edits are saved in the local copy; save again to retry.");
+            else E.status_msg = "uploaded " + remote;
+        });
+        return;   /* one at a time; the next save picks up the rest */
+    }
+}
+
+void remote_ask_folder(RemoteProfile p) {
+    bool smb = p.proto == "smb";
+    dlg_show(smb ? "Share and folder" : "Remote folder to open", smb ? "For example /share/projects" : "Leave empty for the home folder (ssh, sftp) or the root (ftp)", {"Add", "Cancel"}, [p](int i2, const std::string &t2) {
+        if (i2 != 0) return;
+        RemoteProfile q = p;
+        q.path = trim_nl(t2);
+        g_rem.profiles.push_back(q);
+        g_rem.conns.push_back(RConn());
+        remote_save(g_rem.profiles);
+        remote_connect((int)g_rem.profiles.size() - 1);
+    }, true, "", smb ? "/share" : "/path (optional)");
+}
+
+void remote_ask_address(const std::string &proto) {
+    const char *ph = proto == "smb" ? "user@server  (guest if empty)" : "user@host   or   user@host:port";
+    dlg_show("New " + proto + " connection", "Server address", {"Next", "Cancel"}, [proto](int i, const std::string &t) {
+        std::string a = trim_nl(t);
+        if (i != 0 || a.empty()) return;
+        RemoteProfile p;
+        p.proto = proto;
+        size_t at = a.find('@');
+        if (at != std::string::npos) { p.user = a.substr(0, at); a = a.substr(at + 1); }
+        size_t col = a.rfind(':');
+        if (col != std::string::npos && a.find(']') == std::string::npos) { p.port = atoi(a.c_str() + col + 1); a = a.substr(0, col); }
+        p.host = a;
+        p.name = a;
+        remote_ask_folder(p);
+    }, true, "", ph);
+}
+
+void remote_new_connection() {
+    remote_ensure();
+    std::vector<Ed::PItem> items = {{"SSH (shell and files)", 0, false}, {"SFTP", 1, false}, {"FTP", 2, false}, {"FTPS (FTP over TLS)", 3, false}, {"SMB / Samba share", 4, false}};
+    pick_custom("Select the connection type", items, [](const Ed::PItem &it) {
+        static const char *protos[5] = {"ssh", "sftp", "ftp", "ftps", "smb"};
+        std::string proto = protos[it.id];
+        std::vector<SshHost> hosts = it.id < 2 ? remote_ssh_hosts() : std::vector<SshHost>();
+        if (hosts.empty()) { remote_ask_address(proto); return; }
+        /* hosts from ~/.ssh/config: ssh applies the user, port and key of the entry itself */
+        std::vector<Ed::PItem> hi;
+        for (size_t k = 0; k < hosts.size(); k++) hi.push_back({hosts[k].name + "    " + hosts[k].detail, (int)k, false});
+        hi.push_back({"Enter an address...", -1, false});
+        pick_custom("Select a host from ~/.ssh/config", hi, [proto, hosts](const Ed::PItem &h) {
+            if (h.id < 0) { remote_ask_address(proto); return; }
+            RemoteProfile p;
+            p.proto = proto; p.host = hosts[(size_t)h.id].name; p.name = p.host;
+            remote_ask_folder(p);
+        });
+    });
+}
+
+void remote_open_terminal(int pi) {
+    if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) return;
+    std::string line = remote_ssh_line(g_rem.profiles[(size_t)pi]) + "\n";
+    E.term_open = true;
+    if (E.term_choice != "builtin") { launch_external(E.term_choice.substr(E.term_choice.find(':') + 1)); return; }
+    if (new_terminal() && cur_term() && cur_term()->core) { E.term_focus = true; tcore_text(cur_term()->core, line.c_str()); }
+}
+
+void remote_menu(int pi, const std::string &path, int kind, float x, float y) {
+    if (pi < 0 || (size_t)pi >= g_rem.profiles.size()) return;
+    RConn &c = g_rem.conns[(size_t)pi];
+    const RemoteProfile &p = g_rem.profiles[(size_t)pi];
+    bool ssh = p.proto == "ssh" || p.proto == "sftp";
+    if (kind == 0) {
+        std::vector<CtxItem> v = {ci(c.connected ? "Reconnect" : "Connect", [pi] { if (g_rem.conns[(size_t)pi].connected) remote_disconnect_now(pi); remote_connect(pi); }),
+                                  ci("Disconnect", [pi] { remote_disconnect_now(pi); }, "", c.connected), ci("New File...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_NEWFILE); }, "", c.connected), ci("New Folder...", [pi] { remote_ask_name(pi, remote_root(g_rem.profiles[(size_t)pi]), ROP_MKDIR); }, "", c.connected), ci("Search...", [pi] { remote_search(pi, remote_root(g_rem.profiles[(size_t)pi])); }, "", c.connected && ssh), ci("Refresh", [pi] { RConn &k = g_rem.conns[(size_t)pi]; k.dirs.clear(); k.expanded.clear(); remote_connect_now(pi); }, "", c.connected), ci_sep(),
+                                  ci("Open SSH Terminal", [pi] { remote_open_terminal(pi); }, "", ssh), ci_sep(),
+                                  ci("Edit Connections File", [] { const char *x2 = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME"); open_path((x2 && *x2 ? std::string(x2) : std::string(h ? h : ".") + "/.config") + "/hootedit/remotes.ini"); }),
+                                  ci("Remove Connection", [pi] {
+                                      dlg_show("Remove the connection '" + g_rem.profiles[(size_t)pi].name + "'?", "Only the saved entry is removed. Nothing on the server changes.", {"Remove", "Cancel"}, [pi](int i, const std::string &) {
+                                          if (i != 0 || (size_t)pi >= g_rem.profiles.size()) return;
+                                          remote_disconnect_now(pi);
+                                          g_rem.profiles.erase(g_rem.profiles.begin() + pi);
+                                          g_rem.conns.erase(g_rem.conns.begin() + pi);
+                                          for (auto it = g_rem.files.begin(); it != g_rem.files.end();) { if (it->second.prof == pi) it = g_rem.files.erase(it); else { if (it->second.prof > pi) it->second.prof--; ++it; } }
+                                          remote_save(g_rem.profiles);
+                                      }); })};
+        ctx_show(x, y, std::move(v));
+    } else if (kind == 1) {
+        ctx_show(x, y, {ci("New File...", [pi, path] { remote_ask_name(pi, path, ROP_NEWFILE); }), ci("New Folder...", [pi, path] { remote_ask_name(pi, path, ROP_MKDIR); }), ci_sep(),
+                        ci("Rename...", [pi, path] { remote_ask_rename(pi, path, true); }), ci("Delete", [pi, path] { remote_ask_delete(pi, path, true); }), ci_sep(),
+                        ci("Search in Folder...", [pi, path] { remote_search(pi, path); }, "", ssh), ci_sep(),
+                        ci("Refresh", [pi, path] { g_rem.conns[(size_t)pi].dirs.erase(path); remote_list_dir(pi, path); }), ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
+    } else if (kind == 2) {
+        ctx_show(x, y, {ci("Open", [pi, path] { remote_open_file(pi, path); }), ci_sep(), ci("Rename...", [pi, path] { remote_ask_rename(pi, path, false); }), ci("Delete", [pi, path] { remote_ask_delete(pi, path, false); }), ci_sep(),
+                        ci("Copy Path", [path] { SDL_SetClipboardText(path.c_str()); })});
+    }
+}
+
+void remote_row_click(int idx) {
+    if (idx < 0 || (size_t)idx >= g_rrows.size()) return;
+    RRow r = g_rrows[(size_t)idx];
+    RConn &c = g_rem.conns[(size_t)r.prof];
+    if (r.kind == 0) {
+        if (!c.connected) remote_connect(r.prof); else c.open = !c.open;
+    } else if (r.kind == 1) {
+        if (c.expanded.count(r.path)) c.expanded.erase(r.path);
+        else if (c.dirs.count(r.path)) c.expanded.insert(r.path);
+        else remote_list_dir(r.prof, r.path);
+    } else if (r.kind == 2) remote_open_file(r.prof, r.path);
+}
+
+void tip_poll() {
+    if (E.tip_at > 0 && now_s() >= E.tip_at) { E.tip_at = 0; E.tip_on = true; redraw(); }
+}
+
+void askpass_poll() {
+    if (E.mode == M_DIALOG) return;
+    AskReq r;
+    if (!askpass_take(r)) return;
+    std::string low = r.prompt;
+    for (char &c : low) c = (char)tolower((unsigned char)c);
+    bool secret = low.find("password") != std::string::npos || low.find("passphrase") != std::string::npos || low.find("pin") != std::string::npos || low.find("token") != std::string::npos;
+    std::string title = trim_nl(r.prompt);
+    while (!title.empty() && (title.back() == ':' || title.back() == ' ')) title.pop_back();
+    if (title.empty()) title = "Authentication required";
+    int fd = r.fd;
+    if (low.find("(yes/no") != std::string::npos) {   /* ssh asking whether to trust a new host key */
+        dlg_show(trim_nl(r.prompt), "The authenticity of this host cannot be verified yet. Only continue if you trust it.", {"Yes", "No"}, [fd](int i, const std::string &) { if (i < 0) askpass_reply(fd, false, ""); else askpass_reply(fd, true, i == 0 ? "yes" : "no"); });
+        return;
+    }
+    dlg_show(title, "Asked by git or ssh. Hootedit passes your answer on and does not store it.", {"OK", "Cancel"}, [fd](int i, const std::string &t) { askpass_reply(fd, i == 0, t); }, true, "", secret ? "Enter secret" : "Enter value", secret);
+}
+
+void git_job_poll() { job_poll(g_job); }
+
+bool hovered(int kind, int id) { return E.hover_kind == kind && E.hover_id == id; }
+
+uint32_t lang_color(const Lang *l) {
+    const char *n = lang_name(l);
+    if (!strcmp(n, "C") || !strcmp(n, "C++")) return RGBA(86, 156, 214, 255);
+    if (!strcmp(n, "Python")) return RGBA(86, 156, 214, 255);
+    if (!strcmp(n, "JavaScript") || !strcmp(n, "TypeScript") || !strcmp(n, "Lua")) return RGBA(220, 200, 90, 255);
+    if (!strcmp(n, "Shell") || !strcmp(n, "Makefile") || !strcmp(n, "CMake")) return RGBA(137, 209, 133, 255);
+    if (!strcmp(n, "Markdown") || !strcmp(n, "Plain Text")) return RGBA(120, 170, 220, 255);
+    if (!strcmp(n, "JSON") || !strcmp(n, "YAML") || !strcmp(n, "TOML") || !strcmp(n, "INI")) return RGBA(203, 170, 100, 255);
+    if (!strcmp(n, "HTML") || !strcmp(n, "XML") || !strcmp(n, "CSS")) return RGBA(228, 120, 80, 255);
+    if (!strcmp(n, "Rust") || !strcmp(n, "Go") || !strcmp(n, "Java") || !strcmp(n, "Ruby")) return RGBA(222, 140, 100, 255);
+    return RGBA(150, 160, 175, 255);
+}
+
+uint32_t file_color(const std::string &name) { return lang_color(lang_detect(name.c_str(), nullptr, 0)); }
+
+
+/* ---- git decorations in the editor: change bars in the gutter and blame for the cursor line ---- */
+
+GutterCache *gutter_for(Doc &d) {
+    if (d.dv || d.mv || !E.git.repo || d.path.empty() || d.buf.lines() > 50000) return nullptr;
+    std::string rel = rel_to_root(d.path);
+    if (rel.empty()) return nullptr;
+    GutterCache &c = g_gutter[&d];
+    if (c.base_stale) {
+        std::string base = git_show(E.git.root, "HEAD", rel);
+        diff_split_lines(base, c.base_lines);
+        c.ids.clear();
+        for (const std::string &l : c.base_lines) c.ids.emplace(l, (int)c.ids.size());
+        c.base_stale = false;
+        c.computed = false;
+    }
+    if (!c.computed || c.rev != d.buf.revision()) {
+        size_t nl = d.buf.lines();
+        if (nl > 1 && d.buf.line_len(nl - 1) == 0) nl--;   /* the empty line after the final newline is not a line of text */
+        std::vector<int> a(c.base_lines.size()), b(nl);
+        for (size_t i = 0; i < a.size(); i++) a[i] = c.ids[c.base_lines[i]];
+        std::unordered_map<std::string, int> extra;
+        std::string t;
+        for (size_t i = 0; i < b.size(); i++) {
+            d.buf.line_text(i, t);
+            if (!t.empty() && t.back() == '\r') t.pop_back();
+            auto it = c.ids.find(t);
+            if (it != c.ids.end()) { b[i] = it->second; continue; }
+            auto ex = extra.emplace(t, (int)(c.ids.size() + extra.size()));
+            b[i] = ex.first->second;
+        }
+        if (d.buf.size() == 0) b.clear();
+        c.hunks = diff_ids(a, b, 800, nullptr);
+        c.rev = d.buf.revision();
+        c.computed = true;
+    }
+    return &c;
+}
+
+const GitBlame *blame_for(Doc &d, size_t line) {
+    if (d.dv || d.mv || d.modified() || !E.git.repo || d.path.empty()) return nullptr;
+    GutterCache *c = gutter_for(d);
+    if (!c) return nullptr;
+    if (!c->blame_tried) {
+        c->blame_tried = true;
+        c->blame_ok = false;
+        if (d.buf.size() < (2u << 20)) {
+            auto job = std::make_shared<BlameJob>();
+            c->blame_job = job;
+            std::string root = E.git.root, rel = rel_to_root(d.path);
+            std::thread([job, root, rel] { job->ok = git_blame(root, rel, job->v); job->done = true; g_async_ready = true; app_wake(); }).detach();
+        }
+    }
+    if (c->blame_job) {
+        if (!c->blame_job->done) return nullptr;
+        c->blame_ok = c->blame_job->ok;
+        c->blame = std::move(c->blame_job->v);
+        c->blame_job.reset();
+    }
+    return c->blame_ok && line < c->blame.size() ? &c->blame[line] : nullptr;
+}
+
+std::string blame_text(const GitBlame &b, bool summary = true) {   /* the status bar passes false: who and when only */
+    if (b.hash.find_first_not_of('0') == std::string::npos) return "You, Uncommitted changes";
+    std::string who = b.author + ", " + git_ago(b.time, (long)time(nullptr));
+    return summary ? who + "  \xE2\x80\xA2  " + b.summary : who;
+}
+
+void open_blame_commit(const GitBlame &b, const std::string &path) {
+    if (b.hash.find_first_not_of('0') == std::string::npos) { open_diff_spec(path, ":", "WORK", "Index", "Working Tree", base_name(path) + " (Working Tree)", "Unstaged changes"); return; }
+    GitCommit c;
+    c.hash = b.hash; c.subject = b.summary; c.author = b.author; c.date = b.time;
+    open_commit_diff(c, GitFile{'M', path});
+}
+
+/* ---- layout ---- */
+
+struct Layout {
+    int menu_h, tab_h, status_h, side_w, side_x1;   /* side_w: width the docked sidebar takes from the editor; side_x1: right edge when drawn (docked or floating) */
+    bool docked, floating;
+    int ed_x, split_x, tab_y, text_y, bar_y, ed_bottom, panel_y, panel_h, gutter, text_x, rows, cols;
+};
+
+Layout layout() {
+    Layout l;
+    l.menu_h = S(28); l.tab_h = S(34); l.status_h = S(22);
+    int sw = std::min(S(296), (int)((float)E.W * 0.32f));
+    l.docked = E.pinned && E.side_open;
+    l.floating = !E.pinned && E.side_open;
+    l.side_w = l.docked ? sw : 0;
+    l.side_x1 = E.side_open ? sw : 0;
+    l.ed_x = l.side_w;
+    bool split = E.preview_open && E.preview_split && preview_format(D().path) != PreviewFormat::None && !D().dv && !D().mv;
+    l.split_x = split ? l.ed_x + (E.W - l.ed_x) / 2 : E.W;
+    l.tab_y = l.menu_h;
+    l.text_y = l.menu_h + l.tab_h;
+    l.bar_y = E.H - l.status_h;
+    l.panel_h = E.term_open ? std::min(S(E.panel_logical), std::max(S(80), l.bar_y - l.text_y - S(100))) : 0;
+    l.panel_y = l.bar_y - l.panel_h;
+    l.ed_bottom = l.panel_y;
+    int digits = 3;
+    for (size_t n = D().buf.lines(); n >= 1000; n /= 10) digits++;
+    l.gutter = S(79) + (digits - 3) * E.cw;
+    l.text_x = l.ed_x + l.gutter;
+    l.rows = std::max(0, (l.ed_bottom - l.text_y) / E.rowh);
+    l.cols = std::max(0, (l.split_x - l.text_x) / E.cw);
+    return l;
+}
+
+float draw_mermaid(const PreviewBlock &block, float x, float y, float width, float line_h, const PreviewPalette &palette) {
+    MermaidGraph graph = preview_mermaid(block.lines);
+    float left = x + (float)S(10), available = std::max((float)S(100), width - (float)S(20));
+    if (!graph.known || graph.nodes.empty()) {
+        for (const std::string &line : block.lines) {
+            std::string text = line.empty() ? " " : line;
+            y = preview_draw_inline(text, left, y, available, line_h, E.font, FS_REGULAR, palette.muted, true);
+        }
+        return y + (float)S(8);
+    }
+    float node_w = std::min((float)S(190), std::max((float)S(112), available * (graph.left_right ? 0.24f : 0.62f)));
+    float node_h = (float)S(46), gap_x = (float)S(42), gap_y = (float)S(44);
+    size_t per_row = graph.left_right ? std::max<size_t>(1, (size_t)((available + gap_x) / (node_w + gap_x))) : 1;
+    std::vector<float> nx(graph.nodes.size()), ny(graph.nodes.size());
+    for (size_t i = 0; i < graph.nodes.size(); i++) {
+        size_t row = graph.left_right ? i / per_row : i;
+        size_t col = graph.left_right ? i % per_row : 0;
+        nx[i] = left + (float)col * (node_w + gap_x);
+        ny[i] = y + (float)row * (node_h + gap_y);
+    }
+    if (!graph.sequence) for (const MermaidEdge &edge : graph.edges) {
+        if (edge.from >= graph.nodes.size() || edge.to >= graph.nodes.size()) continue;
+        float sx, sy, ex, ey;
+        if (graph.left_right) {
+            sx = nx[edge.from] + node_w;
+            sy = ny[edge.from] + node_h / 2;
+            ex = nx[edge.to];
+            ey = ny[edge.to] + node_h / 2;
+            if (std::fabs(ey - sy) < 2.f) {
+                float w = std::max(0.f, ex - sx);
+                r_rect(E.r, sx, sy - (float)S(1), w, (float)S(2), palette.accent);
+                if (w > S(12)) draw_icon(IC_ARROW_R, ex - (float)S(14), ey - (float)S(7), S(14), palette.accent);
+            } else {
+                float mid = sx + (ex - sx) / 2;
+                r_rect(E.r, sx, sy - (float)S(1), std::max(0.f, mid - sx), (float)S(2), palette.accent);
+                r_rect(E.r, mid - (float)S(1), std::min(sy, ey), (float)S(2), std::fabs(ey - sy), palette.accent);
+                r_rect(E.r, mid, ey - (float)S(1), std::max(0.f, ex - mid), (float)S(2), palette.accent);
+            }
+            if (!edge.label.empty()) draw_text(E.ui, sx + (std::max(0.f, ex - sx) - text_width(E.ui, edge.label.c_str())) / 2, ui_base(sy - (float)S(18), (float)S(18)), edge.label.c_str(), palette.muted, available);
+        } else {
+            sx = nx[edge.from] + node_w / 2;
+            sy = ny[edge.from] + node_h;
+            ex = nx[edge.to] + node_w / 2;
+            ey = ny[edge.to];
+            float mid = sy + (ey - sy) / 2;
+            if (std::fabs(ex - sx) < 2.f) r_rect(E.r, sx - (float)S(1), sy, (float)S(2), std::max(0.f, ey - sy), palette.accent);
+            else {
+                r_rect(E.r, sx - (float)S(1), sy, (float)S(2), std::max((float)S(1), mid - sy), palette.accent);
+                r_rect(E.r, std::min(sx, ex), mid - (float)S(1), std::fabs(ex - sx), (float)S(2), palette.accent);
+                r_rect(E.r, ex - (float)S(1), mid, (float)S(2), std::max((float)S(1), ey - mid), palette.accent);
+            }
+            if (ey > sy) draw_icon(IC_CHEV_D, ex - (float)S(7), ey - (float)S(12), S(14), palette.accent);
+            if (!edge.label.empty()) draw_text(E.ui, sx + (float)S(7), ui_base(mid - (float)S(10), (float)S(18)), edge.label.c_str(), palette.muted, available);
+        }
+    }
+    if (graph.sequence) {
+        float end_y = y + (float)S(50) + (float)graph.edges.size() * (float)S(42);
+        for (size_t i = 0; i < graph.nodes.size(); i++) {
+            float cx = left + ((float)i + 0.5f) * available / (float)graph.nodes.size();
+            r_rect(E.r, cx - (float)S(1), y + node_h, (float)S(2), end_y - y - node_h, palette.border);
+            r_rrect(E.r, cx - node_w / 2, y, node_w, node_h, palette.table_head, S(6), 1);
+            float tw = text_width(E.ui, graph.nodes[i].label.c_str());
+            draw_text(E.ui, cx - tw / 2, ui_base(y, node_h), graph.nodes[i].label.c_str(), palette.text, node_w - (float)S(12));
+        }
+        for (size_t i = 0; i < graph.edges.size(); i++) {
+            const MermaidEdge &e = graph.edges[i];
+            if (e.from >= graph.nodes.size() || e.to >= graph.nodes.size()) continue;
+            float cy = y + node_h + (float)S(22) + (float)i * (float)S(42);
+            float from = left + ((float)e.from + 0.5f) * available / (float)graph.nodes.size();
+            float to = left + ((float)e.to + 0.5f) * available / (float)graph.nodes.size();
+            r_rect(E.r, std::min(from, to), cy, std::fabs(to - from), (float)S(2), palette.accent);
+            draw_icon(to >= from ? IC_ARROW_R : IC_ARROW_L, to - (float)S(7), cy - (float)S(7), S(14), palette.accent);
+            draw_text(E.ui, std::min(from, to) + (std::fabs(to - from) - text_width(E.ui, e.label.c_str())) / 2,
+                      ui_base(cy - (float)S(20), (float)S(18)), e.label.c_str(), palette.text, available);
+        }
+        return end_y + (float)S(12);
+    }
+    for (size_t i = 0; i < graph.nodes.size(); i++) {
+        const MermaidNode &node = graph.nodes[i];
+        float bx = nx[i], by = ny[i];
+        uint32_t fill = palette.panel;
+        if (node.shape == 'c') r_rrect(E.r, bx + (node_w - node_h) / 2, by, node_h, node_h, fill, (int)(node_h / 2), 1);
+        else if (node.shape == 'd') {
+            r_rrect(E.r, bx + (float)S(8), by + (float)S(4), node_w - (float)S(16), node_h - (float)S(8), fill, S(8), 1);
+        } else r_rrect(E.r, bx, by, node_w, node_h, fill, node.shape == 'o' ? (int)(node_h / 2) : S(6), 1);
+        float text_w = text_width(E.ui, node.label.c_str(), FS_BOLD);
+        draw_text(E.ui, bx + std::max((float)S(6), (node_w - text_w) / 2), ui_base(by, node_h), node.label.c_str(), palette.text, node_w - (float)S(12), FS_BOLD);
+    }
+    return y + (float)((graph.left_right ? (graph.nodes.size() + per_row - 1) / per_row : graph.nodes.size()) * (size_t)(node_h + gap_y));
+}
+
+void draw_preview(const Layout &L, float x, float width) {
+    Doc &d = D();
+    preview_refresh(d);
+    PreviewPalette palette = preview_palette();
+    float top = (float)L.text_y + (float)S(16);
+    float left = x + (float)S(24);
+    float content_w = std::max((float)S(80), width - (float)S(48));
+    float bottom = (float)L.ed_bottom;
+    r_rect(E.r, x, (float)L.text_y, width, (float)(L.ed_bottom - L.text_y), palette.bg);
+    if (E.preview_blocks.empty()) {
+        draw_text(E.ui, left, ui_base(top, (float)S(24)), "Nothing to preview", C_UI_FAINT, content_w);
+        return;
+    }
+    r_clip(E.r, (int)x, L.text_y, (int)width, L.ed_bottom - L.text_y);
+    float y = top - E.preview_scroll;
+    int ordered_index = 0;
+    bool was_ordered = false;
+    for (const PreviewBlock &b : E.preview_blocks) {
+        if (y > bottom) break;
+        if (b.kind != PreviewBlockKind::List || !b.ordered) { ordered_index = 0; was_ordered = false; }
+        if (b.kind == PreviewBlockKind::Rule) {
+            if (y + (float)S(10) >= (float)L.text_y && y < bottom) r_rect(E.r, left, y + (float)S(5), content_w, (float)S(1), C_BORDER);
+            y += (float)S(18);
+        } else if (b.kind == PreviewBlockKind::Heading) {
+            int level = std::clamp(b.level, 1, 6);
+            Font *font = E.preview_heading[level - 1];
+            if (!font) font = level == 1 ? E.big : E.ui;
+            float lh = std::max((float)S(18), (float)font_cell_h(font) + (float)S(4));
+            uint32_t color = palette.text;
+            y += level <= 2 ? (float)S(8) : (float)S(5);
+            if (E.preview_target == 1 && y + lh >= (float)L.text_y && y < bottom)
+                r_rect(E.r, left, y + (float)S(3), (float)S(3), lh - (float)S(6), palette.accent);
+            if (y + lh >= (float)L.text_y && y < bottom)
+                y = preview_draw_inline(b.text, left + (E.preview_target ? (float)S(10) : 0.f), y, content_w, lh, font, FS_BOLD, color, true);
+            else y += lh;
+            if (E.preview_target == 0 && level <= 2 && y < bottom) {
+                y += (float)S(4);
+                r_rect(E.r, left, y, content_w, (float)S(1), palette.border);
+            }
+            y += level <= 2 ? (float)S(9) : (float)S(6);
+        } else if (b.kind == PreviewBlockKind::Diagram) {
+            float diagram_y = y + (float)S(8);
+            float end_y = draw_mermaid(b, left, diagram_y, content_w, (float)E.rowh, palette);
+            y = std::max(end_y, diagram_y + (float)S(50)) + (float)S(12);
+        } else if (b.kind == PreviewBlockKind::Code) {
+            float pad = (float)S(12);
+            float code_y = y + pad;
+            float code_x = left + pad;
+            float code_h = (float)(preview_code_rows(b, content_w - 2 * pad) + 1) * (float)E.rowh + pad * 2;
+            if (y < bottom && y + code_h >= (float)L.text_y) r_rect(E.r, left, y, content_w, code_h, palette.panel);
+            code_y = preview_draw_code(b, code_x, code_y, content_w - 2 * pad, true);
+            y = std::max(code_y, y + code_h) + (float)S(10);
+        } else if (b.kind == PreviewBlockKind::Quote) {
+            float lh = (float)S(22);
+            if (y + lh >= (float)L.text_y && y < bottom) r_rect(E.r, left, y, (float)S(3), lh, palette.accent);
+            y = preview_draw_inline(b.text, left + (float)S(12), y, content_w - (float)S(12), lh, E.ui, FS_ITALIC, palette.muted,
+                                   y + lh >= (float)L.text_y && y < bottom);
+            y += (float)S(4);
+        } else if (b.kind == PreviewBlockKind::List) {
+            float lh = (float)S(22);
+            float indent = std::min((float)S(72), (float)b.level * (float)S(18));
+            if (b.ordered) {
+                if (!was_ordered) ordered_index = 0;
+                std::string prefix = std::to_string(++ordered_index) + ".";
+                draw_text(E.ui, left + indent, ui_base(y, lh), prefix.c_str(), palette.accent, (float)S(24));
+                was_ordered = true;
+            } else if (b.task) {
+                float size = (float)S(14), bx = left + indent;
+                r_rrect(E.r, bx, y + (lh - size) / 2, size, size, palette.bg, S(2), 1);
+                if (b.checked) draw_icon(IC_CHECK, bx, y + (lh - size) / 2, S(14), palette.accent);
+            } else draw_text(E.ui, left + indent, ui_base(y, lh), "\xE2\x80\xA2", palette.accent, (float)S(14));
+            float text_indent = b.task ? (float)S(22) : (float)S(22);
+            y = preview_draw_inline(b.text, left + indent + text_indent, y, content_w - indent - text_indent, lh, E.ui, FS_REGULAR, palette.text,
+                                   y + lh >= (float)L.text_y && y < bottom);
+        } else if (b.kind == PreviewBlockKind::Table) {
+            bool markdown_table = b.level == 2;
+            bool has_header = b.level != 0;
+            size_t first_data = markdown_table ? 2 : 0;
+            if (b.lines.size() <= first_data) continue;
+            std::vector<std::string> header = preview_table_cells(b.lines[0]);
+            size_t columns = std::max<size_t>(1, header.size());
+            std::vector<int> align = markdown_table ? preview_table_align(b.lines[1], columns) : std::vector<int>(columns, 0);
+            std::vector<float> widths(columns, content_w / (float)columns);
+            float pad = (float)S(10), line_h = (float)S(22);
+            size_t row_count = markdown_table ? b.lines.size() - 1 : b.lines.size();
+            for (size_t ri = 0; ri < row_count; ri++) {
+                bool is_header = has_header && ri == 0;
+                size_t source_row = markdown_table && ri > 0 ? ri + 1 : ri;
+                std::vector<std::string> cells = preview_table_cells(b.lines[source_row]);
+                cells.resize(columns);
+                std::vector<std::vector<std::string>> wrapped(columns);
+                size_t row_lines = 1;
+                for (size_t c = 0; c < columns; c++) {
+                    wrapped[c] = wrap_lines(cells[c], std::max((float)S(24), widths[c] - 2 * pad));
+                    row_lines = std::max(row_lines, wrapped[c].size());
+                }
+                float row_h = (float)row_lines * line_h + (float)S(10);
+                bool visible = y + row_h >= (float)L.text_y && y < bottom;
+                if (visible) {
+                    uint32_t row_bg = is_header ? palette.table_head : (E.preview_target == 0 && (ri & 1) ? palette.table_alt : palette.bg);
+                    r_rect(E.r, left, y, content_w, row_h, row_bg);
+                    r_rect(E.r, left, y + row_h - (float)S(1), content_w, (float)S(1), palette.border);
+                    if (E.preview_target == 1) r_rect(E.r, left, y, content_w, (float)S(1), palette.border);
+                    for (size_t c = 0; c < columns; c++) {
+                        if (E.preview_target == 1 && c) r_rect(E.r, left + (float)c * widths[c], y, (float)S(1), row_h, palette.border);
+                        for (size_t ln = 0; ln < wrapped[c].size(); ln++) {
+                            float tx = left + (float)c * widths[c] + pad;
+                            float available = std::max(0.f, widths[c] - 2 * pad);
+                            float tw = text_width(E.ui, wrapped[c][ln].c_str(), is_header ? FS_BOLD : FS_REGULAR);
+                            if (align[c] == 1) tx += std::max(0.f, (available - tw) / 2);
+                            else if (align[c] == 2) tx += std::max(0.f, available - tw);
+                            preview_draw_inline(wrapped[c][ln], tx, y + (float)S(5) + (float)ln * line_h, available, line_h, E.ui,
+                                               is_header ? FS_BOLD : FS_REGULAR, palette.text, true);
+                        }
+                    }
+                }
+                y += row_h;
+            }
+            y += (float)S(8);
+        } else {
+            float lh = (float)S(22);
+            y = preview_draw_inline(b.text, left, y, content_w, lh, E.ui, FS_REGULAR, C_UI, y + lh >= (float)L.text_y && y < bottom);
+            y += (float)S(6);
+        }
+    }
+    r_clip_off(E.r);
+}
+
+float preview_max_scroll(const Layout &L, float width) {
+    float content_w = std::max((float)S(80), width - (float)S(48));
+    float height = (float)S(16);
+    for (const PreviewBlock &b : E.preview_blocks) {
+        if (b.kind == PreviewBlockKind::Rule) height += (float)S(18);
+        else if (b.kind == PreviewBlockKind::Heading) height += (b.level <= 1 ? (float)S(48) : (float)S(37));
+        else if (b.kind == PreviewBlockKind::Code) {
+            height += (float)preview_code_rows(b, content_w - (float)S(24)) * (float)E.rowh;
+            height += (float)S(34);
+        } else if (b.kind == PreviewBlockKind::Diagram) {
+            height += (float)std::max<size_t>(1, b.lines.size()) * (float)S(70);
+        } else {
+            size_t rows = wrap_lines(b.text, content_w).size();
+            height += (float)std::max<size_t>(1, rows) * (float)S(22) + (b.kind == PreviewBlockKind::Paragraph ? (float)S(6) : (float)S(4));
+        }
+    }
+    return std::max(0.f, height - (float)(L.ed_bottom - L.text_y) + (float)S(16));
+}
+
+void ensure_visible(const Layout &L) {
+    Doc &d = D();
+    size_t l = d.buf.line_of(d.cur);
+    if (l < d.top) d.top = l;
+    else if (L.rows > 0 && l >= d.top + (size_t)L.rows) d.top = l - (size_t)L.rows + 1;
+    int c = d.col_of_byte(l, d.cur - d.buf.line_start(l));
+    if (c < d.left) d.left = c;
+    else if (L.cols > 0 && c >= d.left + L.cols) d.left = c - L.cols + 1;
+}
+
+const std::vector<RInst> &row_instances(const std::string &text, int cols, const Lang *lang, uint8_t state) {
+    Doc &d = D();
+    uint64_t key = fnv1a(text.data(), text.size(), 1469598103934665603ull);
+    int lid = lang_id(lang);
+    uint32_t gen = atlas_generation(E.atlas), fid = font_id(E.font);
+    key = fnv1a(&d.left, sizeof d.left, key);
+    key = fnv1a(&cols, sizeof cols, key);
+    key = fnv1a(&gen, sizeof gen, key);
+    key = fnv1a(&fid, sizeof fid, key);
+    key = fnv1a(&lid, sizeof lid, key);
+    key = fnv1a(&state, sizeof state, key);
+    auto it = E.rows.find(key);
+    if (it != E.rows.end()) { sd_cache.row_hit++; return it->second.v; }
+    sd_cache.row_miss++;
+    if (E.rows.size() >= 4096) { sd_cache.row_recycle += E.rows.size(); E.rows.clear(); }
+    Ed::Row &row = E.rows[key];
+    if (E.tok.size() < text.size() + 1) E.tok.resize(text.size() + 64);
+    if (lang != lang_plain()) lex_line(lang, text.data(), text.size(), state, E.tok.data());
+    else memset(E.tok.data(), 0, text.size());
+    int col = 0;
+    for (size_t i = 0; i < text.size() && col < d.left + cols;) {
+        size_t a, i0 = i;
+        uint32_t cp = u8_decode(text.data() + i, text.size() - i, &a);
+        i += a;
+        if (cp == '\t') { col = (col / TAB_W + 1) * TAB_W; continue; }
+        if (col >= d.left && cp != ' ') {
+            const AtlasGlyph *g = atlas_glyph(E.atlas, E.font, cp, FS_REGULAR);
+            if (g && !g->blank) {
+                RInst inst;
+                r_make_glyph(E.r, &inst, g, (float)((col - d.left) * E.cw), (float)E.rowasc, TOKCOL[E.tok[i0]]);
+                row.v.push_back(inst);
+            }
+        }
+        col++;
+    }
+    return row.v;
+}
+
+/* ---- pickers: one list UI for languages, themes and terminals (type to filter, Up/Down, Enter) ---- */
+
+std::vector<int> pick_view() {   /* indices into E.pick_items that match the filter */
+    std::vector<int> v;
+    std::string f = lower_ascii(E.pick_filter);
+    std::vector<std::string> words;   /* every word typed has to appear, in any order: "git pu" finds "Git: Pull" */
+    for (size_t p0 = 0; p0 < f.size();) {
+        size_t e = f.find(' ', p0);
+        if (e == std::string::npos) e = f.size();
+        if (e > p0) words.push_back(f.substr(p0, e - p0));
+        p0 = e + 1;
+    }
+    for (size_t i = 0; i < E.pick_items.size(); i++) {
+        std::string l = lower_ascii(E.pick_items[i].label);
+        bool ok = true;
+        for (const std::string &w : words) if (l.find(w) == std::string::npos) { ok = false; break; }
+        if (ok) v.push_back((int)i);
+    }
+    return v;
+}
+
+const char *git_label(char x, char y, uint32_t *col) {
+    char c = x != ' ' && x != '?' ? x : y;
+    if (x == '?' && y == '?') { *col = C_GREEN; return "U"; }
+    switch (c) {
+    case 'M': *col = C_ORANGE; return "M";
+    case 'A': *col = C_GREEN; return "A";
+    case 'D': *col = C_RED; return "D";
+    case 'R': *col = C_GREEN; return "R";
+    default: *col = C_UI_DIM; return "?";
+    }
+}
+
+/* ---- the sidebar, in the Lestrix style: a rail with the pin and rotated tabs, then a filter box and grouped lists ---- */
+
+/* Text turned 90 degrees (reads bottom to top) as one cached atlas bitmap: the renderer only draws upright quads. */
+const AtlasGlyph *vlabel(const char *text, Font *f, int style) {
+    uint32_t fid = 0xfffd0000u | (font_id(f) & 0xffffu);
+    uint32_t key = (uint32_t)fnv1a(text, strlen(text), 1469598103934665603ull + (uint64_t)style);
+    if (const AtlasGlyph *g = atlas_find_custom(E.atlas, fid, key)) return g;
+    int h = font_cell_h(f), asc = font_ascent(f), w = 2;
+    for (size_t i = 0; text[i];) { size_t a; uint32_t cp = u8_decode(text + i, strlen(text + i), &a); i += a; const AtlasGlyph *g = atlas_glyph(E.atlas, f, cp, style); w += g ? (int)ceilf(g->adv) : font_cell_w(f); }
+    std::vector<uint8_t> canvas((size_t)w * (size_t)h, 0), rot((size_t)w * (size_t)h, 0);
+    int pen = 1;
+    for (size_t i = 0; text[i];) {
+        size_t a;
+        uint32_t cp = u8_decode(text + i, strlen(text + i), &a);
+        i += a;
+        GlyphBmp b;
+        if (font_glyph(f, cp, style, &b) && b.buf) {
+            for (int y = 0; y < b.h; y++)
+                for (int x = 0; x < b.w; x++) {
+                    int cx = pen + b.left + x, cy = asc - b.top + y;
+                    if (cx >= 0 && cx < w && cy >= 0 && cy < h) { uint8_t &d = canvas[(size_t)cy * (size_t)w + (size_t)cx]; d = std::max(d, b.buf[(size_t)y * (size_t)b.w + (size_t)x]); }
+                }
+        }
+        pen += (int)ceilf(b.adv);
+    }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) rot[(size_t)(w - 1 - x) * (size_t)h + (size_t)y] = canvas[(size_t)y * (size_t)w + (size_t)x];
+    return atlas_custom(E.atlas, fid, key, rot.data(), h, w);
+}
+
+void side_filter_update() {
+    WorkTimer wt;
+    if (E.quick_files.empty()) { ensure_files(); E.quick_files = *E.sfiles; }
+    fuzzy_filter(E.quick_files, E.side_q, 400, E.side_hits, E.side_pos);
+}
+
+const char *git_group(const GitChange &c) { return c.x == '?' ? "UNTRACKED" : c.x != ' ' ? "STAGED" : "CHANGES"; }
+
+uint32_t git_dot(const GitChange &c) {
+    char k = c.x != ' ' && c.x != '?' ? c.x : c.y;
+    if (c.x == '?') return C_GREEN;
+    return k == 'M' ? C_ORANGE : k == 'A' || k == 'R' ? C_GREEN : k == 'D' ? C_RED : C_UI_DIM;
+}
+
+void draw_dot(float cx, float cy, int size, uint32_t rgba) { draw_icon(IC_DOT, cx - (float)size / 2, cy - (float)size / 2, size, rgba); }
+
+
+/* ---- the Source Control view (modelled on VS Code's): summary, commit box, staged and other changes, history graph, file timeline ---- */
+
+struct GEnt { int idx; bool staged; char st; };
+std::vector<std::string> g_gitdirs;   /* tree view folder keys of the current frame, indexed by the hit id */
+
+void git_entries(std::vector<GEnt> &staged, std::vector<GEnt> &other, std::vector<GEnt> &merge) {
+    for (size_t i = 0; i < E.git.changes.size(); i++) {
+        const GitChange &c = E.git.changes[i];
+        bool conflict = (c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D'));
+        if (c.x == '?' && c.y == '?') other.push_back({(int)i, false, '?'});
+        else if (conflict) merge.push_back({(int)i, false, 'C'});
+        else {
+            if (c.x != ' ') staged.push_back({(int)i, true, c.x});
+            if (c.y != ' ') other.push_back({(int)i, false, c.y});
+        }
+    }
+}
+
+uint32_t status_color(char st) {
+    switch (st) {
+    case 'M': return C_GIT_MOD;
+    case 'A': case 'R': return C_GIT_ADD;
+    case 'D': return C_GIT_DEL;
+    case '?': return C_GIT_UNT;
+    case 'C': return C_GIT_CONF;
+    default: return C_UI_DIM;
+    }
+}
+
+const char *status_letter(char st) {
+    switch (st) { case 'M': return "M"; case 'A': return "A"; case 'D': return "D"; case 'R': return "R"; case '?': return "U"; case 'C': return "!"; default: return "?"; }
+}
+
+void draw_pill(float x, float y, float w, float h, uint32_t col) {
+    int cap = (int)(h * 2.36f);   /* IC_DOT's circle is 0.425 of its box wide */
+    draw_icon(IC_DOT, x + h / 2 - (float)cap / 2, y + h / 2 - (float)cap / 2, cap, col);
+    draw_icon(IC_DOT, x + w - h / 2 - (float)cap / 2, y + h / 2 - (float)cap / 2, cap, col);
+    r_rect(E.r, x + h / 2, y, std::max(0.f, w - h), h, col);
+}
+
+float draw_badge(float right, float y, float h, int n, uint32_t bg, uint32_t fg) {   /* a count in a pill, right aligned at `right`; returns its left edge */
+    std::string t = std::to_string(n);
+    float w = std::max(h, text_width(E.ui, t.c_str()) + (float)S(10));
+    draw_pill(right - w, y, w, h, bg);
+    draw_text(E.ui, right - w + (w - text_width(E.ui, t.c_str())) / 2, ui_base(y, h) - (float)S(1), t.c_str(), fg, w);
+    return right - w;
+}
+
+void git_ref_pills(const std::string &refs, float *right, float y, float h, float minx) {   /* branch and tag labels, right aligned; drawn from the right edge inwards */
+    std::vector<std::pair<std::string, int>> labs;   /* label, kind: 0 local branch, 1 remote, 2 tag */
+    size_t pos = 0;
+    while (pos < refs.size()) {
+        size_t e = refs.find(", ", pos);
+        if (e == std::string::npos) e = refs.size();
+        std::string r = refs.substr(pos, e - pos);
+        pos = e + 2;
+        if (r == "HEAD") continue;
+        if (r.compare(0, 8, "HEAD -> ") == 0) r = r.substr(8);
+        int kind = r.compare(0, 5, "tag: ") == 0 ? 2 : r.find('/') != std::string::npos ? 1 : 0;
+        if (kind == 2) r = r.substr(5);
+        labs.push_back({r, kind});
+    }
+    for (size_t i = 0; i < labs.size() && i < 3; i++) {
+        float w = text_width(E.ui, labs[i].first.c_str()) + (float)S(14);
+        if (*right - w < minx) break;
+        uint32_t bg = labs[i].second == 0 ? C_ACCENT : labs[i].second == 1 ? ui_mix(C_CHROME, C_ACCENT, 0.40) : ui_mix(C_CHROME, C_GIT_MOD, 0.45);
+        uint32_t fg = labs[i].second == 0 ? C_ON_ACCENT : C_UI;
+        draw_pill(*right - w, y, w, h, bg);
+        draw_text(E.ui, *right - w + (float)S(7), ui_base(y, h) - (float)S(1), labs[i].first.c_str(), fg, w - (float)S(10));
+        *right -= w + (float)S(4);
+    }
+}
+
+void draw_git_view(float rail, float sw, float cx, float cw, float list_top, float bot, float &ry) {
+    GitUi &g = E.g;
+    g_gitdirs.clear();
+    const float rowh = (float)S(26), full_x = rail + 1, full_w = sw - rail - 2, right = sw - (float)S(10);
+    auto visible = [&](float h) { return ry + h >= list_top && ry <= bot; };
+    std::vector<GEnt> staged, other, merge;
+    git_entries(staged, other, merge);
+    int n_mod = 0, n_add = 0, n_del = 0, n_unt = 0;
+    for (const GitChange &c : E.git.changes) {
+        if (c.x == '?') n_unt++;
+        else if (c.x == 'D' || c.y == 'D') n_del++;
+        else if (c.x == 'A' || c.x == 'R') n_add++;
+        else n_mod++;
+    }
+
+    /* title and refresh */
+    if (visible(rowh)) {
+        draw_text(E.ui, cx, ui_base(ry, rowh), "SOURCE CONTROL", C_GROUP, cw, FS_BOLD);
+        float bx = right - (float)S(22);
+        if (hovered(H_GITREFRESH, 0)) r_rect(E.r, bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), C_HOVER);
+        draw_icon(IC_REFRESH, bx, ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+        hit(bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), H_GITREFRESH, 0);
+        float mx2 = bx - (float)S(26);   /* the "..." more actions button */
+        if (hovered(H_GITMORE, 0)) r_rect(E.r, mx2 - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), C_HOVER);
+        for (int k = 0; k < 3; k++) draw_dot(mx2 + (float)S(2) + (float)k * (float)S(6), ry + rowh / 2, S(6), C_UI_DIM);
+        hit(mx2 - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), H_GITMORE, 0);
+        if (g_job.running) draw_text(E.ui, mx2 - (float)S(8) - text_width(E.ui, (g_job.label + "...").c_str()), ui_base(ry, rowh), (g_job.label + "...").c_str(), C_ACCENT, (float)S(140));
+    }
+    ry += rowh;
+
+    /* branch, sync state and the number of changes */
+    if (visible(rowh)) {
+        draw_icon(IC_GIT, cx, ry + (rowh - (float)S(14)) / 2, S(14), C_ACCENT);
+        float pen = draw_text(E.ui, cx + (float)S(22), ui_base(ry, rowh), E.git.branch.c_str(), C_UI, cw * 0.55f, FS_BOLD);
+        if (E.git.ahead) { draw_icon(IC_ARROW_U, pen + (float)S(6), ry + (rowh - (float)S(14)) / 2, S(14), C_UI_DIM); pen = draw_text(E.ui, pen + (float)S(20), ui_base(ry, rowh), std::to_string(E.git.ahead).c_str(), C_UI_DIM, (float)S(40)); }
+        if (E.git.behind) { draw_icon(IC_ARROW_D, pen + (float)S(6), ry + (rowh - (float)S(14)) / 2, S(14), C_UI_DIM); draw_text(E.ui, pen + (float)S(20), ui_base(ry, rowh), std::to_string(E.git.behind).c_str(), C_UI_DIM, (float)S(40)); }
+        if (hovered(H_GITBRANCH, 0)) r_rect(E.r, cx - (float)S(3), ry + 1, std::min(cw * 0.6f, pen - cx + (float)S(8)), rowh - 2, C_HOVER);
+        hit(cx - (float)S(3), ry, std::min(cw * 0.6f, pen - cx + (float)S(8)), rowh, H_GITBRANCH, 0);
+        std::string tot = E.git.changes.empty() ? "clean" : sfmt("%zu change%s", E.git.changes.size(), E.git.changes.size() == 1 ? "" : "s");
+        draw_text(E.ui, right - text_width(E.ui, tot.c_str()), ui_base(ry, rowh), tot.c_str(), E.git.changes.empty() ? C_GIT_UNT : C_UI_DIM, (float)S(120));
+    }
+    ry += rowh;
+    if (!E.git.changes.empty()) {   /* modified / added / deleted / untracked, coloured like the file rows */
+        if (visible(rowh)) {
+            float x = cx;
+            struct { int n; const char *l, *sh; uint32_t c; } sm[4] = {{n_mod, "modified", "M", C_GIT_MOD}, {n_add, "added", "A", C_GIT_ADD}, {n_del, "deleted", "D", C_GIT_DEL}, {n_unt, "untracked", "U", C_GIT_UNT}};
+            float need = 0;
+            for (auto &it : sm) if (it.n) need += text_width(E.ui, sfmt("%d %s", it.n, it.l).c_str()) + (float)S(22);
+            bool compact = need > cw;   /* the long words do not fit the sidebar: use the letters VS Code shows on the rows */
+            for (auto &it : sm) {
+                if (!it.n) continue;
+                std::string t = sfmt("%d %s", it.n, compact ? it.sh : it.l);
+                draw_dot(x + (float)S(4), ry + rowh / 2, S(8), it.c);
+                x = draw_text(E.ui, x + (float)S(12), ui_base(ry, rowh), t.c_str(), C_UI_DIM, sw - x) + (float)S(10);
+            }
+        }
+        ry += (float)S(22);
+    }
+
+    if (!E.git.op.empty()) {   /* an unfinished merge, rebase, cherry-pick or revert: resolve, stage, then Continue (or Skip, or Abort) */
+        std::string lab = E.git.op == "merge" ? "MERGING" : E.git.op == "rebase" ? "REBASING" : E.git.op == "cherry-pick" ? "CHERRY-PICKING" : "REVERTING";
+        if (visible(rowh)) {
+            float lw = draw_text(E.ui, cx, ui_base(ry, rowh), lab.c_str(), C_GIT_MOD, cw, FS_BOLD);
+            draw_text(E.ui, lw + (float)S(8), ui_base(ry, rowh), "resolve, stage, continue", C_UI_FAINT, cx + cw - lw - (float)S(8));
+        }
+        ry += rowh;
+        if (visible(rowh)) {
+            const bool can_skip = E.git.op == "rebase" || E.git.op == "cherry-pick";
+            const char *names[3] = {"Continue", "Skip", "Abort"};
+            int nb = can_skip ? 3 : 2;
+            float bw = (cw - (float)(nb - 1) * (float)S(6)) / (float)nb, x = cx;
+            for (int k = 0; k < 3; k++) {
+                if (k == 1 && !can_skip) continue;
+                bool hv = hovered(H_GITOP, k);
+                r_rect(E.r, x, ry, bw, rowh - (float)S(2), k == 0 ? (hv ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT) : (hv ? C_SELROW : C_FIELD));
+                float tw = text_width(E.ui, names[k]);
+                draw_text(E.ui, x + (bw - tw) / 2, ui_base(ry, rowh - (float)S(2)), names[k], k == 0 ? C_ON_ACCENT : C_UI, bw);
+                hit(x, ry, bw, rowh - (float)S(2), H_GITOP, k);
+                x += bw + (float)S(6);
+            }
+        }
+        ry += rowh + (float)S(4);
+    }
+
+    /* commit message and button */
+    {
+        std::vector<std::string> ml;
+        size_t pos = 0;
+        while (true) { size_t e = g.msg.find('\n', pos); ml.push_back(g.msg.substr(pos, e == std::string::npos ? std::string::npos : e - pos)); if (e == std::string::npos) break; pos = e + 1; }
+        int shown = std::min<int>(5, (int)ml.size());
+        float lh = (float)S(18), bh = (float)shown * lh + (float)S(12);
+        bool foc = E.mode == M_GITMSG;
+        if (visible(bh)) {
+            r_rect(E.r, cx, ry, cw, bh, foc ? C_ACCENT : C_BOX_LINE);
+            r_rect(E.r, cx + 1, ry + 1, cw - 2, bh - 2, C_FIELD);
+            if (g.msg.empty()) draw_text(E.ui, cx + (float)S(8), ui_base(ry + (float)S(6), lh), "Message (Ctrl+Enter to commit)", C_UI_FAINT, cw - (float)S(16));
+            float pen = cx + (float)S(8);
+            for (int i = 0; i < shown; i++) {
+                const std::string &line = ml[ml.size() - (size_t)shown + (size_t)i];
+                pen = draw_text(E.ui, cx + (float)S(8), ui_base(ry + (float)S(6) + (float)i * lh, lh), line.c_str(), C_UI, cw - (float)S(16));
+            }
+            if (foc && E.blink_on) r_rect(E.r, pen + 1, ry + (float)S(6) + (float)(shown - 1) * lh + (float)S(2), std::max(1.f, E.scale), lh - (float)S(4), C_CURSOR);
+            hit(cx, ry, cw, bh, H_GITMSG, 0);
+        }
+        ry += bh + (float)S(6);
+        if (!g.err.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, (float)S(20)), g.err.c_str(), C_RED, cw); ry += (float)S(22); }
+        float bth = (float)S(30);
+        if (visible(bth)) {
+            bool clean = E.git.changes.empty() || (staged.empty() && other.empty());
+            bool sync = clean && !E.git.upstream.empty() && (E.git.ahead || E.git.behind);
+            bool publish = clean && E.git.upstream.empty() && E.git.has_remote && E.git.branch.compare(0, 4, "HEAD") != 0;
+            int mode = sync ? 1 : publish ? 2 : 0;
+            bool can = !clean || mode != 0;
+            std::string lab = mode == 1 ? sfmt("Sync Changes  %s%s%s", E.git.behind ? sfmt("%d down", E.git.behind).c_str() : "", E.git.behind && E.git.ahead ? "  " : "", E.git.ahead ? sfmt("%d up", E.git.ahead).c_str() : "")
+                              : mode == 2 ? "Publish Branch" : clean ? (merge.empty() ? "Nothing to commit" : "Resolve the conflicts first") : !staged.empty() ? sfmt("Commit  (%zu staged)", staged.size()) : sfmt("Commit All  (%zu)", other.size());
+            float ddw = mode == 0 && can ? (float)S(26) : 0.f;
+            uint32_t bg = !can ? C_FIELD : hovered(H_GITCOMMIT, mode) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT;
+            uint32_t fg = can ? C_ON_ACCENT : C_UI_FAINT;
+            r_rect(E.r, cx, ry, cw - ddw, bth, bg);
+            float lw = text_width(E.ui, lab.c_str()) + (float)S(22);
+            float lx = cx + (cw - ddw - lw) / 2;
+            if (can) draw_icon(mode == 1 ? IC_REFRESH : mode == 2 ? IC_ARROW_U : IC_CHECK, lx, ry + (bth - (float)S(16)) / 2, S(16), fg);
+            draw_text(E.ui, lx + (can ? (float)S(22) : 0.f), ui_base(ry, bth), lab.c_str(), fg, cw - ddw);
+            hit(cx, ry, cw - ddw, bth, H_GITCOMMIT, mode);
+            if (ddw > 0) {   /* the arrow: Commit (Amend), Commit and Push, Undo Last Commit ... */
+                r_rect(E.r, cx + cw - ddw, ry, ddw, bth, hovered(H_GITDD, 0) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT);
+                r_rect(E.r, cx + cw - ddw, ry + (float)S(5), 1, bth - (float)S(10), ui_mix(C_ACCENT, C_ON_ACCENT, 0.4));
+                draw_icon(IC_CHEV_D, cx + cw - ddw + (ddw - (float)S(16)) / 2, ry + (bth - (float)S(16)) / 2, S(16), fg);
+                hit(cx + cw - ddw, ry, ddw, bth, H_GITDD, 0);
+            }
+        }
+        ry += bth + (float)S(10);
+    }
+
+    auto section = [&](int id, const char *name, bool open, int count, int all_id) {
+        float h = (float)S(26);
+        if (visible(h)) {
+            if (hovered(H_GITSEC, id)) r_rect(E.r, full_x, ry, full_w, h, C_HOVER);
+            draw_icon(open ? IC_CHEV_D : IC_CHEV_R, cx - (float)S(4), ry + (h - (float)S(16)) / 2, S(16), C_GROUP);
+            float pen = draw_text(E.ui, cx + (float)S(14), ui_base(ry, h), name, C_UI_DIM, cw, FS_BOLD);
+            hit(full_x, ry, full_w, h, H_GITSEC, id);
+            float r = right;
+            if (all_id == 0 && count > 0) {   /* discard all changes */
+                float dx = right - (float)S(44);
+                if (hovered(H_GITDISC, -1)) r_rect(E.r, dx - (float)S(2), ry + (float)S(3), (float)S(22), h - (float)S(6), C_HOVER);
+                draw_icon(IC_UNDO, dx, ry + (h - (float)S(16)) / 2, S(16), C_UI_DIM);
+                hit(dx - (float)S(2), ry + (float)S(3), (float)S(22), h - (float)S(6), H_GITDISC, -1);
+                r = dx - (float)S(6);
+            }
+            if (all_id >= 0 && count > 0) {   /* stage all / unstage all */
+                float bx = right - (float)S(20);
+                if (hovered(H_GITALL, all_id)) r_rect(E.r, bx - (float)S(2), ry + (float)S(3), (float)S(22), h - (float)S(6), C_HOVER);
+                draw_icon(all_id == 0 ? IC_PLUS : IC_MINUS, bx, ry + (h - (float)S(16)) / 2, S(16), C_UI_DIM);
+                hit(bx - (float)S(2), ry + (float)S(3), (float)S(22), h - (float)S(6), H_GITALL, all_id);
+                r = std::min(r, bx - (float)S(6));
+            }
+            if (count >= 0) draw_badge(r, ry + (h - (float)S(16)) / 2, (float)S(16), count, C_ACCENT, C_ON_ACCENT);
+            (void)pen;
+        }
+        ry += h;
+    };
+
+    auto file_rows = [&](const std::vector<GEnt> &ents, int sect) {
+        std::vector<int> order;
+        for (size_t k = 0; k < ents.size(); k++) order.push_back((int)k);
+        if (g.tree_view) std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return E.git.changes[(size_t)ents[(size_t)a].idx].path < E.git.changes[(size_t)ents[(size_t)b].idx].path; });
+        std::vector<std::string> prev;   /* folder path of the previous row, to know which folder rows to emit */
+        std::string hidden_under;        /* a collapsed folder: everything below it is skipped */
+        for (int ok : order) {
+            const GEnt &en = ents[(size_t)ok];
+            const GitChange &c = E.git.changes[(size_t)en.idx];
+            int id = en.idx * 2 + (en.staged ? 1 : 0);
+            std::string base = base_name(c.path), dir = c.path.size() > base.size() ? c.path.substr(0, c.path.size() - base.size() - 1) : std::string();
+            int depth = 0;
+            if (g.tree_view) {
+                std::vector<std::string> parts;
+                size_t p0 = 0;
+                while (p0 < dir.size()) { size_t e = dir.find('/', p0); if (e == std::string::npos) e = dir.size(); parts.push_back(dir.substr(p0, e - p0)); p0 = e + 1; }
+                size_t common = 0;
+                while (common < parts.size() && common < prev.size() && parts[common] == prev[common]) common++;
+                std::string acc;
+                bool skip = false;
+                for (size_t d = 0; d < parts.size(); d++) {
+                    acc += (d ? "/" : "") + parts[d];
+                    std::string key = sfmt("%d:", sect) + acc;
+                    bool closed = g.collapsed.count(key) != 0;
+                    if (d >= common) {
+                        if (visible(rowh)) {
+                            if (hovered(H_GITDIR, (int)g_gitdirs.size())) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+                            float fx = cx + (float)d * (float)S(12);
+                            draw_icon(closed ? IC_CHEV_R : IC_CHEV_D, fx - (float)S(4), ry + (rowh - (float)S(16)) / 2, S(16), C_GROUP);
+                            draw_text(E.ui, fx + (float)S(12), ui_base(ry, rowh), parts[d].c_str(), C_UI, right - fx - (float)S(16));
+                            hit(full_x, ry, full_w, rowh, H_GITDIR, (int)g_gitdirs.size());
+                        }
+                        g_gitdirs.push_back(key);
+                        ry += rowh;
+                    }
+                    if (closed) { skip = true; break; }
+                }
+                prev = parts;
+                if (skip) { prev.resize(std::min(prev.size(), parts.size())); continue; }
+                depth = (int)parts.size();
+            }
+            if (visible(rowh)) {
+                bool hv = hovered(H_GITROW, id) || hovered(H_GITSTG, id) || hovered(H_GITOPEN, id) || hovered(H_GITDISC, id);
+                if (hv) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+                uint32_t col = status_color(en.st);
+                float ix = cx + (float)depth * (float)S(12);
+                draw_dot(ix + (float)S(8), ry + rowh / 2, S(8), file_color(base));
+                const bool conf = en.st == 'C';
+                int nb = en.staged || conf ? 2 : 3;   /* open, (discard), stage / unstage */
+                float lim = right - (float)S(18) - (hv ? (float)(nb * 22) * E.scale : 0.f);
+                float pen = draw_text(E.ui, ix + (float)S(20), ui_base(ry, rowh), base.c_str(), en.st == 'D' ? C_UI_FAINT : C_UI, lim - ix - (float)S(20));
+                if (!g.tree_view && !dir.empty() && pen + (float)S(30) < lim) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir.c_str(), C_UI_FAINT, lim - pen - (float)S(8));
+                float lw = text_width(E.ui, status_letter(en.st));
+                draw_text(E.ui, right - (float)S(8) - lw, ui_base(ry, rowh), status_letter(en.st), col, (float)S(20), FS_BOLD);
+                hit(full_x, ry, full_w, rowh, H_GITROW, id);
+                if (hv) {
+                    float bx = right - (float)S(22) * (float)nb - (float)S(2);
+                    for (int b = 0; b < nb; b++) {
+                        int kind = b == 0 ? H_GITOPEN : (b == 1 && !en.staged && !conf) ? H_GITDISC : H_GITSTG;
+                        Icon ic = b == 0 ? IC_OPEN_FILE : (b == 1 && !en.staged && !conf) ? IC_UNDO : en.staged ? IC_MINUS : IC_PLUS;
+                        if (hovered(kind, id)) r_rect(E.r, bx - (float)S(1), ry + (float)S(3), (float)S(20), rowh - (float)S(6), C_SELROW);
+                        draw_icon(ic, bx + (float)S(1), ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+                        hit(bx - (float)S(1), ry + (float)S(3), (float)S(20), rowh - (float)S(6), kind, id);
+                        bx += (float)S(22);
+                    }
+                }
+            }
+            ry += rowh;
+        }
+    };
+
+    if (E.git.changes.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "No changes. The working tree matches HEAD.", C_UI_FAINT, cw); ry += rowh; }
+    if (!merge.empty()) { section(4, "Merge Changes", g.open_merge, (int)merge.size(), -1); if (g.open_merge) file_rows(merge, 4); }
+    if (!staged.empty()) { section(0, "Staged Changes", g.open_staged, (int)staged.size(), 1); if (g.open_staged) file_rows(staged, 0); }
+    if (!other.empty()) { section(1, "Changes", g.open_changes, (int)other.size(), 0); if (g.open_changes) file_rows(other, 1); }
+    ry += (float)S(6);
+
+    /* the history graph */
+    section(2, "GRAPH", g.open_graph, (int)g.log.size(), -1);
+    if (g.open_graph) {
+        const float gh = (float)S(24);
+        const float lw = (float)S(10), lx0 = cx + (float)S(6), th = std::max(1.f, (float)S(2));
+        const float textx = lx0 + (float)g.lane_cols * lw + (float)S(2);
+        const uint32_t pal[5] = {C_GUT_MOD, C_GUT_ADD, C_GIT_MOD, C_ACCENT, C_GUT_DEL};
+        auto lane_x = [&](int k) { return lx0 + (float)std::min(k, 4) * lw; };
+        auto through = [&](size_t i, float y, float h) {   /* the lanes that continue below commit i, drawn over a row of height h */
+            if (i >= g.lanes.size()) return;
+            const GitUi::Lane &ln = g.lanes[i];
+            for (size_t k = 0; k < ln.bot.size() && k < 5; k++) if (ln.bot[k]) r_rect(E.r, lane_x((int)k) - th / 2, y, th, h, pal[k % 5]);
+        };
+        for (size_t i = 0; i < g.log.size(); i++) {
+            const GitCommit &c = g.log[i];
+            bool sel = (int)i == g.log_sel, marked = !g.mark_hash.empty() && c.hash == g.mark_hash;
+            if (visible(gh)) {
+                if (sel) r_rect(E.r, full_x, ry, full_w, gh, C_SELROW);
+                else if (hovered(H_GITLOG, (int)i)) r_rect(E.r, full_x, ry, full_w, gh, C_HOVER);
+                if (marked) r_rect(E.r, full_x, ry, (float)S(2), gh, C_ACCENT);
+                const GitUi::Lane &ln = g.lanes[i];
+                auto has = [](const std::vector<int> &v, int k) { return std::find(v.begin(), v.end(), k) != v.end(); };
+                const float mid = ry + gh / 2;
+                for (size_t k = 0; k < std::max(ln.top.size(), ln.bot.size()) && k < 5; k++) {
+                    if ((int)k == ln.col) continue;
+                    bool t = k < ln.top.size() && ln.top[k], b = k < ln.bot.size() && ln.bot[k], cv = has(ln.conv, (int)k), ou = has(ln.out, (int)k);
+                    float x = lane_x((int)k), x2 = lane_x(ln.col);
+                    uint32_t col = pal[k % 5];
+                    if (t && b && !cv && !ou) r_rect(E.r, x - th / 2, ry, th, gh, col);
+                    if (cv) { r_rect(E.r, x - th / 2, ry, th, gh / 2, col); r_rect(E.r, std::min(x, x2), mid - th / 2, std::fabs(x2 - x) + th / 2, th, col); }
+                    if (ou) { r_rect(E.r, x - th / 2, mid, th, gh / 2, col); r_rect(E.r, std::min(x, x2), mid - th / 2, std::fabs(x2 - x) + th / 2, th, col); }
+                }
+                float cxl = lane_x(ln.col);
+                uint32_t ccol = pal[(size_t)ln.col % 5];
+                if (!ln.top.empty() && (size_t)ln.col < ln.top.size() && ln.top[(size_t)ln.col]) r_rect(E.r, cxl - th / 2, ry, th, gh / 2, ccol);
+                if ((size_t)ln.col < ln.bot.size() && ln.bot[(size_t)ln.col]) r_rect(E.r, cxl - th / 2, mid, th, gh / 2, ccol);
+                bool head = c.refs.find("HEAD") != std::string::npos;
+                draw_dot(cxl, mid, S(11), head ? C_ACCENT : ccol);
+                if (head || c.parents > 1) draw_dot(cxl, mid, S(5), sel ? C_SELROW : C_CHROME);   /* HEAD and merges are hollow */
+                float pr = right;
+                git_ref_pills(c.refs, &pr, ry + (gh - (float)S(16)) / 2, (float)S(16), cx + cw * 0.35f);
+                draw_text(E.ui, textx, ui_base(ry, gh), c.subject.c_str(), C_UI, pr - textx - (float)S(4), head ? FS_BOLD : FS_REGULAR);
+                hit(full_x, ry, full_w, gh, H_GITLOG, (int)i);
+            }
+            ry += gh;
+            if (sel) {   /* the commit's details and files, indented under it */
+                float mh = (float)S(22);
+                if (visible(mh)) {
+                    std::string meta = g.cmp_a.empty() ? sfmt("%s  %s, %s", c.hash.substr(0, 7).c_str(), c.author.c_str(), git_ago(c.date, (long)time(nullptr)).c_str())
+                                                       : sfmt("comparing %s with %s", g.cmp_a.substr(0, 7).c_str(), g.cmp_b.substr(0, 7).c_str());
+                    draw_text(E.ui, textx, ui_base(ry, mh), meta.c_str(), C_UI_FAINT, right - textx);
+                    through(i, ry, mh);
+                }
+                ry += mh;
+                for (size_t k = 0; k < g.sel_files.size(); k++) {
+                    const GitFile &f = g.sel_files[k];
+                    if (visible(rowh)) {
+                        if (hovered(H_GITCFILE, (int)k)) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+                        through(i, ry, rowh);
+                        std::string base = base_name(f.path), dir = f.path.size() > base.size() ? f.path.substr(0, f.path.size() - base.size() - 1) : std::string();
+                        float lim = right - (float)S(22);
+                        float pen = draw_text(E.ui, textx, ui_base(ry, rowh), base.c_str(), status_color(f.status), lim - textx);
+                        if (!dir.empty() && pen + (float)S(30) < lim) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir.c_str(), C_UI_FAINT, lim - pen - (float)S(8));
+                        draw_text(E.ui, right - (float)S(8) - text_width(E.ui, status_letter(f.status)), ui_base(ry, rowh), status_letter(f.status), status_color(f.status), (float)S(20), FS_BOLD);
+                        hit(full_x, ry, full_w, rowh, H_GITCFILE, (int)k);
+                    }
+                    ry += rowh;
+                }
+                if (g.sel_files.empty()) { if (visible(mh)) draw_text(E.ui, textx, ui_base(ry, mh), "no file changes", C_UI_FAINT, cw); ry += mh; }
+            }
+        }
+        if (g.log.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "No commits yet", C_UI_FAINT, cw); ry += rowh; }
+        if (!g.mark_hash.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), sfmt("Marked %s. Shift+click to compare", g.mark_label.c_str()).c_str(), C_UI_FAINT, cw); ry += rowh; }
+        else { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), "Ctrl+click marks, Shift+click compares", C_UI_FAINT, cw); ry += rowh; }
+    }
+    ry += (float)S(6);
+
+    /* history of the file in the active tab */
+    {
+        std::string title = g.tl_path.empty() || g.tl_path[0] == '\x01' ? std::string("TIMELINE") : "TIMELINE  " + base_name(g.tl_path);
+        section(3, title.c_str(), g.open_tl, g.tl_path.empty() || g.tl_path[0] == '\x01' ? -1 : (int)g.tl.size(), -1);
+        if (g.open_tl) {
+            const float th = (float)S(24);
+            for (size_t i = 0; i < g.tl.size(); i++) {
+                const GitCommit &c = g.tl[i];
+                bool marked = !g.mark_hash.empty() && c.hash == g.mark_hash;
+                if (visible(th)) {
+                    if (hovered(H_GITTL, (int)i)) r_rect(E.r, full_x, ry, full_w, th, C_HOVER);
+                    if (marked) r_rect(E.r, full_x, ry, (float)S(2), th, C_ACCENT);
+                    std::string ago = git_ago(c.date, (long)time(nullptr));
+                    float aw = text_width(E.ui, ago.c_str());
+                    draw_dot(cx + (float)S(6), ry + th / 2, S(8), C_GUT_MOD);
+                    draw_text(E.ui, cx + (float)S(20), ui_base(ry, th), c.subject.c_str(), C_UI, right - cx - (float)S(28) - aw);
+                    draw_text(E.ui, right - aw, ui_base(ry, th), ago.c_str(), C_UI_FAINT, aw + 2);
+                    hit(full_x, ry, full_w, th, H_GITTL, (int)i);
+                }
+                ry += th;
+            }
+            if (g.tl.empty()) { if (visible(rowh)) draw_text(E.ui, cx, ui_base(ry, rowh), g.tl_path.empty() || g.tl_path[0] == '\x01' ? "Open a tracked file to see its history" : "No history for this file yet", C_UI_FAINT, cw); ry += rowh; }
+        }
+    }
+}
+
+void draw_remote_view(float rail, float sw, float cx, float cw, float list_top, float bot, float &ry) {
+    remote_ensure();
+    g_rrows.clear();
+    const float rowh = (float)S(26), full_x = rail + 1, full_w = sw - rail - 2, right = sw - (float)S(10);
+    auto visible = [&](float h) { return ry + h >= list_top && ry <= bot; };
+    if (visible(rowh)) {
+        draw_text(E.ui, cx, ui_base(ry, rowh), "REMOTE EXPLORER", C_GROUP, cw, FS_BOLD);
+        float bx = right - (float)S(22);
+        if (hovered(H_RNEW, 0)) r_rect(E.r, bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), C_HOVER);
+        draw_icon(IC_PLUS, bx, ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+        hit(bx - (float)S(3), ry + (float)S(2), (float)S(24), rowh - (float)S(4), H_RNEW, 0);
+    }
+    ry += rowh;
+    if (g_rem.profiles.empty()) {
+        if (visible(rowh * 3)) {
+            draw_text(E.ui, cx, ui_base(ry, rowh), "No connections yet", C_UI, cw, FS_BOLD);
+            draw_text(E.ui, cx, ui_base(ry + rowh, rowh), "SSH, SFTP, FTP, FTPS and SMB", C_UI_DIM, cw);
+            float by = ry + rowh * 2 + (float)S(4), bh = (float)S(30);
+            r_rect(E.r, cx, by, cw, bh, hovered(H_RNEW, 1) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT);
+            float lw = text_width(E.ui, "New Connection");
+            draw_text(E.ui, cx + (cw - lw) / 2, ui_base(by, bh), "New Connection", C_ON_ACCENT, cw);
+            hit(cx, by, cw, bh, H_RNEW, 1);
+        }
+        ry += rowh * 3 + (float)S(10);
+        return;
+    }
+    std::function<void(int, const std::string &, int)> emit = [&](int pi, const std::string &dir, int depth) {
+        RConn &c = g_rem.conns[(size_t)pi];
+        auto it = c.dirs.find(dir);
+        if (it == c.dirs.end()) return;
+        for (const RemoteEntry &e : it->second) {
+            std::string full = dir == "." ? e.name : (dir.empty() || dir == "/" ? "/" : dir + "/") + e.name;
+            if (dir.back() == '/' && dir.size() > 1) full = dir + e.name;
+            int idx = (int)g_rrows.size();
+            g_rrows.push_back({pi, full, e.dir ? 1 : 2});
+            bool opened = e.dir && c.expanded.count(full);
+            if (visible(rowh)) {
+                if (hovered(H_RROW, idx)) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+                float x = cx + (float)depth * (float)S(12);
+                if (e.dir) { draw_icon(opened ? IC_CHEV_D : IC_CHEV_R, x - (float)S(4), ry + (rowh - (float)S(16)) / 2, S(16), C_GROUP); draw_icon(IC_FOLDER, x + (float)S(12), ry + (rowh - (float)S(14)) / 2, S(14), C_UI_DIM); }
+                else draw_dot(x + (float)S(8), ry + rowh / 2, S(8), file_color(e.name));
+                draw_text(E.ui, x + (float)S(e.dir ? 30 : 20), ui_base(ry, rowh), e.name.c_str(), C_UI, right - x - (float)S(34));
+                hit(full_x, ry, full_w, rowh, H_RROW, idx);
+            }
+            ry += rowh;
+            if (opened) {
+                if (c.dirs.count(full)) emit(pi, full, depth + 1);
+            } else if (e.dir && c.loading.count(full)) { /* the arrow turns into a row of its own below */ }
+            if (e.dir && c.loading.count(full)) { if (visible(rowh)) draw_text(E.ui, cx + (float)(depth + 1) * (float)S(12) + (float)S(20), ui_base(ry, rowh), "loading...", C_UI_FAINT, cw); ry += rowh; }
+        }
+        if (it->second.empty()) { if (visible(rowh)) draw_text(E.ui, cx + (float)depth * (float)S(12) + (float)S(20), ui_base(ry, rowh), "(empty)", C_UI_FAINT, cw); ry += rowh; }
+    };
+    for (size_t pi = 0; pi < g_rem.profiles.size(); pi++) {
+        const RemoteProfile &p = g_rem.profiles[pi];
+        RConn &c = g_rem.conns[pi];
+        int idx = (int)g_rrows.size();
+        g_rrows.push_back({(int)pi, remote_root(p), 0});
+        if (visible(rowh)) {
+            if (hovered(H_RROW, idx)) r_rect(E.r, full_x, ry, full_w, rowh, C_HOVER);
+            draw_icon(c.connected && c.open ? IC_CHEV_D : IC_CHEV_R, cx - (float)S(4), ry + (rowh - (float)S(16)) / 2, S(16), C_GROUP);
+            draw_dot(cx + (float)S(20), ry + rowh / 2, S(12), c.busy ? C_ACCENT : c.connected ? C_GIT_ADD : C_UI_FAINT);
+            float pen = draw_text(E.ui, cx + (float)S(30), ui_base(ry, rowh), p.name.c_str(), C_UI, cw * 0.5f, FS_BOLD);
+            std::string tag = p.proto;
+            for (char &ch : tag) ch = (char)toupper((unsigned char)ch);
+            float tw = text_width(E.ui, tag.c_str());
+            draw_text(E.ui, right - tw, ui_base(ry, rowh), tag.c_str(), C_UI_FAINT, tw + 2);
+            if (pen + (float)S(10) < right - tw - (float)S(8)) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rowh), remote_label(p).c_str(), C_UI_FAINT, right - tw - pen - (float)S(16));
+            hit(full_x, ry, full_w, rowh, H_RROW, idx);
+        }
+        ry += rowh;
+        if (c.connected && c.open) emit((int)pi, remote_root(p), 1);
+        else if (!c.connected && !c.busy) {
+            if (visible(rowh) && (!c.err.empty())) draw_text(E.ui, cx + (float)S(20), ui_base(ry, rowh), c.err.c_str(), C_RED, cw - (float)S(20));
+            if (!c.err.empty()) ry += rowh;
+        }
+    }
+    ry += (float)S(8);
+    if (visible(rowh)) { draw_text(E.ui, cx, ui_base(ry, rowh), "Right-click a connection for more.", C_UI_FAINT, cw); draw_text(E.ui, cx, ui_base(ry + rowh, rowh), "Saving a file uploads it.", C_UI_FAINT, cw); }
+    ry += rowh * 2;
+}
+
+
+
+/* ---- files changed on disk (an AI tool, a formatter, git): inotify on the folders of the open files and of the expanded tree ---- */
+
+struct FsWatch {
+    int fd = -1;
+    std::mutex mu;
+    std::map<std::string, int> wd_of;               /* folder -> watch */
+    std::map<int, std::string> dir_of;
+    std::map<std::string, double> changed;          /* path -> when the event arrived (monotonic seconds) */
+    std::string sig;                                /* the folders the watches were last set for */
+    size_t tree_rows = (size_t)-1;
+    double tree_due = 0;
+    bool started = false;
+};
+FsWatch *g_fw = new FsWatch;                         /* never freed: the thread outlives main's cleanup */
+
+void fswatch_thread() {
+    char buf[16384] __attribute__((aligned(8)));
+    for (;;) {
+        ssize_t n = read(g_fw->fd, buf, sizeof buf);
+        if (n <= 0) { if (n < 0 && errno == EINTR) continue; return; }
+        double t = now_s();
+        {
+            std::lock_guard<std::mutex> g(g_fw->mu);
+            for (char *p = buf; p < buf + n;) {
+                const inotify_event *ev = reinterpret_cast<const inotify_event *>(p);
+                auto it = g_fw->dir_of.find(ev->wd);
+                if (it != g_fw->dir_of.end() && (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MODIFY)) && ev->len) {
+                    std::string path = (it->second == "/" ? std::string() : it->second) + "/" + ev->name;
+                    if (path.size() > 13 && path.compare(path.size() - 13, 13, ".hootedit-tmp") == 0) { p += sizeof(inotify_event) + ev->len; continue; }   /* our own atomic save */
+                    if (!g_fw->changed.count(path)) g_fw->changed[path] = t;   /* keep the first event: the time since the write started */
+                }
+                p += sizeof(inotify_event) + ev->len;
+            }
+        }
+        app_wake();
+    }
+}
+
+void fswatch_dirs(const std::set<std::string> &want) {
+    std::string sig;
+    for (const std::string &d : want) sig += d + "\n";
+    if (sig == g_fw->sig) return;
+    g_fw->sig = sig;
+    if (!g_fw->started) {
+        g_fw->fd = inotify_init1(IN_CLOEXEC);
+        if (g_fw->fd < 0) return;
+        g_fw->started = true;
+        std::thread(fswatch_thread).detach();
+    }
+    if (g_fw->fd < 0) return;
+    std::lock_guard<std::mutex> g(g_fw->mu);
+    for (auto it = g_fw->wd_of.begin(); it != g_fw->wd_of.end();) {
+        if (!want.count(it->first)) { inotify_rm_watch(g_fw->fd, it->second); g_fw->dir_of.erase(it->second); it = g_fw->wd_of.erase(it); } else ++it;
+    }
+    size_t budget = 600;
+    for (const std::string &d : want) {
+        if (g_fw->wd_of.count(d) || budget-- == 0) continue;
+        int wd = inotify_add_watch(g_fw->fd, d.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_MOVED_FROM);
+        if (wd >= 0) { g_fw->wd_of[d] = wd; g_fw->dir_of[wd] = d; }
+    }
+}
+
+std::vector<std::string> g_ext_queue;     /* documents with unsaved edits whose file changed: asked about one at a time */
+
+bool external_change(Doc &d, double event_at) {
+    if (d.dv || d.mv || d.path.empty()) return false;
+    if (d.disk_gone()) { E.status_msg = d.name() + " was deleted on disk; the text is kept in the editor"; d.disk_mtime = 0; d.disk_size = -1; redraw(); return true; }
+    if (!d.disk_changed()) return false;
+    if (!d.modified()) {
+        double t0 = now_s();
+        if (!d.reload_disk()) return false;
+        double t1 = now_s();
+        g_gutter.erase(&d);
+        E.rows.clear();
+        lint_forget(&d);
+        double reload_ms = (t1 - t0) * 1000.0, seen_ms = (t1 - event_at) * 1000.0;
+        record_op("hot reload " + d.name(), reload_ms);
+        E.status_msg = "reloaded " + d.name() + " from disk in " + fmt_ms(reload_ms) + " (" + fmt_ms(seen_ms) + " after the write finished)";
+        E.follow = false;
+        redraw();
+        return true;
+    }
+    std::string name = d.name(), path = d.path;
+    dlg_show(name + " changed on disk", "You have unsaved edits in the editor and the file was changed by something else. Load the new version from disk (Ctrl+Z gets your text back), or keep yours and overwrite the file when you save.", {"Load from disk", "Keep mine"},
+             [path](int btn, const std::string &) {
+                 for (auto &dp : E.docs) {
+                     if (dp->path != path) continue;
+                     if (btn == 0) { double t0 = now_s(); dp->reload_disk(); double ms = (now_s() - t0) * 1000.0; record_op("hot reload " + dp->name(), ms); E.status_msg = "loaded " + dp->name() + " from disk in " + fmt_ms(ms); g_gutter.erase(dp.get()); E.rows.clear(); lint_forget(dp.get()); }
+                     else { dp->stamp_disk(); E.status_msg = "kept your version of " + dp->name() + "; saving overwrites the file on disk"; }
+                 }
+                 redraw();
+             });
+    return true;
+}
+
+/* once per loop iteration: follow the folders we should watch, then act on what changed */
+void fswatch_tick() {
+    if (!E.hot_reload) { std::lock_guard<std::mutex> g(g_fw->mu); g_fw->changed.clear(); return; }
+    std::set<std::string> want;
+    for (auto &dp : E.docs) if (!dp->dv && !dp->mv && !dp->path.empty() && dp->path[0] == '/') want.insert(dp->path.substr(0, dp->path.rfind('/') == 0 ? 1 : dp->path.rfind('/')));
+    if (!E.tree.root().empty()) {
+        want.insert(E.tree.root());
+        for (const Tree::Row &r : E.tree.rows()) if (r.dir && r.expanded && !r.ghost) want.insert(r.path);
+    }
+    fswatch_dirs(want);
+    std::map<std::string, double> got;
+    {
+        std::lock_guard<std::mutex> g(g_fw->mu);
+        if (g_fw->changed.empty() && g_fw->tree_due == 0) return;
+        got.swap(g_fw->changed);
+    }
+    bool tree = false, defer_all = E.mode == M_DIALOG;
+    for (auto &kv : got) {
+        bool is_doc = false;
+        for (auto &dp : E.docs) if (dp->path == kv.first) {
+            is_doc = true;
+            if (defer_all) { std::lock_guard<std::mutex> g(g_fw->mu); g_fw->changed.emplace(kv.first, kv.second); }   /* a dialog is open: ask again afterwards */
+            else if (external_change(*dp, kv.second)) tree = true;
+        }
+        if (!is_doc) tree = true;
+    }
+    if (tree && !E.tree.root().empty()) g_fw->tree_due = now_s() + 0.2;   /* new or removed files: the Explorer and the git state follow, after a short pause so a burst is one refresh */
+    if (g_fw->tree_due > 0 && now_s() >= g_fw->tree_due) {
+        g_fw->tree_due = 0;
+        E.tree.refresh();
+        if (E.git.repo) git_refresh();
+        E.quick_files.clear();
+        E.sfiles.reset();
+        redraw();
+    }
+}
+
+/* ---- live checks: src/lint.cpp results per document, refreshed when the text has been still for a moment ---- */
+
+struct LintJob {
+    std::string text, path;
+    const Lang *lang = nullptr;
+    uint64_t rev = 0;
+    std::vector<Diag> out;
+    std::atomic<bool> done{false};
+};
+
+struct LintState {
+    uint64_t rev = ~0ull;                 /* the revision the diagnostics belong to */
+    std::vector<Diag> d;
+    std::shared_ptr<LintJob> job;         /* a check of a big file runs on a thread */
+    int counts[4] = {0, 0, 0, 0};
+    bool skipped = false;
+};
+
+std::unordered_map<const Doc *, LintState> g_lint;
+void lint_forget(const Doc *d) { g_lint.erase(d); }
+
+void lint_filter(std::vector<Diag> &v) {   /* Settings > Ignored check codes */
+    if (E.lint_ignore.empty()) return;
+    std::set<std::string> skip;
+    size_t p = 0;
+    while (p < E.lint_ignore.size()) { size_t e = E.lint_ignore.find(' ', p); if (e == std::string::npos) e = E.lint_ignore.size(); if (e > p) skip.insert(E.lint_ignore.substr(p, e - p)); p = e + 1; }
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const Diag &d) { std::string base = d.code.substr(0, d.code.find('[')); return skip.count(d.code) || skip.count(base); }), v.end());
+}
+
+void lint_count(LintState &st) { for (int &c : st.counts) c = 0; for (const Diag &x : st.d) if (x.sev < 4) st.counts[x.sev]++; }
+
+const LintState *lint_state(const Doc &d) { auto it = g_lint.find(&d); return it == g_lint.end() ? nullptr : &it->second; }
+
+void lint_kick(Doc &d, bool force_sync) {
+    if (!E.lint_on || d.dv || d.mv) return;
+    LintState &st = g_lint[&d];
+    uint64_t rev = d.buf.revision();
+    if (st.rev == rev) return;
+    st.skipped = false;
+    size_t n;
+    const char *fb = d.buf.flat(&n);
+    if (n > (24u << 20)) { st.d.clear(); st.rev = rev; st.skipped = true; lint_count(st); redraw(); return; }
+    LintInput in;
+    in.text = fb; in.n = n; in.lang = d.lang; in.path = d.path;
+    if (n <= (192u << 10) || force_sync) {   /* small files: about 2 ms, done in the idle gap; bigger ones on a thread */
+        double t0 = now_s();
+        lint_run(in, st.d);
+        lint_filter(st.d);
+        st.rev = rev;
+        lint_count(st);
+        record_op("live checks", (now_s() - t0) * 1000.0);
+        redraw();
+        return;
+    }
+    if (st.job && !st.job->done) return;   /* one at a time; the next tick starts a fresh one */
+    auto job = std::make_shared<LintJob>();
+    job->text.assign(fb, n);
+    job->path = d.path; job->lang = d.lang; job->rev = rev;
+    st.job = job;
+    std::thread([job] {
+        LintInput li;
+        li.text = job->text.data(); li.n = job->text.size(); li.lang = job->lang; li.path = job->path;
+        lint_run(li, job->out);
+        job->done = true;
+    }).detach();
+}
+
+/* custom resources are checked against the CRDs of the workspace: scanned on a thread the first time a manifest of an unknown kind is seen */
+std::atomic<bool> g_crd_force{false}, g_crd_done{false}, g_crd_scanning{false};
+
+void crd_scan_start() {
+    if (g_crd_scanning.exchange(true)) return;
+    std::string root = E.tree.root().empty() && !E.docs.empty() && !E.docs[(size_t)E.active]->path.empty() ? E.docs[(size_t)E.active]->path.substr(0, E.docs[(size_t)E.active]->path.rfind('/')) : E.tree.root();
+    bool git = E.git.repo;
+    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    std::string cfg = xdg && *xdg ? std::string(xdg) : (home ? std::string(home) + "/.config" : std::string());
+    std::thread([root, git, cfg] {
+        std::vector<std::string> files;
+        if (!root.empty()) for (const std::string &f : list_workspace_files(root, git)) if (lintp::ends(f, ".yaml") || lintp::ends(f, ".yml")) files.push_back(f);
+        if (!cfg.empty()) for (const std::string &f : list_workspace_files(cfg + "/hootedit/crds", false)) if (lintp::ends(f, ".yaml") || lintp::ends(f, ".yml")) files.push_back(f);   /* CRDs you keep for every project */
+        lint_crd_build(files);
+        g_crd_done = true;
+        g_crd_scanning = false;
+        app_wake();
+    }).detach();
+}
+
+/* once per loop iteration: take finished background checks, start the one that is due */
+void lint_tick() {
+    if (g_crd_done.exchange(false)) { for (auto &kv : g_lint) kv.second.rev = ~0ull; redraw(); }   /* the CRDs are known now: check the manifests again */
+    if (lint_crd_wanted() || g_crd_force.exchange(false)) crd_scan_start();
+    if (!E.lint_on || E.docs.empty()) return;
+    Doc &d = D();
+    auto it = g_lint.find(&d);
+    if (it != g_lint.end() && it->second.job && it->second.job->done) {
+        LintState &st = it->second;
+        if (st.job->rev == d.buf.revision()) { st.d = std::move(st.job->out); lint_filter(st.d); st.rev = st.job->rev; lint_count(st); redraw(); }
+        st.job.reset();
+    }
+    if (d.dv || d.mv) return;
+    LintState &st = g_lint[&d];
+    if (st.rev == d.buf.revision()) { E.lint_at = 0; return; }
+    if (st.job && !st.job->done) { E.lint_at = E.now + 0.1; return; }
+    double due = std::max(E.last_active, 0.0) + (st.rev == ~0ull ? 0.0 : 0.35);   /* the first check of a file does not wait; later ones wait for a pause in typing */
+    if (E.now >= due) { E.lint_at = 0; lint_kick(d, false); }
+    else E.lint_at = due;
+}
+
+/* the diagnostics of a line: [first, last) indices in the sorted vector */
+std::pair<size_t, size_t> lint_line_range(const std::vector<Diag> &v, size_t line) {
+    size_t lo = 0, hi = v.size();
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (v[mid].line < line) lo = mid + 1; else hi = mid; }
+    size_t e = lo;
+    while (e < v.size() && v[e].line == line) e++;
+    return {lo, e};
+}
+
+uint32_t lint_color(int sev) { return sev == SEV_ERROR ? C_RED : sev == SEV_WARN ? C_ORANGE : sev == SEV_INFO ? C_ACCENT : C_UI_FAINT; }
+const char *lint_sev_name(int sev) { return sev == SEV_ERROR ? "error" : sev == SEV_WARN ? "warning" : sev == SEV_INFO ? "info" : "hint"; }
+
+void lint_squiggle(float x, float y, float w, uint32_t col) {
+    float step = std::max(2.f, 2.f * E.scale), th = std::max(1.f, E.scale);
+    int n = 0;
+    for (float px = x; px < x + w && n < 400; px += step, n++) r_rect(E.r, px, y + ((n & 1) ? 0.f : th), std::min(step, x + w - px), th, col);
+}
+
+const Diag *lint_at_cursor(Doc &d, LintState **stp = nullptr) {
+    if (!E.lint_on || d.dv || d.mv) return nullptr;
+    auto it = g_lint.find(&d);
+    if (it == g_lint.end()) return nullptr;
+    LintState &st = it->second;
+    if (st.rev != d.buf.revision() || st.d.empty()) return nullptr;
+    size_t line = d.buf.line_of(d.cur), col = d.cur - d.buf.line_start(line);
+    auto r = lint_line_range(st.d, line);
+    const Diag *best = nullptr;
+    for (size_t i = r.first; i < r.second; i++) {
+        const Diag &x = st.d[i];
+        if (col >= x.c0 && col <= x.c1) { if (!best || x.sev < best->sev) best = &x; }
+    }
+    if (!best && r.first < r.second) best = &st.d[r.first];
+    if (stp) *stp = &st;
+    return best;
+}
+
+void lint_jump(Doc &d, const Diag &x) {
+    size_t line = std::min<size_t>(x.line, d.buf.lines() - 1);
+    size_t pos = std::min(d.buf.line_start(line) + x.c0, d.buf.line_start(line) + d.buf.line_len(line));
+    d.break_group();
+    d.anchor = d.cur = pos;
+    d.want_col = d.col_of_byte(line, pos - d.buf.line_start(line));
+    E.follow = true;
+}
+
+void lint_next(int dir) {
+    Doc &d = D();
+    lint_kick(d, true);
+    const LintState *st = lint_state(d);
+    if (!st || st->d.empty()) { E.status_msg = "no problems"; return; }
+    size_t line = d.buf.line_of(d.cur), col = d.cur - d.buf.line_start(line);
+    const Diag *pick = nullptr;
+    if (dir > 0) { for (const Diag &x : st->d) if (x.line > line || (x.line == line && x.c0 > col)) { pick = &x; break; } if (!pick) pick = &st->d.front(); }
+    else { for (size_t i = st->d.size(); i-- > 0;) { const Diag &x = st->d[i]; if (x.line < line || (x.line == line && x.c0 < col)) { pick = &x; break; } } if (!pick) pick = &st->d.back(); }
+    lint_jump(d, *pick);
+    E.status_msg.clear();
+}
+
+void lint_problems_list() {
+    Doc &d = D();
+    lint_kick(d, true);
+    const LintState *st = lint_state(d);
+    if (!st || st->d.empty()) { E.status_msg = st && st->skipped ? "live checks are off for files over 24 MB" : "no problems found"; return; }
+    std::vector<Ed::PItem> items;
+    for (size_t i = 0; i < st->d.size() && i < 2000; i++) {
+        const Diag &x = st->d[i];
+        items.push_back({sfmt("%u:%u  %s  %s  %s", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str()), (int)i, false});
+    }
+    auto copy = std::make_shared<std::vector<Diag>>(st->d);
+    pick_custom("Problems (" + std::to_string(st->d.size()) + ")", items, [copy](const Ed::PItem &it) {
+        if ((size_t)it.id < copy->size()) { E.mode = M_EDIT; lint_jump(D(), (*copy)[(size_t)it.id]); }
+    });
+}
+
+/* fixes: replace bytes inside one line; many at once go bottom-up as one undo step */
+void lint_apply_fix(Doc &d, const Diag &x) {
+    size_t line = std::min<size_t>(x.line, d.buf.lines() - 1), ls0 = d.buf.line_start(line), len = d.buf.line_len(line);
+    size_t f0 = std::min<size_t>(x.f0, len), f1 = std::min<size_t>(x.f1, len);
+    d.replace(ls0 + f0, f1 - f0, x.fix.data(), x.fix.size());
+}
+
+void lint_quick_fix() {
+    Doc &d = D();
+    if (d.dv || d.mv) return;
+    lint_kick(d, true);
+    LintState *st = nullptr;
+    const Diag *x = lint_at_cursor(d, &st);
+    if (!x) { E.status_msg = "no problem at the cursor"; return; }
+    const Diag *with_fix = nullptr;
+    size_t line = d.buf.line_of(d.cur), col = d.cur - d.buf.line_start(line);
+    auto r = lint_line_range(st->d, line);
+    for (size_t i = r.first; i < r.second; i++) { const Diag &y = st->d[i]; if (y.has_fix && col >= y.c0 && col <= y.c1) { with_fix = &y; break; } }
+    if (!with_fix) for (size_t i = r.first; i < r.second; i++) if (st->d[i].has_fix) { with_fix = &st->d[i]; break; }
+    if (!with_fix) { E.status_msg = "no automatic fix for: " + x->msg; return; }
+    Diag copy = *with_fix;
+    d.break_group();
+    lint_apply_fix(d, copy);
+    d.break_group();
+    st->rev = ~0ull;
+    E.status_msg = "fixed: " + copy.code;
+    E.follow = true;
+}
+
+void lint_fix_all() {
+    Doc &d = D();
+    if (d.dv || d.mv) return;
+    lint_kick(d, true);
+    LintState *st = nullptr;
+    auto it = g_lint.find(&d);
+    if (it == g_lint.end()) return;
+    st = &it->second;
+    std::vector<Diag> fixes;
+    for (const Diag &x : st->d) if (x.has_fix) fixes.push_back(x);
+    if (fixes.empty()) { E.status_msg = "nothing to fix automatically"; return; }
+    std::sort(fixes.begin(), fixes.end(), [](const Diag &a, const Diag &b) { return a.line != b.line ? a.line > b.line : a.f0 > b.f0; });
+    size_t cur = d.cur, applied = 0;
+    d.break_group();
+    uint32_t last_line = ~0u, last_f0 = ~0u;
+    for (const Diag &x : fixes) {
+        if (x.line == last_line && x.f1 > last_f0) continue;   /* overlaps the fix to its right */
+        lint_apply_fix(d, x);
+        last_line = x.line; last_f0 = x.f0;
+        applied++;
+    }
+    d.break_group();
+    d.anchor = d.cur = std::min(cur, d.buf.size());
+    st->rev = ~0ull;
+    E.status_msg = sfmt("applied %zu fix%s", applied, applied == 1 ? "" : "es");
+}
+
+/* Insert Ansible Task / Insert Kubernetes Resource: a list of correct skeletons; a task goes in at the current list position, a resource as a new YAML document */
+void template_insert(bool k8s) {
+    const auto &tp = k8s ? k8s_templates() : ansible_templates();
+    std::vector<Ed::PItem> items;
+    for (size_t i = 0; i < tp.size(); i++) items.push_back({tp[i].label, (int)i, false});
+    pick_custom(k8s ? "Kubernetes: Insert Resource" : "Ansible: Insert Task", items, [k8s](const Ed::PItem &it) {
+        const auto &tpl = k8s ? k8s_templates() : ansible_templates();
+        if ((size_t)it.id >= tpl.size()) return;
+        E.mode = M_EDIT;
+        Doc &d = D();
+        size_t line = d.buf.line_of(d.cur), ls0 = d.buf.line_start(line);
+        std::string cur_line;
+        d.buf.line_text(line, cur_line);
+        bool blank = cur_line.find_first_not_of(" \t") == std::string::npos;
+        std::string src = tpl[(size_t)it.id].text;
+        d.break_group();
+        if (k8s) {   /* a resource is a whole document: into an empty line as it is, otherwise after the current document under a --- line */
+            bool empty_doc = d.buf.size() == 0;
+            std::string text = (blank || empty_doc) ? src : "---\n" + src;
+            size_t at = blank ? ls0 : std::min(d.buf.size(), ls0 + cur_line.size() + (line + 1 < d.buf.lines() ? 1 : 0));
+            if (!blank && line + 1 >= d.buf.lines()) text = "\n" + text;
+            d.replace(at, 0, text.data(), text.size());
+            d.break_group();
+            E.follow = true;
+            touch();
+            return;
+        }
+        std::string indent = cur_line.substr(0, cur_line.find_first_not_of(" \t") == std::string::npos ? cur_line.size() : cur_line.find_first_not_of(" \t"));
+        if (!blank) {   /* a task below the current one: same indentation as the current list item */
+            size_t dash = cur_line.find("- ");
+            if (dash != std::string::npos && dash == indent.size()) indent = cur_line.substr(0, dash);
+        }
+        std::string text;
+        size_t pos = 0;
+        bool first = true;
+        while (pos < src.size()) {
+            size_t nl = src.find('\n', pos);
+            std::string ln = src.substr(pos, nl - pos);
+            text += (first && blank ? std::string() : indent) + ln + "\n";
+            first = false;
+            pos = nl + 1;
+        }
+        size_t at = blank ? ls0 + indent.size() : d.buf.line_start(line) + cur_line.size();
+        if (!blank) text = "\n" + text.substr(0, text.size() - 1);
+        d.replace(at, 0, text.data(), text.size());
+        d.break_group();
+        if (!blank) d.anchor = d.cur = d.buf.line_start(std::min(line + 1, d.buf.lines() - 1)) + indent.size() + 8;
+        E.follow = true;
+        touch();
+    });
+}
+
+/* ---- outline: a cheap symbol scan of the active file (no parser): types, functions, markdown headings ---- */
+
+struct OutlineCache { const Doc *d = nullptr; uint64_t rev = 0; std::vector<OItem> items; } g_outline;
+
+const std::vector<OItem> &outline_for(const Doc &d) {
+    if (g_outline.d != &d || g_outline.rev != d.buf.revision()) { g_outline.d = &d; g_outline.rev = d.buf.revision(); outline_scan(d, g_outline.items); }
+    return g_outline.items;
+}
+
+void draw_sidebar(const Layout &L) {
+    float sw = (float)L.side_x1, top = (float)L.menu_h, bot = (float)L.bar_y;
+    float rail = (float)S(29);
+    r_rect(E.r, 0, top, sw, bot - top, C_CHROME);
+    r_rect(E.r, rail, top, 1, bot - top, C_BORDER);
+    r_rect(E.r, sw - 1, top, 1, bot - top, C_BORDER);
+    hit(0, top, sw, bot - top, H_SIDEBAR, 0);
+
+    /* rail: pin on top, then the rotated tabs */
+    float pb = (float)S(20), pbx = (rail - pb) / 2, pby = top + (float)S(8);
+    r_rect(E.r, pbx, pby, pb, pb, E.pinned ? C_ACCENT : C_BORDER);
+    r_rect(E.r, pbx + 1, pby + 1, pb - 2, pb - 2, E.pinned ? C_ACCENT : hovered(H_PIN, 0) ? C_HOVER : C_CHROME);
+    draw_icon(IC_PIN, pbx + (pb - (float)S(14)) / 2, pby + (pb - (float)S(14)) / 2, S(14), E.pinned ? C_EDITOR : C_UI_DIM);
+    hit(0, top, rail, pby - top + pb + (float)S(4), H_PIN, 0);
+    float ty = pby + pb + (float)S(14);
+    const char *names[4] = {"FILES", "SEARCH", "GIT", "REMOTE"};
+    for (int i = 0; i < 4; i++) {
+        const AtlasGlyph *g = vlabel(names[i], E.ui, FS_BOLD);
+        if (!g) continue;
+        bool badge = i == 2 && E.git.repo && !E.git.changes.empty();
+        float th = (float)g->h + (float)S(28) + (badge ? (float)S(18) : 0.f);
+        bool on = (int)E.view == i;
+        if (on) { r_rect(E.r, 0, ty, rail, th, C_SELROW); r_rect(E.r, 0, ty, (float)S(2), th, C_ACCENT); }
+        else if (hovered(H_ACTIVITY, i)) r_rect(E.r, 0, ty, rail, th, C_HOVER);
+        RInst inst;
+        r_make_glyph(E.r, &inst, g, (rail - (float)g->w) / 2 + 1, ty + ((th - (badge ? (float)S(18) : 0.f)) - (float)g->h) / 2, on ? C_ACCENT : C_UI_DIM);
+        r_push(E.r, &inst, 1);
+        if (badge) {
+            std::string nb = std::to_string(E.git.changes.size());
+            float bw = std::max((float)S(16), text_width(E.ui, nb.c_str()) + (float)S(8));
+            draw_badge((rail + bw) / 2, ty + th - (float)S(22), (float)S(16), (int)E.git.changes.size(), C_ACCENT, C_ON_ACCENT);
+        }   /* how many files changed, like the badge on VS Code's source control icon */
+        hit(0, ty, rail, th, H_ACTIVITY, i);
+        ty += th + (float)S(2);
+    }
+
+    {   /* the settings cog at the foot of the rail, like VS Code's manage icon */
+        float gs = (float)S(18), gy = bot - gs - (float)S(12), gx = (rail - gs) / 2;
+        bool on = E.mode == M_SETTINGS;
+        if (on) r_rect(E.r, 0, gy - (float)S(6), rail, gs + (float)S(12), C_SELROW);
+        else if (hovered(H_SETCOG, 0)) r_rect(E.r, 0, gy - (float)S(6), rail, gs + (float)S(12), C_HOVER);
+        draw_icon(IC_GEAR, gx, gy, S(18), on ? C_ACCENT : C_UI_DIM);
+        hit(0, gy - (float)S(6), rail, gs + (float)S(12), H_SETCOG, 0);
+    }
+
+    /* content: filter box with a "+" and the grouped list */
+    float cx = rail + (float)S(10), cw = sw - cx - (float)S(10);
+    float y = top + (float)S(8);
+    bool files_view = E.view == V_EXPLORER, search_view = E.view == V_SEARCH;
+    if (files_view || search_view) {
+        float plus_w = files_view ? (float)S(32) : 0.f, bh = (float)S(28);
+        float bw = cw - (files_view ? plus_w + (float)S(6) : 0.f);
+        bool foc = E.mode == M_SIDE;
+        r_rect(E.r, cx, y, bw, bh, foc ? C_ACCENT : C_FIELD);
+        r_rect(E.r, cx + 1, y + 1, bw - 2, bh - 2, C_FIELD);
+        float tw_ = search_view ? (float)S(26) * 3 + (float)S(6) : 0.f;   /* room for the three toggles inside the box */
+        const std::string &qs = search_view ? E.sq : E.side_q;
+        float pen = draw_text(E.ui, cx + (float)S(10), ui_base(y, bh), qs.c_str(), C_UI, bw - (float)S(20) - tw_);
+        if (qs.empty()) draw_text(E.ui, cx + (float)S(10), ui_base(y, bh), search_view ? "Search in files" : "Search files", C_UI_DIM, bw - (float)S(20) - tw_);
+        if (foc && E.blink_on) r_rect(E.r, pen, y + (float)S(6), std::max(1.f, E.scale), bh - (float)S(12), C_CURSOR);
+        hit(cx, y, bw - tw_, bh, H_SIDEBOX, 0);
+        if (search_view) {
+            const char *lab[3] = {"Aa", ".*", "ab"};
+            int ids[3] = {A_TOG_CASE, A_TOG_REGEX, A_TOG_WORD};
+            bool on[3] = {E.sq_case, E.sq_regex, E.sq_word};
+            float tx = cx + bw - tw_ + (float)S(3), th = bh - (float)S(8);
+            for (int k = 0; k < 3; k++) {
+                float w = (float)S(24);
+                if (on[k]) r_rect(E.r, tx, y + (float)S(4), w, th, C_ACCENT);
+                else if (hovered(H_ACT, ids[k])) r_rect(E.r, tx, y + (float)S(4), w, th, C_HOVER);
+                float lw2 = text_width(E.ui, lab[k]);
+                draw_text(E.ui, tx + (w - lw2) / 2, ui_base(y + (float)S(4), th), lab[k], on[k] ? C_ON_ACCENT : C_UI_DIM, w);
+                hit(tx, y + (float)S(4), w, th, H_ACT, ids[k]);
+                tx += w + (float)S(2);
+            }
+        }
+        if (files_view) {
+            float px = cx + bw + (float)S(6);
+            r_rect(E.r, px, y, plus_w, bh, hovered(H_ACT, A_NEW) ? C_HOVER : C_CHROME);
+            float pl = (float)S(12), pcx = px + plus_w / 2, pcy = y + bh / 2;
+            r_rect(E.r, pcx - pl / 2, pcy - 0.75f * E.scale, pl, std::max(1.5f, 1.5f * E.scale), C_UI);
+            r_rect(E.r, pcx - 0.75f * E.scale, pcy - pl / 2, std::max(1.5f, 1.5f * E.scale), pl, C_UI);
+            hit(px, y, plus_w, bh, H_ACT, A_NEW);
+        }
+        y += bh + (float)S(8);
+        if (search_view) {
+            std::string st;
+            uint32_t sc = C_UI_FAINT;
+            if (!E.s_active) st = "Type to search every file in the workspace";
+            else if (!E.sstat.error.empty()) { st = "pattern: " + E.sstat.error; sc = C_RED; }
+            else st = sfmt("%llu results in %llu files   %.1f ms%s%s", (unsigned long long)E.sstat.hits, (unsigned long long)E.sstat.files_with_hits, E.sstat.ms,
+                           E.sstat.truncated ? "   (capped)" : "", E.sstat.done ? "" : "   searching...");
+            draw_text(E.ui, cx, ui_base(y, (float)S(20)), st.c_str(), sc, cw);
+            if (E.s_active && E.sstat.done && E.sstat.error.empty()) {
+                std::string st2 = sfmt("%llu files, %.0f MB scanned", (unsigned long long)E.sstat.files_scanned, (double)E.sstat.bytes / 1e6);
+                draw_text(E.ui, cx, ui_base(y + (float)S(18), (float)S(20)), st2.c_str(), C_UI_FAINT, cw);
+                y += (float)S(18);
+            }
+            y += (float)S(26);
+        } else y += (float)S(4);
+    } else {
+        y += (float)S(4);
+    }
+    float list_top = y;
+    r_clip(E.r, (int)(rail + 1), (int)list_top, (int)(sw - rail - 2), (int)(bot - list_top));
+    float rowh = (float)S(28), ry = y - E.side_scroll;
+    auto group = [&](const std::string &name, bool chev, bool open, int hit_kind) {
+        draw_text(E.ui, cx + (chev ? (float)S(18) : 0.f), ui_base(ry, (float)S(24)), name.c_str(), C_GROUP, cw);
+        if (chev) draw_icon(open ? IC_CHEV_D : IC_CHEV_R, cx - (float)S(4), ry + ((float)S(24) - (float)S(16)) / 2, S(16), C_GROUP);
+        if (hit_kind) hit(rail + 1, ry, sw - rail - 2, (float)S(24), hit_kind, 0);
+        ry += (float)S(26);
+    };
+    if (search_view) {
+        const std::vector<std::string> &fl = E.search.files();
+        size_t rl = E.tree.root().size() + 1;
+        float rh = (float)S(24);
+        for (size_t i = 0; i < E.srows.size(); i++, ry += rh) {
+            if (ry + rh < list_top || ry > bot) continue;
+            const Ed::SRow &row = E.srows[i];
+            if (row.hit < 0) {
+                const std::string &path = fl[(size_t)row.file];
+                std::string rel = path.substr(std::min(rl, path.size()));
+                size_t sl = rel.rfind('/');
+                std::string base = sl == std::string::npos ? rel : rel.substr(sl + 1), dir = sl == std::string::npos ? "" : rel.substr(0, sl);
+                r_rect(E.r, rail + 1, ry, sw - rail - 2, rh, C_SELROW);
+                float pen = draw_text(E.ui, cx, ui_base(ry, rh), base.c_str(), C_UI, cw - (float)S(40), FS_BOLD);
+                if (!dir.empty()) draw_text(E.ui, pen + (float)S(8), ui_base(ry, rh), dir.c_str(), C_UI_FAINT, sw - pen - (float)S(48));
+                std::string cnt = std::to_string(row.count);
+                draw_text(E.ui, sw - (float)S(14) - text_width(E.ui, cnt.c_str()), ui_base(ry, rh), cnt.c_str(), C_UI_DIM, (float)S(40));
+                hit(rail + 1, ry, sw - rail - 2, rh, H_SRES, (int)i);
+                continue;
+            }
+            const SearchHit &h = E.sres[(size_t)row.hit];
+            if ((int)i == E.sel_hit) r_rect(E.r, rail + 1, ry, sw - rail - 2, rh, C_MENU_SEL);
+            else if (hovered(H_SRES, (int)i)) r_rect(E.r, rail + 1, ry, sw - rail - 2, rh, C_HOVER);
+            std::string num = std::to_string(h.line);
+            draw_text(E.ui, cx + (float)S(30) - text_width(E.ui, num.c_str()), ui_base(ry, rh), num.c_str(), C_UI_FAINT, (float)S(40));
+            size_t t0 = 0;
+            while (t0 < h.ms && (h.text[t0] == ' ' || h.text[t0] == '\t')) t0++;     /* indentation is noise in a narrow list */
+            std::string prefix;
+            size_t sh0 = t0;
+            if (h.ms > t0 + 18) { sh0 = h.ms - 14; prefix = "..."; }                  /* keep the match inside the visible width */
+            std::string shown = prefix + h.text.substr(sh0);
+            size_t ms2 = prefix.size() + (h.ms - sh0), me2 = prefix.size() + (std::min<size_t>(h.me, h.text.size()) - sh0);
+            float x0 = cx + (float)S(40);
+            float xa = x0 + text_width(E.ui, shown.substr(0, ms2).c_str()), xb = xa + text_width(E.ui, shown.substr(ms2, me2 > ms2 ? me2 - ms2 : 0).c_str());
+            if (xb > xa) r_rect(E.r, xa, ry + (float)S(3), std::min(xb, sw - (float)S(6)) - xa, rh - (float)S(6), ui_mix(C_CHROME, C_ACCENT, 0.45f));
+            draw_text(E.ui, x0, ui_base(ry, rh), shown.c_str(), C_UI, sw - x0 - (float)S(6));
+            hit(rail + 1, ry, sw - rail - 2, rh, H_SRES, (int)i);
+        }
+        float content = (ry + E.side_scroll) - list_top;
+        float maxs = std::max(0.f, content - (bot - list_top) + rh);
+        if (E.side_scroll > maxs) E.side_scroll = maxs;
+    } else if (files_view && !E.side_q.empty()) {
+        group(sfmt("RESULTS  %zu", E.side_hits.size()), false, true, 0);
+        size_t rl = E.tree.root().size() + 1;
+        for (size_t i = 0; i < E.side_hits.size(); i++, ry += rowh) {
+            if (ry + rowh < list_top || ry > bot) continue;
+            if (hovered(H_SIDEHIT, (int)i)) r_rect(E.r, rail + 1, ry, sw - rail - 2, rowh, C_HOVER);
+            std::string rel = E.side_hits[i].substr(std::min(rl, E.side_hits[i].size()));
+            size_t sl = rel.rfind('/');
+            std::string base = sl == std::string::npos ? rel : rel.substr(sl + 1), dir = sl == std::string::npos ? "" : rel.substr(0, sl);
+            const std::vector<int> &ps = i < E.side_pos.size() ? E.side_pos[i] : std::vector<int>();
+            float pen = draw_text_hl(E.ui, cx + (float)S(14), ui_base(ry, rowh), base, ps, (int)(sl == std::string::npos ? 0 : sl + 1), C_UI, C_ACCENT, cw - (float)S(14));
+            if (!dir.empty()) draw_text_hl(E.ui, pen + (float)S(8), ui_base(ry, rowh), dir, ps, 0, C_UI_FAINT, C_ACCENT, sw - pen - (float)S(18));
+            hit(rail + 1, ry, sw - rail - 2, rowh, H_SIDEHIT, (int)i);
+        }
+    } else if (files_view) {
+        float orh = (float)S(24);
+        auto section = [&](const std::string &label, bool open, int id) {
+            float y0 = ry;
+            group(label, true, open, 0);
+            hit(rail + 1, y0, sw - rail - 2, (float)S(24), H_SECT, id);
+        };
+        if (E.docs.size() > 1 || !D().pristine()) {   /* OPEN EDITORS: every tab, with the unsaved mark and a close button */
+            section(sfmt("OPEN EDITORS  %zu", E.docs.size()), E.opened_open, 0);
+            if (E.opened_open) {
+                size_t rl = E.tree.root().size() + 1;
+                for (size_t i = 0; i < E.docs.size(); i++, ry += orh) {
+                    if (ry + orh < list_top || ry > bot) continue;
+                    const Doc &dd = *E.docs[i];
+                    bool cur = (int)i == E.active, hv = hovered(H_OPENED, (int)i) || hovered(H_TABCLOSE, 1000 + (int)i);
+                    if (cur) { r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_SELROW); r_rect(E.r, rail + 1, ry, (float)S(2), orh, C_ACCENT); }
+                    else if (hv) r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_HOVER);
+                    float cxr = sw - (float)S(30);
+                    std::string nm = dd.name();
+                    float pen = draw_text(E.ui, cx + (float)S(14), ui_base(ry, orh), nm.c_str(), cur ? C_ACCENT : C_UI, cxr - cx - (float)S(14), dd.preview ? FS_ITALIC : FS_REGULAR);
+                    if (!dd.path.empty() && !dd.title.size()) {
+                        std::string rel = dd.path.size() > rl && dd.path.compare(0, rl, E.tree.root() + "/") == 0 ? dd.path.substr(rl) : dd.path;
+                        size_t sl = rel.rfind('/');
+                        if (sl != std::string::npos && cxr - pen - (float)S(16) > (float)S(30)) draw_text(E.ui, pen + (float)S(8), ui_base(ry, orh), rel.substr(0, sl).c_str(), C_UI_FAINT, cxr - pen - (float)S(12));
+                    }
+                    bool mod = dd.modified();
+                    float ix = sw - (float)S(26), iy = ry + (orh - (float)S(16)) / 2;
+                    if (mod && !hovered(H_TABCLOSE, 1000 + (int)i)) draw_icon(IC_DOT, ix, iy, S(16), C_UI);
+                    else if (hv || cur) draw_icon(IC_CLOSE, ix, iy, S(16), hovered(H_TABCLOSE, 1000 + (int)i) ? C_UI : C_UI_DIM);
+                    hit(rail + 1, ry, sw - rail - 2 - (float)S(30), orh, H_OPENED, (int)i);
+                    hit(sw - (float)S(30), ry, (float)S(30), orh, H_TABCLOSE, 1000 + (int)i);
+                }
+            }
+        }
+        if (E.outline_on && !D().dv && !D().mv) {   /* OUTLINE: symbols of the active file, click to jump */
+            const std::vector<OItem> &oi = outline_for(D());
+            section(sfmt("OUTLINE  %zu", oi.size()), E.outline_open, 1);
+            if (E.outline_open) {
+                if (oi.empty()) { draw_text(E.ui, cx + (float)S(14), ui_base(ry, orh), "No symbols found", C_UI_FAINT, cw); ry += orh; }
+                size_t curline = D().buf.line_of(D().cur);
+                long here = -1;
+                for (size_t i = 0; i < oi.size(); i++) if (oi[i].line <= curline) here = (long)i;
+                for (size_t i = 0; i < oi.size(); i++, ry += orh) {
+                    if (ry + orh < list_top || ry > bot) continue;
+                    if ((long)i == here) { r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_SELROW); r_rect(E.r, rail + 1, ry, (float)S(2), orh, C_ACCENT); }
+                    else if (hovered(H_OUTLINE, (int)i)) r_rect(E.r, rail + 1, ry, sw - rail - 2, orh, C_HOVER);
+                    const OItem &it = oi[i];
+                    float x = cx + (float)S(14 + 12 * it.depth);
+                    const char *tag = it.kind == 'C' ? "C" : it.kind == 'H' ? "#" : "f";
+                    uint32_t tc = it.kind == 'C' ? C_ORANGE : it.kind == 'H' ? C_UI_DIM : C_ACCENT;
+                    draw_text(E.ui, x, ui_base(ry, orh), tag, tc, (float)S(14), FS_BOLD);
+                    draw_text(E.ui, x + (float)S(16), ui_base(ry, orh), it.name.c_str(), (long)i == here ? C_ACCENT : C_UI, sw - x - (float)S(24));
+                    hit(rail + 1, ry, sw - rail - 2, orh, H_OUTLINE, (int)i);
+                }
+            }
+        }
+        std::string name = E.tree.root_name();
+        for (char &c : name) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        group(name, true, E.root_open, H_ROOT);
+        if (E.root_open) {
+            const std::vector<Tree::Row> &rows = E.tree.rows();
+            const float tree_y0 = ry;
+            for (size_t i = 0; i < rows.size(); i++, ry += rowh) {
+                if (ry + rowh < list_top || ry > bot) continue;
+                const Tree::Row &r = rows[i];
+                int open_idx = -1;
+                for (size_t k = 0; k < E.docs.size(); k++) if (!r.dir && E.docs[k]->path == r.path) open_idx = (int)k;
+                bool cur = open_idx == E.active;
+                if (cur) { r_rect(E.r, rail + 1, ry, sw - rail - 2, rowh, C_SELROW); r_rect(E.r, rail + 1, ry, (float)S(2), rowh, C_ACCENT); }
+                else if (hovered(H_TREE, (int)i)) r_rect(E.r, rail + 1, ry, sw - rail - 2, rowh, C_HOVER);
+                float x = cx + (float)S(14 * r.depth);
+                float tx = x + (float)S(r.dir ? 18 : 14);
+                if (r.dir) draw_icon(r.expanded ? IC_CHEV_D : IC_CHEV_R, x - (float)S(2), ry + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+                else if (open_idx >= 0) draw_dot(x + (float)S(3), ry + rowh / 2, S(10), E.docs[(size_t)open_idx]->modified() ? C_ORANGE : C_GREEN);   /* open in a tab; orange = unsaved edits */
+                char gs = 0;
+                { auto di = E.deco.find(r.path); if (di != E.deco.end()) gs = di->second; }
+                if (r.ghost) gs = 'D';
+                uint32_t ncol = cur ? C_ACCENT : gs ? status_color(gs) : C_UI;
+                float badge_w = gs && !r.dir ? (float)S(22) : gs ? (float)S(18) : 0.f;
+                float nx = tx + (float)S(open_idx >= 0 && !r.dir ? 4 : 0);
+                float npen = draw_text(E.ui, nx, ui_base(ry, rowh), r.name.c_str(), ncol, sw - tx - (float)S(8) - badge_w);
+                if (r.ghost) r_rect(E.r, nx, ry + rowh / 2, std::max(0.f, npen - nx), std::max(1.f, E.scale), ncol);   /* struck through: deleted */
+                if (gs && !r.dir) draw_text(E.ui, sw - (float)S(18), ui_base(ry, rowh), status_letter(gs), ncol, (float)S(14), FS_BOLD);
+                else if (gs) draw_dot(sw - (float)S(14), ry + rowh / 2, S(8), ncol);
+                hit(rail + 1, ry, sw - rail - 2, rowh, H_TREE, (int)i);
+            }
+            /* sticky folders: the parents of the first visible row stay pinned under the filter box while you scroll a long folder */
+            if (tree_y0 < list_top && !rows.empty()) {
+                std::vector<size_t> chain;
+                for (int pass = 0; pass < 4; pass++) {
+                    size_t f = (size_t)std::max(0.f, std::ceil((list_top + (float)chain.size() * rowh - tree_y0) / rowh));
+                    if (f >= rows.size()) { chain.clear(); break; }
+                    std::vector<size_t> c2;
+                    int dpt = rows[f].depth;
+                    for (size_t j = f; j-- > 0 && dpt > 0;) if (rows[j].dir && rows[j].depth < dpt) { dpt = rows[j].depth; if (tree_y0 + (float)j * rowh < list_top + (float)c2.size() * 0.f) c2.push_back(j); }
+                    std::reverse(c2.begin(), c2.end());
+                    if (c2.size() > 3) c2.erase(c2.begin(), c2.end() - 3);
+                    if (c2.size() == chain.size()) { chain = c2; break; }
+                    chain = c2;
+                }
+                for (size_t k = 0; k < chain.size(); k++) {
+                    const Tree::Row &r = rows[chain[k]];
+                    float sy = list_top + (float)k * rowh, x = cx + (float)S(14 * r.depth);
+                    r_rect(E.r, rail + 1, sy, sw - rail - 2, rowh, C_CHROME);
+                    if (hovered(H_TREE, (int)chain[k])) r_rect(E.r, rail + 1, sy, sw - rail - 2, rowh, C_HOVER);
+                    draw_icon(IC_CHEV_D, x - (float)S(2), sy + (rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+                    draw_text(E.ui, x + (float)S(18), ui_base(sy, rowh), r.name.c_str(), C_UI, sw - x - (float)S(26), FS_BOLD);
+                    if (k + 1 == chain.size()) r_rect(E.r, rail + 1, sy + rowh - 1, sw - rail - 2, 1, C_BORDER);
+                    hit(rail + 1, sy, sw - rail - 2, rowh, H_TREE, (int)chain[k]);
+                }
+            }
+        }
+        float content = (ry + E.side_scroll) - list_top;
+        float maxs = std::max(0.f, content - (bot - list_top) + rowh);
+        if (E.side_scroll > maxs) E.side_scroll = maxs;
+    } else if (E.view == V_REMOTE) {
+        draw_remote_view(rail, sw, cx, cw, list_top, bot, ry);
+        float content = (ry + E.side_scroll) - list_top;
+        float maxs = std::max(0.f, content - (bot - list_top) + (float)S(20));
+        if (E.side_scroll > maxs) E.side_scroll = maxs;
+    } else if (!E.git.repo) {
+        draw_text(E.ui, cx, ui_base(ry, rowh), E.git.available ? "No git repository here" : "git is not installed", C_UI, cw, FS_BOLD);
+        if (E.git.available) {
+            draw_text(E.ui, cx, ui_base(ry + rowh, rowh), "Open a folder, or a file,", C_UI_DIM, cw);
+            draw_text(E.ui, cx, ui_base(ry + rowh * 2 - (float)S(4), rowh), "that is inside a repository.", C_UI_DIM, cw);
+        }
+    } else {
+        draw_git_view(rail, sw, cx, cw, list_top, bot, ry);
+        float content = (ry + E.side_scroll) - list_top;
+        float maxs = std::max(0.f, content - (bot - list_top) + (float)S(20));
+        if (E.side_scroll > maxs) E.side_scroll = maxs;
+    }
+    r_clip_off(E.r);
+}
+
+
+/* ---- the diff tab: side by side or inline, folded unchanged regions, change navigation ---- */
+
+int diff_rows_visible(const Layout &L) { return std::max(1, (L.ed_bottom - L.text_y - S(30)) / E.rowh); }
+
+void diff_clamp(DiffView &v, const Layout &L) {
+    long maxtop = std::max<long>(0, (long)v.vrows.size() - 1);
+    if (v.top < 0) v.top = 0;
+    if (v.top > maxtop) v.top = maxtop;
+    (void)L;
+}
+
+void diff_goto_change(DiffView &v, int k, const Layout &L) {
+    if (v.vdirty) diff_layout(v, v.vinline);
+    if (k < 0 || (size_t)k >= v.change_v.size() || v.change_v[(size_t)k] < 0) return;
+    v.cur_change = k;
+    v.top = std::max<long>(0, v.change_v[(size_t)k] - diff_rows_visible(L) / 3);
+    diff_clamp(v, L);
+}
+
+void diff_step(DiffView &v, int dir, const Layout &L) {
+    if (v.m.hunks.empty()) return;
+    int n = (int)v.m.hunks.size();
+    int k = v.cur_change < 0 ? (dir > 0 ? 0 : n - 1) : (v.cur_change + dir + n) % n;
+    diff_goto_change(v, k, L);
+}
+
+/* one line of code with syntax colours at (x, y): `left` columns scrolled off, at most `cols` shown */
+void emit_code(float x, float y, const std::string &text, int left, int cols, const Lang *lang, uint8_t state) {
+    static std::vector<RInst> v;
+    v.clear();
+    if (E.tok.size() < text.size() + 1) E.tok.resize(text.size() + 64);
+    if (lang != lang_plain()) lex_line(lang, text.data(), text.size(), state, E.tok.data());
+    else memset(E.tok.data(), 0, text.size());
+    int col = 0;
+    for (size_t i = 0; i < text.size() && col < left + cols;) {
+        size_t a, i0 = i;
+        uint32_t cp = u8_decode(text.data() + i, text.size() - i, &a);
+        i += a;
+        if (cp == '\t') { col = (col / TAB_W + 1) * TAB_W; continue; }
+        if (col >= left && cp != ' ') {
+            const AtlasGlyph *g = atlas_glyph(E.atlas, E.font, cp, FS_REGULAR);
+            if (g && !g->blank) { RInst inst; r_make_glyph(E.r, &inst, g, (float)((col - left) * E.cw), (float)E.rowasc, TOKCOL[E.tok[i0]]); v.push_back(inst); }
+        }
+        col++;
+    }
+    if (!v.empty()) r_push_at(E.r, v.data(), (int)v.size(), x, y);
+}
+
+void draw_diff(const Layout &L, float ex, float ew) {
+    Doc &d = D();
+    DiffView &v = *d.dv;
+    const float tb_h = (float)S(30), body_y = (float)L.text_y + tb_h;
+    const int rows = diff_rows_visible(L);
+    bool inl = v.mode == 2 || (v.mode == 0 && ew < (float)S(900));
+    if (v.vdirty || v.vinline != inl) diff_layout(v, inl);
+    if (v.top < 0) { v.top = 0; if (v.cur_change >= 0) diff_goto_change(v, v.cur_change, L); }
+    diff_clamp(v, L);
+    const DiffModel &m = v.m;
+
+    /* toolbar: what is compared, the change counter and the buttons */
+    r_rect(E.r, ex, (float)L.text_y, ew, tb_h, C_CHROME);
+    r_rect(E.r, ex, (float)L.text_y + tb_h - 1, ew, 1, C_BORDER);
+    float by = (float)L.text_y + (tb_h - (float)S(22)) / 2, bh = (float)S(22), rx = ex + ew - (float)S(10);
+    auto button = [&](int id, const char *label, Icon ic, bool has_icon) {
+        float tw = label ? text_width(E.ui, label) : 0.f;
+        float w = (float)S(12) + (has_icon ? (float)S(16) : 0.f) + (label ? tw + (has_icon ? (float)S(4) : 0.f) : 0.f);
+        float x = rx - w;
+        if (hovered(H_DIFFBTN, id)) r_rect(E.r, x, by, w, bh, C_HOVER);
+        float px = x + (float)S(6);
+        if (has_icon) { draw_icon(ic, px, by + (bh - (float)S(16)) / 2, S(16), C_UI_DIM); px += (float)S(20); }
+        if (label) draw_text(E.ui, px, ui_base(by, bh), label, C_UI_DIM, tw + 2);
+        hit(x, by, w, bh, H_DIFFBTN, id);
+        rx = x - (float)S(2);
+    };
+    button(3, "Open File", IC_OPEN_FILE, true);
+    if (v.right_rev == "WORK" && (v.left_rev == ":" || v.left_rev.empty())) { button(5, "Revert Change", IC_UNDO, true); button(4, "Stage Change", IC_PLUS, true); }
+    else if (v.left_rev == "HEAD" && v.right_rev == ":") button(6, "Unstage Change", IC_MINUS, true);
+    button(2, v.vinline ? "Side by side" : "Inline", IC_FILE, false);
+    button(1, nullptr, IC_ARROW_D, true);
+    button(0, nullptr, IC_ARROW_U, true);
+    {
+        std::string cnt = m.hunks.empty() ? "no changes" : v.cur_change >= 0 ? sfmt("change %d of %zu", v.cur_change + 1, m.hunks.size()) : sfmt("%zu change%s", m.hunks.size(), m.hunks.size() == 1 ? "" : "s");
+        float cw2 = text_width(E.ui, cnt.c_str());
+        draw_text(E.ui, rx - cw2 - (float)S(6), ui_base(by, bh), cnt.c_str(), C_UI_FAINT, cw2 + 2);
+        rx -= cw2 + (float)S(16);
+    }
+    {
+        std::string lab = v.left_label + "  \xE2\x86\x94  " + v.right_label;
+        float lw = draw_text(E.ui, ex + (float)S(12), ui_base(by, bh), lab.c_str(), C_UI, std::max(0.f, rx - ex - (float)S(24)), FS_BOLD);
+        if (!v.info.empty() && lw + (float)S(30) < rx) draw_text(E.ui, lw + (float)S(14), ui_base(by, bh), v.info.c_str(), C_UI_FAINT, rx - lw - (float)S(20));
+    }
+
+    if (v.binary || v.too_big || m.hunks.empty()) {
+        const char *msg = v.binary ? "Binary files differ" : v.too_big ? "File too large to compare" : "No differences: both sides are identical";
+        float w = text_width(E.big, msg);
+        draw_text(E.big, ex + (ew - w) / 2, body_y + (float)S(80), msg, C_UI_FAINT, ew);
+        return;
+    }
+
+    int nd = 1;
+    for (size_t n = std::max(m.a.size(), m.b.size()); n >= 10; n /= 10) nd++;
+    const float numw = (float)((nd + 2) * E.cw);
+    const float half = v.vinline ? ew : (ew - 1) / 2;
+    const float tx_a = ex + numw + (float)S(6), tx_b = ex + half + 1 + numw + (float)S(6);   /* text origin: left column, right column */
+    const float itx = ex + 2 * numw + (float)S(6);                                           /* inline */
+    const int cols = std::max(1, (int)((v.vinline ? ew - 2 * numw - (float)S(24) : half - numw - (float)S(24)) / (float)E.cw));
+    int nrows = (int)std::min<long>(rows, (long)v.vrows.size() - v.top);
+
+    auto number = [&](float x0, int line, uint32_t col, float y) {
+        if (line < 0) return;
+        char nb[24];
+        snprintf(nb, sizeof nb, "%d", line + 1);
+        draw_text(E.font, x0 + (numw - (float)S(14) - (float)(strlen(nb) * (size_t)E.cw)) / 2 + (float)S(2), y + (float)E.rowasc, nb, col, numw);
+    };
+    auto range_rect = [&](float tx, const std::string &t, int b0, int b1, uint32_t col, float y) {
+        int c0 = std::max(0, col_of(t, (size_t)b0) - v.left), c1 = std::min(cols, col_of(t, (size_t)b1) - v.left);
+        if (c1 > c0) r_rect(E.r, tx + (float)(c0 * E.cw), y, (float)((c1 - c0) * E.cw), (float)E.rowh, col);
+    };
+    auto hatch = [&](float x0, float w, float y) {
+        r_clip(E.r, (int)x0, (int)y, (int)w, E.rowh);
+        for (float hx = x0; hx < x0 + w; hx += (float)E.rowh) draw_icon(IC_HATCH, hx, y, E.rowh, C_DIFF_FILL);
+        r_clip_off(E.r);
+    };
+
+    if (!v.vinline) r_rect(E.r, ex + half, body_y, 1, (float)(rows * E.rowh), C_BORDER);   /* under the rows, so a fold bar covers it */
+    /* the change under the mouse gets stage / revert (or unstage) buttons on its first visible row, like VS Code */
+    int hov_hunk = -1;
+    const bool can_wt = v.right_rev == "WORK" && (v.left_rev == ":" || v.left_rev.empty()), can_unstage = v.left_rev == "HEAD" && v.right_rev == ":";
+    if ((can_wt || can_unstage) && E.mx >= ex && E.mx < ex + ew && E.my >= body_y && E.my < body_y + (float)(nrows * E.rowh) && (E.mode == M_EDIT || E.mode == M_FIND)) {
+        const DiffView::VRow &mv = v.vrows[(size_t)(v.top + (int)((E.my - body_y) / (float)E.rowh))];
+        if (mv.sub != 3 && m.rows[(size_t)mv.row].kind != DK_SAME) hov_hunk = m.rows[(size_t)mv.row].hunk;
+    }
+    bool hov_drawn = false;
+    for (int r = 0; r < nrows; r++) {
+        const DiffView::VRow &vr = v.vrows[(size_t)(v.top + r)];
+        float y = body_y + (float)(r * E.rowh);
+        if (vr.sub == 3) {   /* a folded stretch of unchanged lines */
+            bool hv = hovered(H_DIFFFOLD, (int)(v.top + r));
+            r_rect(E.r, ex, y, ew, (float)E.rowh, hv ? C_SELROW : C_DIFF_FOLD);
+            std::string t = sfmt("%d unchanged lines hidden", vr.n);
+            float tw = text_width(E.ui, t.c_str());
+            float cx0 = ex + (ew - tw) / 2;
+            draw_icon(IC_CHEV_R, cx0 - (float)S(20), y + ((float)E.rowh - (float)S(16)) / 2, S(16), C_UI_DIM);
+            draw_text(E.ui, cx0, ui_base(y, (float)E.rowh), t.c_str(), C_UI_DIM, tw + 2);
+            hit(ex, y, ew, (float)E.rowh, H_DIFFFOLD, (int)(v.top + r));
+            continue;
+        }
+        const DiffRow &row = m.rows[(size_t)vr.row];
+        bool changed = row.kind != DK_SAME;
+        const std::string *ta = row.a >= 0 ? &m.a[(size_t)row.a] : nullptr, *tb = row.b >= 0 ? &m.b[(size_t)row.b] : nullptr;
+        bool cur = changed && v.cur_change >= 0 && row.hunk == v.cur_change;
+        auto hunk_buttons = [&]() {
+            if (hov_drawn || !changed || row.hunk != hov_hunk) return;
+            hov_drawn = true;
+            const float bs = (float)E.rowh, gap = (float)S(2);
+            const int nb = can_wt ? 2 : 1;
+            float bx = ex + ew - (float)S(16) - (float)nb * (bs + gap);
+            r_rect(E.r, bx - gap, y, (float)nb * (bs + gap) + gap, bs, C_CHROME);
+            r_rect(E.r, bx - gap, y, (float)nb * (bs + gap) + gap, 1, C_BORDER);
+            r_rect(E.r, bx - gap, y + bs - 1, (float)nb * (bs + gap) + gap, 1, C_BORDER);
+            const int ops[2] = {can_wt ? 4 : 6, 5};
+            const Icon ics[2] = {can_wt ? IC_PLUS : IC_MINUS, IC_UNDO};
+            for (int k = 0; k < nb; k++) {
+                int id = row.hunk * 8 + ops[k];
+                float x = bx + (float)k * (bs + gap);
+                if (hovered(H_DIFFHUNK, id)) r_rect(E.r, x, y, bs, bs, C_HOVER);
+                draw_icon(ics[k], x + (bs - (float)S(16)) / 2, y + (bs - (float)S(16)) / 2, S(16), C_UI);
+                hit(x, y, bs, bs, H_DIFFHUNK, id);
+            }
+        };
+        if (v.vinline) {
+            bool del = vr.sub == 1, add = vr.sub == 2;
+            const std::string *t = del ? ta : add ? tb : tb;
+            int ln = del ? row.a : row.b;
+            uint32_t bg = del ? C_DIFF_DEL : add ? C_DIFF_ADD : 0;
+            if (bg) r_rect(E.r, ex, y, ew, (float)E.rowh, bg);
+            if (row.kind == DK_MOD) { if (del) range_rect(itx, *ta, row.ia0, row.ia1, C_DIFF_DEL_TXT, y); else range_rect(itx, *tb, row.ib0, row.ib1, C_DIFF_ADD_TXT, y); }
+            if (cur) r_rect(E.r, ex, y, (float)S(2), (float)E.rowh, C_ACCENT);
+            number(ex, vr.sub == 0 ? row.a : del ? row.a : -1, C_GUTTER, y);
+            number(ex + numw, vr.sub == 0 ? row.b : add ? row.b : -1, C_GUTTER, y);
+            if (del || add) draw_text(E.font, ex + 2 * numw - (float)S(16), y + (float)E.rowasc, del ? "-" : "+", del ? C_GUT_DEL : C_GUT_ADD, (float)S(16));
+            r_clip(E.r, (int)itx, (int)y, (int)(ex + ew - itx), E.rowh);
+            if (t) emit_code(itx, y, *t, v.left, cols, v.lang, del ? v.sa[(size_t)ln] : v.sb[(size_t)ln]);
+            r_clip_off(E.r);
+            hunk_buttons();
+            continue;
+        }
+        /* side by side: left column (old), divider, right column (new) */
+        uint32_t bga = row.kind == DK_MOD || row.kind == DK_DEL ? C_DIFF_DEL : 0, bgb = row.kind == DK_MOD || row.kind == DK_ADD ? C_DIFF_ADD : 0;
+        if (bga) r_rect(E.r, ex, y, half, (float)E.rowh, bga);
+        if (bgb) r_rect(E.r, ex + half + 1, y, half, (float)E.rowh, bgb);
+        if (!ta) hatch(ex, half, y);
+        if (!tb) hatch(ex + half + 1, half, y);
+        if (row.kind == DK_MOD) { range_rect(tx_a, *ta, row.ia0, row.ia1, C_DIFF_DEL_TXT, y); range_rect(tx_b, *tb, row.ib0, row.ib1, C_DIFF_ADD_TXT, y); }
+        if (cur) { r_rect(E.r, ex, y, (float)S(2), (float)E.rowh, C_ACCENT); r_rect(E.r, ex + half + 1, y, (float)S(2), (float)E.rowh, C_ACCENT); }
+        number(ex, row.a, C_GUTTER, y);
+        number(ex + half + 1, row.b, C_GUTTER, y);
+        r_clip(E.r, (int)tx_a, (int)y, (int)(ex + half - tx_a), E.rowh);
+        if (ta) emit_code(tx_a, y, *ta, v.left, cols, v.lang, v.sa[(size_t)row.a]);
+        r_clip_off(E.r);
+        r_clip(E.r, (int)tx_b, (int)y, (int)(ex + ew - tx_b), E.rowh);
+        if (tb) emit_code(tx_b, y, *tb, v.left, cols, v.lang, v.sb[(size_t)row.b]);
+        r_clip_off(E.r);
+        hunk_buttons();
+    }
+
+    /* scrollbar with the changes marked on the track, like VS Code's overview ruler */
+    {
+        float track_h = (float)(rows * E.rowh), sx = (float)(E.W - S(10));
+        long total = (long)v.vrows.size();
+        if (total > rows) {
+            float th = std::max((float)S(24), track_h * (float)rows / (float)total), ty = body_y + (track_h - th) * (float)v.top / (float)std::max<long>(1, total - rows);
+            for (size_t k = 0; k < v.change_v.size(); k++) {
+                if (v.change_v[k] < 0) continue;
+                const DiffHunk &h = m.hunks[k];
+                uint32_t col = h.an == 0 ? C_GUT_ADD : h.bn == 0 ? C_GUT_DEL : C_GUT_MOD;
+                r_rect(E.r, sx, body_y + track_h * (float)v.change_v[k] / (float)total, (float)S(8), std::max(2.f, E.scale * 2), col);
+            }
+            r_rect(E.r, sx + (float)S(2), ty, (float)S(6), th, ui_mix(C_EDITOR, C_FG, 0.20));
+        }
+    }
+}
+
+bool diff_key(const SDL_KeyboardEvent &k, bool ctrl, bool shift) {   /* keys in a diff tab; true when consumed */
+    DiffView &v = *D().dv;
+    Layout L = layout();
+    int page = std::max(1, diff_rows_visible(L) - 2);
+    SDL_Keycode sym = k.keysym.sym;
+    bool alt = k.keysym.mod & KMOD_ALT;
+    if (ctrl || alt) {
+        if (sym == SDLK_SLASH || sym == SDLK_RIGHTBRACKET || sym == SDLK_LEFTBRACKET || sym == SDLK_d || sym == SDLK_l || sym == SDLK_k || sym == SDLK_RETURN || sym == SDLK_BACKSPACE || sym == SDLK_DELETE) return !(alt && !ctrl && false);
+        if (ctrl && sym == SDLK_HOME) { v.top = 0; touch(); return true; }
+        if (ctrl && sym == SDLK_END) { v.top = (long)v.vrows.size(); diff_clamp(v, L); touch(); return true; }
+        return false;
+    }
+    switch (sym) {
+    case SDLK_UP: v.top -= 1; break;
+    case SDLK_DOWN: v.top += 1; break;
+    case SDLK_PAGEUP: v.top -= page; break;
+    case SDLK_PAGEDOWN: v.top += page; break;
+    case SDLK_HOME: v.top = 0; break;
+    case SDLK_END: v.top = (long)v.vrows.size(); break;
+    case SDLK_LEFT: v.left = std::max(0, v.left - 4); break;
+    case SDLK_RIGHT: v.left += 4; break;
+    case SDLK_F7: diff_step(v, shift ? -1 : 1, L); touch(); return true;
+    case SDLK_i: v.mode = v.vinline ? 1 : 2; v.vdirty = true; break;
+    case SDLK_e: v.all_open = !v.all_open; v.vdirty = true; break;
+    case SDLK_o: case SDLK_RETURN: case SDLK_KP_ENTER: {
+        std::string p = v.root + "/" + v.path;
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) open_path(p); else E.status_msg = "the file is not on disk any more";
+        touch();
+        return true;
+    }
+    case SDLK_BACKSPACE: case SDLK_DELETE: case SDLK_TAB: return true;
+    default: return false;
+    }
+    diff_clamp(v, L);
+    touch();
+    return true;
+}
+
+/* ---- the frame ---- */
+
+void draw_menu_bar(const Layout &L, float *menu_end) {
+    r_rect(E.r, 0, 0, (float)E.W, (float)L.menu_h, C_MENUBAR);
+    float x = (float)S(8);
+    for (size_t i = 0; i < MENUS.size(); i++) {
+        float w = text_width(E.ui, MENUS[i].name) + (float)S(14);
+        bool open = E.menu_open == (int)i;
+        if (open || hovered(H_MENU, (int)i)) r_rect(E.r, x, (float)S(3), w, (float)(L.menu_h - S(6)), open ? C_MENU_SEL : C_HOVER);
+        draw_text(E.ui, x + (float)S(7), ui_base(0, (float)L.menu_h), MENUS[i].name, C_UI, w);
+        hit(x, 0, w, (float)L.menu_h, H_MENU, (int)i);
+        x += w;
+    }
+    /* top right, like VS Code: show or hide the sidebar, and the settings cog (reachable when the sidebar is closed) */
+    float bs = (float)S(26), isz = (float)S(16), by = ((float)L.menu_h - bs) / 2, bx = (float)E.W - (float)S(6) - bs;
+    for (int k = 0; k < 2; k++) {
+        int kind = k == 0 ? H_SETCOG : H_SIDETOG;
+        bool on = k == 0 ? E.mode == M_SETTINGS : E.pinned;
+        if (hovered(kind, 0)) r_rect(E.r, bx, by, bs, bs, C_HOVER);
+        draw_icon(k == 0 ? IC_GEAR : IC_SIDEBAR, bx + (bs - isz) / 2, by + (bs - isz) / 2, (int)isz, on ? C_ACCENT : C_UI_DIM);
+        hit(bx, 0, bs, (float)L.menu_h, kind, 0);
+        bx -= bs;
+    }
+    *menu_end = x;
+}
+
+void draw_panel(const Layout &L) {
+    float px = (float)L.ed_x, py = (float)L.panel_y, pw = (float)(E.W - L.ed_x), ph = (float)L.panel_h, hh = (float)S(30);
+    r_rect(E.r, px, py, pw, ph, C_EDITOR);
+    r_rect(E.r, px, py, pw, 1, C_BORDER);
+    hit(px, py - (float)S(3), pw, (float)S(7), H_SPLIT, 0);
+    /* header: label, one chip per terminal, buttons on the right */
+    float x = px + (float)S(14);
+    draw_text(E.ui, x, ui_base(py, hh), "TERMINAL", E.term_focus ? C_UI : C_UI_DIM, pw, FS_BOLD);
+    if (E.term_focus) r_rect(E.r, x, py + hh - (float)S(2), text_width(E.ui, "TERMINAL", FS_BOLD), (float)S(2), C_ACCENT);
+    x += text_width(E.ui, "TERMINAL", FS_BOLD) + (float)S(20);
+    for (size_t i = 0; i < E.terms.size(); i++) {
+        std::string lab = std::to_string(i + 1) + ": " + E.terms[i]->title;
+        float w = text_width(E.ui, lab.c_str()) + (float)S(20);
+        bool act = (int)i == E.term_active;
+        if (act) r_rect(E.r, x, py + (float)S(4), w, hh - (float)S(8), C_SELROW);
+        else if (hovered(H_TERMTAB, (int)i)) r_rect(E.r, x, py + (float)S(4), w, hh - (float)S(8), C_HOVER);
+        draw_text(E.ui, x + (float)S(10), ui_base(py, hh), lab.c_str(), act ? C_UI : C_UI_DIM, w);
+        hit(x, py, w, hh, H_TERMTAB, (int)i);
+        x += w + (float)S(4);
+    }
+    float bx2 = px + pw - (float)S(30);
+    const struct { Icon ic; int act; } btn[3] = {{IC_CHEV_D, A_TERM_TOGGLE}, {IC_CLOSE, A_TERM_KILL}, {IC_DOT, A_TERM_NEW}};
+    for (int k = 0; k < 3; k++) {
+        float bx3 = bx2 - (float)(k * S(28));
+        if (hovered(H_ACT, btn[k].act)) r_rect(E.r, bx3 - (float)S(2), py + (float)S(4), (float)S(24), hh - (float)S(8), C_HOVER);
+        if (btn[k].act == A_TERM_NEW) {   /* a plus sign */
+            float pl = (float)S(11), cx2 = bx3 + (float)S(10), cy2 = py + hh / 2;
+            r_rect(E.r, cx2 - pl / 2, cy2 - 0.75f * E.scale, pl, std::max(1.5f, 1.5f * E.scale), C_UI_DIM);
+            r_rect(E.r, cx2 - 0.75f * E.scale, cy2 - pl / 2, std::max(1.5f, 1.5f * E.scale), pl, C_UI_DIM);
+        } else draw_icon(btn[k].ic, bx3 + (float)S(2), py + (hh - (float)S(16)) / 2, S(16), C_UI_DIM);
+        hit(bx3 - (float)S(2), py, (float)S(24), hh, H_ACT, btn[k].act);
+    }
+    /* body */
+    float cx = px, cy = py + hh, cw = pw, ch = ph - hh;
+    E.term_rx = cx; E.term_ry = cy; E.term_rw = cw; E.term_rh = ch;
+    Ed::Term *t = cur_term();
+    if (!t || !t->core) { draw_text(E.ui, cx + (float)S(16), ui_base(cy, (float)S(26)), "No terminal. Press Ctrl+Shift+` to start one.", C_UI_FAINT, cw); return; }
+    int cols, rows;
+    tv_fit(E.font, cw, ch, &cols, &rows);
+    if (cols > 0 && rows > 0 && (cols != tcore_cols(t->core) || rows != tcore_rows(t->core))) tcore_resize(t->core, cols, rows);
+    tcore_set_focus(t->core, E.term_focus && E.focused);
+    r_clip(E.r, (int)cx, (int)cy, (int)cw, (int)ch);
+    tv_draw(t->core, E.r, E.font, &E.pal, cx, cy, cw, ch, E.blink_on && E.term_focus);
+    r_clip_off(E.r);
+}
+
+/* ---- editor polish: indent guides, bracket pairs, scrollbar ---- */
+
+int indent_cols(const std::string &t, bool *blank) {
+    int c = 0;
+    size_t i = 0;
+    for (; i < t.size() && (t[i] == ' ' || t[i] == '\t'); i++) c = t[i] == '\t' ? (c / TAB_W + 1) * TAB_W : c + 1;
+    *blank = i == t.size();
+    return c;
+}
+
+int indent_step(const Doc &d) {   /* the width the status bar reports ("Spaces: 4", "Tab Size: 4") */
+    size_t colon = d.indent.find(':');
+    int w = colon == std::string::npos ? 4 : atoi(d.indent.c_str() + colon + 1);
+    return w >= 2 && w <= 8 ? w : 4;
+}
+
+/* the bracket next to the cursor and its partner, as byte offsets (-1 when there is none); plain counting, strings and comments are not skipped */
+void bracket_pair(Doc &d, long *a, long *b) {
+    if (E.br_doc == &d && E.br_cur == d.cur && E.br_rev == d.buf.revision()) { *a = E.br_a; *b = E.br_b; return; }
+    E.br_doc = &d; E.br_cur = d.cur; E.br_rev = d.buf.revision(); E.br_a = E.br_b = -1;
+    static const char *OPEN = "([{", *CLOSE = ")]}";
+    std::string c;
+    for (int k = 0; k < 2 && E.br_a < 0; k++) {
+        if (k == 0 && d.cur == 0) continue;
+        size_t p = k == 0 ? d.cur - 1 : d.cur;
+        if (p >= d.buf.size()) continue;
+        d.buf.copy(p, 1, c);
+        if (c.empty()) continue;
+        const char *o = strchr(OPEN, c[0]), *cl = strchr(CLOSE, c[0]);
+        if (c[0] == 0 || (!o && !cl)) continue;
+        char me = c[0], want = o ? CLOSE[o - OPEN] : OPEN[cl - CLOSE];
+        int depth = 1;
+        std::string chunk;
+        size_t budget = 200000;
+        if (o) {
+            for (size_t q = p + 1; q < d.buf.size() && budget > 0;) {
+                d.buf.copy(q, 4096, chunk);
+                for (size_t i = 0; i < chunk.size(); i++) { if (chunk[i] == me) depth++; else if (chunk[i] == want && --depth == 0) { E.br_a = (long)p; E.br_b = (long)(q + i); break; } }
+                if (E.br_a >= 0 || chunk.empty()) break;
+                q += chunk.size(); budget = budget > chunk.size() ? budget - chunk.size() : 0;
+            }
+        } else {
+            for (size_t q = p; q > 0 && budget > 0;) {
+                size_t from = q > 4096 ? q - 4096 : 0;
+                d.buf.copy(from, q - from, chunk);
+                for (size_t i = chunk.size(); i-- > 0;) { if (chunk[i] == me) depth++; else if (chunk[i] == want && --depth == 0) { E.br_a = (long)p; E.br_b = (long)(from + i); break; } }
+                if (E.br_a >= 0) break;
+                budget = budget > q - from ? budget - (q - from) : 0;
+                q = from;
+            }
+        }
+    }
+    *a = E.br_a; *b = E.br_b;
+}
+
+/* thumb geometry of the vertical scrollbar; false when the whole file fits */
+bool sb_geom(const Layout &L, const Doc &d, float *ty, float *th, float *thumb_y, float *thumb_h) {
+    size_t lines = d.buf.lines();
+    if (lines <= (size_t)L.rows || L.rows <= 0) return false;
+    *ty = (float)L.text_y;
+    *th = (float)(L.ed_bottom - L.text_y);
+    float frac = (float)L.rows / (float)lines;
+    *thumb_h = std::max((float)S(28), *th * frac);
+    float pos = (float)d.top / (float)std::max<size_t>(1, lines - 1);
+    *thumb_y = *ty + pos * (*th - *thumb_h);
+    return true;
+}
+
+void sb_to_pointer() {
+    Layout L = layout();
+    Doc &d = D();
+    float ty, th, y0, h;
+    if (!sb_geom(L, d, &ty, &th, &y0, &h)) return;
+    float frac = (E.my - ty - h / 2) / std::max(1.f, th - h);
+    frac = std::max(0.f, std::min(1.f, frac));
+    d.top = (size_t)(frac * (float)(d.buf.lines() - 1));
+    redraw();
+}
+
+/* ---- merge conflicts in the editor: the <<<<<<< ======= >>>>>>> blocks of a file git lists as conflicted ---- */
+
+const std::vector<Conflict> *conflicts_for(Doc &d) {
+    if (d.dv || d.mv || !E.git.repo || d.path.empty() || d.buf.size() > (size_t)8 << 20) return nullptr;
+    ConflictCache &c = g_conf[&d];
+    if (c.rev == d.buf.revision() && c.listed) return &c.v;
+    std::string rel = rel_to_root(d.path);
+    bool conflicted = false;
+    for (const GitChange &g : E.git.changes) if (g.path == rel && (g.x == 'U' || g.y == 'U' || (g.x == 'A' && g.y == 'A') || (g.x == 'D' && g.y == 'D'))) { conflicted = true; break; }
+    if (!conflicted) { c.v.clear(); c.rev = d.buf.revision(); c.listed = true; return nullptr; }
+    c.v.clear();
+    std::string t;
+    Conflict cur;
+    for (size_t i = 0, n = d.buf.lines(); i < n; i++) {
+        if (d.buf.line_len(i) < 7) continue;
+        d.buf.line_text(i, t);
+        if (t.compare(0, 7, "<<<<<<<") == 0 && (t.size() == 7 || t[7] == ' ')) { cur = Conflict(); cur.a = (long)i; }
+        else if (cur.a >= 0 && t.compare(0, 7, "|||||||") == 0 && cur.mid < 0) cur.base = (long)i;
+        else if (cur.a >= 0 && t == "=======") cur.mid = (long)i;
+        else if (cur.a >= 0 && cur.mid >= 0 && t.compare(0, 7, ">>>>>>>") == 0 && (t.size() == 7 || t[7] == ' ')) { cur.b = (long)i; c.v.push_back(cur); cur = Conflict(); }
+    }
+    c.rev = d.buf.revision(); c.listed = true;
+    return c.v.empty() ? nullptr : &c.v;
+}
+
+/* 0 none, 1 "<<<<<<<" line, 2 current (ours), 3 "|||||||" line, 4 base, 5 "=======" line, 6 incoming (theirs), 7 ">>>>>>>" line */
+int conflict_kind(const std::vector<Conflict> &v, long line, size_t *idx) {
+    size_t lo = 0, hi = v.size();
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (v[m].b < line) lo = m + 1; else hi = m; }
+    if (lo >= v.size() || line < v[lo].a) return 0;
+    const Conflict &c = v[lo];
+    *idx = lo;
+    if (line == c.a) return 1;
+    if (line == c.b) return 7;
+    if (line == c.mid) return 5;
+    if (c.base >= 0 && line == c.base) return 3;
+    if (line < (c.base >= 0 ? c.base : c.mid)) return 2;
+    if (c.base >= 0 && line < c.mid) return 4;
+    return 6;
+}
+
+void conflict_accept(Doc &d, size_t idx, int op) {   /* 0 current, 1 incoming, 2 both */
+    const std::vector<Conflict> *vp = conflicts_for(d);
+    if (!vp || idx >= vp->size()) return;
+    Conflict c = (*vp)[idx];
+    std::string t, text;
+    auto take = [&](long from, long to) { for (long i = from; i < to; i++) { d.buf.line_text((size_t)i, t); text += t + "\n"; } };
+    long ours_end = c.base >= 0 ? c.base : c.mid;
+    if (op == 0 || op == 2) take(c.a + 1, ours_end);
+    if (op == 1 || op == 2) take(c.mid + 1, c.b);
+    size_t nl = d.buf.lines(), size = d.buf.size();
+    size_t pos = d.buf.line_start((size_t)c.a);
+    size_t end = (size_t)(c.b + 1) < nl ? d.buf.line_start((size_t)(c.b + 1)) : size;
+    if (end == size && size) { std::string last; d.buf.copy(size - 1, 1, last); if (last != "\n" && !text.empty()) text.pop_back(); }
+    d.break_group();
+    d.replace(pos, end - pos, text.data(), text.size());
+    d.break_group();
+    E.status_msg = op == 0 ? "kept the current change" : op == 1 ? "kept the incoming change" : "kept both changes";
+}
+
+/* Accept Current | Accept Incoming | Accept Both on the "<<<<<<<" line, like VS Code's merge conflict actions */
+void draw_conflict_actions(const Layout &L, Doc &d) {
+    if (E.mode != M_EDIT) return;
+    const std::vector<Conflict> *vp = conflicts_for(d);
+    if (!vp) return;
+    static const char *names[4] = {"Accept Current", "Accept Incoming", "Accept Both", "Merge Editor"};
+    float total = 0;
+    for (int k = 0; k < 4; k++) total += text_width(E.ui, names[k]) + (float)S(20);
+    float rx = (float)E.W - (float)S(16);
+    for (size_t i = 0; i < vp->size(); i++) {
+        const Conflict &c = (*vp)[i];
+        long row = c.a - (long)d.top;
+        if (row < 0 || row >= L.rows) continue;
+        float y = (float)(L.text_y + row * E.rowh);
+        float x = rx - total;
+        if (x < (float)L.text_x + (float)(20 * E.cw)) continue;   /* too narrow to show the actions next to the marker text */
+        r_rect(E.r, x - (float)S(6), y, total + (float)S(6), (float)E.rowh, ui_mix(C_EDITOR, C_FG, 0.10));
+        for (int k = 0; k < 4; k++) {
+            float w = text_width(E.ui, names[k]) + (float)S(20);
+            int id = (int)i * 4 + k;
+            if (hovered(H_CONFLICT, id)) r_rect(E.r, x, y + 1, w, (float)E.rowh - 2, C_HOVER);
+            draw_text(E.ui, x + (float)S(10), ui_base(y, (float)E.rowh), names[k], k >= 2 ? C_UI_DIM : C_ACCENT, w);
+            hit(x, y, w, (float)E.rowh, H_CONFLICT, id);
+            x += w;
+        }
+    }
+}
+
+/* The peek: the HEAD lines of a change (red) and the lines now in the buffer (green) in a panel under the changed lines, with Revert, Open Diff and next / previous change */
+void draw_peek(const Layout &L, Doc &d) {
+    if (g_peek.doc != &d || E.mode != M_EDIT) return;
+    GutterCache *gc = gutter_for(d);
+    size_t hk = 0;
+    bool found = false;
+    if (gc) for (; hk < gc->hunks.size(); hk++) if (gc->hunks[hk].b0 == g_peek.b0) { found = true; break; }
+    if (!found) { g_peek.doc = nullptr; return; }
+    const DiffHunk h = gc->hunks[hk];
+    const int cap = 10;
+    int nd = std::min(h.an, cap), na = std::min(h.bn, cap);
+    int n = 1 + nd + na + (h.an > cap || h.bn > cap ? 1 : 0);
+    long endrow = (long)(h.bn > 0 ? h.b0 + h.bn : h.b0) - (long)d.top;
+    if (endrow < 0 || endrow > L.rows) return;
+    float x = (float)L.text_x - (float)S(16), w = (float)E.W - x - (float)S(12), rh = (float)E.rowh;
+    float y = (float)(L.text_y) + (float)endrow * rh, ymax = (float)(L.text_y + L.rows * E.rowh);
+    float ph = (float)n * rh;
+    if (y + ph > ymax) y = std::max((float)L.text_y, ymax - ph);
+    r_rect(E.r, x, y, w, ph, ui_mix(C_EDITOR, C_FG, 0.05));
+    r_rect(E.r, x, y, w, 1, C_ACCENT);
+    r_rect(E.r, x, y + ph - 1, w, 1, C_BORDER);
+    hit(x, y, w, ph, H_PEEK, 0);   /* swallows clicks, so they do not move the cursor underneath */
+    /* header */
+    std::string cnt = sfmt("Change %zu of %zu", hk + 1, gc->hunks.size());
+    draw_text(E.ui, x + (float)S(10), ui_base(y, rh), cnt.c_str(), C_UI_DIM, w * 0.4f);
+    float rx = x + w - (float)S(6);
+    auto btn = [&](int id, const char *label, Icon ic) {
+        float tw = label ? text_width(E.ui, label) : 0.f;
+        float bw = (float)S(8) + (float)S(16) + (label ? tw + (float)S(4) : 0.f);
+        float bx = rx - bw;
+        if (hovered(H_PEEK, id)) r_rect(E.r, bx, y + 1, bw, rh - 1, C_HOVER);
+        draw_icon(ic, bx + (float)S(4), y + (rh - (float)S(16)) / 2, S(16), C_UI);
+        if (label) draw_text(E.ui, bx + (float)S(24), ui_base(y, rh), label, C_UI_DIM, tw + 2);
+        hit(bx, y + 1, bw, rh - 1, H_PEEK, id);
+        rx = bx - (float)S(2);
+    };
+    btn(3, nullptr, IC_CLOSE);
+    btn(2, "Open Diff", IC_OPEN_FILE);
+    btn(1, "Revert", IC_UNDO);
+    btn(5, nullptr, IC_ARROW_D);
+    btn(4, nullptr, IC_ARROW_U);
+    /* the lines */
+    float ly = y + rh;
+    const float tx = x + (float)S(28);
+    const int cols = std::max(1, (int)((x + w - tx - (float)S(8)) / (float)E.cw));
+    auto line = [&](const std::string &t, bool add) {
+        r_rect(E.r, x, ly, w, rh, add ? C_DIFF_ADD : C_DIFF_DEL);
+        draw_text(E.font, x + (float)S(10), ly + (float)E.rowasc, add ? "+" : "-", add ? C_GUT_ADD : C_GUT_DEL, (float)S(16));
+        r_clip(E.r, (int)tx, (int)ly, (int)(x + w - tx), E.rowh);
+        std::string shown = t.size() > (size_t)cols * 4 ? t.substr(0, (size_t)cols * 4) : t;
+        draw_text(E.font, tx, ly + (float)E.rowasc, shown.c_str(), C_FG, x + w - tx - (float)S(6));
+        r_clip_off(E.r);
+        ly += rh;
+    };
+    for (int i = 0; i < nd; i++) line(gc->base_lines[(size_t)(h.a0 + i)], false);
+    std::string t;
+    for (int i = 0; i < na; i++) { d.buf.line_text((size_t)(h.b0 + i), t); line(t, true); }
+    if (h.an > cap || h.bn > cap) draw_text(E.ui, tx, ui_base(ly, rh), sfmt("%d more lines not shown", std::max(h.an - cap, 0) + std::max(h.bn - cap, 0)).c_str(), C_UI_FAINT, w);
+}
+
+void peek_revert(Doc &d) {
+    GutterCache *gc = gutter_for(d);
+    if (!gc) return;
+    for (const DiffHunk &h : gc->hunks) {
+        if (h.b0 != g_peek.b0) continue;
+        std::string ins;
+        for (int i = 0; i < h.an; i++) ins += gc->base_lines[(size_t)(h.a0 + i)] + "\n";
+        size_t nl = d.buf.lines(), size = d.buf.size();
+        size_t pos = (size_t)h.b0 < nl ? d.buf.line_start((size_t)h.b0) : size;
+        size_t end = (size_t)(h.b0 + h.bn) < nl ? d.buf.line_start((size_t)(h.b0 + h.bn)) : size;
+        std::string last;
+        if (size) d.buf.copy(size - 1, 1, last);
+        bool no_eol = size && last != "\n";
+        if (end == size && no_eol && !ins.empty()) {   /* the buffer's last line has no newline: keep it that way */
+            if (h.bn == 0) ins = "\n" + ins;
+            ins.pop_back();
+        }
+        d.break_group();
+        d.replace(pos, end - pos, ins.data(), ins.size());
+        d.break_group();
+        g_peek.doc = nullptr;
+        E.status_msg = "change reverted (Ctrl+Z undoes it)";
+        return;
+    }
+}
+
+void peek_open_diff(Doc &d, int b0) {
+    std::string rel = rel_to_root(d.path);
+    if (rel.empty()) return;
+    Doc &nd = open_diff_spec(rel, ":", "WORK", "Index", "Working Tree", base_name(rel) + " (Working Tree)", "Unstaged changes: the index against the file on disk");
+    if (nd.dv) { DiffView &v = *nd.dv; for (size_t k = 0; k < v.m.hunks.size(); k++) if (v.m.hunks[k].b0 + std::max(v.m.hunks[k].bn, 1) > b0) { v.cur_change = (int)k; break; } v.top = -1; }   /* top = -1: scroll to cur_change when drawn */
+}
+
+/* A rested pointer over a line number, or over the faint blame text of the cursor line, shows who changed the line and why */
+void draw_blame_tip(const Layout &L, Doc &d) {
+    if (!E.tip_on || E.mode != M_EDIT) return;
+    if (E.my < (float)L.text_y || E.my >= (float)(L.text_y + L.rows * E.rowh)) return;
+    size_t line = d.top + (size_t)((E.my - (float)L.text_y) / (float)E.rowh);
+    if (line >= d.buf.lines()) return;
+    bool in_gutter = E.mx >= (float)L.ed_x && E.mx < (float)L.text_x - (float)S(18);
+    bool on_note = false;
+    if (!in_gutter && E.g.blame_inline && line == d.buf.line_of(d.cur) && !d.has_sel()) {
+        std::string t;
+        d.buf.line_text(line, t);
+        float x0 = (float)L.text_x + (float)((col_of(t, t.size()) - d.left + 4) * E.cw);
+        on_note = E.mx >= x0;
+    }
+    if (!in_gutter && !on_note) return;
+    const GitBlame *bl = blame_for(d, line);
+    if (!bl) return;
+    std::string l1 = bl->summary.empty() ? std::string("Uncommitted changes") : bl->summary;
+    bool unc = bl->hash.find_first_not_of('0') == std::string::npos;
+    std::string l2 = unc ? "You, not committed yet" : bl->author + ", " + git_ago(bl->time, (long)time(nullptr)) + "  (" + bl->hash.substr(0, 7) + ")";
+    std::string l3 = unc ? "" : "Click the line's blame text to open the commit";
+    float w = std::max(text_width(E.ui, l1.c_str()), std::max(text_width(E.ui, l2.c_str()), text_width(E.ui, l3.c_str()))) + (float)S(24);
+    w = std::min(w, (float)E.W - (float)S(20));
+    float lh = (float)S(22), h = lh * (l3.empty() ? 2 : 3) + (float)S(10);
+    float x = std::min(E.mx + (float)S(12), (float)E.W - w - (float)S(8)), y = E.my + (float)S(18);
+    if (y + h > (float)(L.text_y + L.rows * E.rowh)) y = E.my - h - (float)S(8);
+    r_rect(E.r, x - 1, y - 1, w + 2, h + 2, C_BORDER);
+    r_rect(E.r, x, y, w, h, C_CHROME);
+    draw_text(E.ui, x + (float)S(12), ui_base(y + (float)S(5), lh), l1.c_str(), C_UI, w - (float)S(24), FS_BOLD);
+    draw_text(E.ui, x + (float)S(12), ui_base(y + (float)S(5) + lh, lh), l2.c_str(), C_UI_DIM, w - (float)S(24));
+    if (!l3.empty()) draw_text(E.ui, x + (float)S(12), ui_base(y + (float)S(5) + 2 * lh, lh), l3.c_str(), C_UI_FAINT, w - (float)S(24));
+}
+
+/* ---- the merge editor: Incoming | Current on top, the Result below, one set of buttons per conflict ---- */
+const char *const MERGE_OPS[] = {"Reset", "Accept Current", "Accept Incoming", "Accept Both", "", "Accept Base"};
+
+struct MergeGeom { float tb_h, body_y; int top_rows, res_rows; };   /* rows include each pane's title row */
+MergeGeom merge_geom(const Layout &L) {
+    MergeGeom g;
+    g.tb_h = (float)S(30);
+    g.body_y = (float)L.text_y + g.tb_h;
+    int total = std::max(6, (int)(((float)L.ed_bottom - g.body_y) / (float)E.rowh));
+    g.top_rows = std::max(3, total * 55 / 100);
+    g.res_rows = std::max(2, total - g.top_rows);
+    return g;
+}
+
+void merge_clamp(MergeView &v, const MergeGeom &g) {
+    v.top = std::max<long>(0, std::min<long>(v.top, (long)v.rows.size() - (g.top_rows - 1)));
+    v.rtop = std::max<long>(0, std::min<long>(v.rtop, (long)v.res.size() - (g.res_rows - 1)));
+}
+
+void merge_goto(MergeView &v, int k) {
+    if (v.conf_row.empty()) return;
+    v.cur = std::max(0, std::min(k, (int)v.conf_row.size() - 1));
+    v.top = std::max(0, v.conf_row[(size_t)v.cur] - 1);
+}
+
+void merge_open(const std::string &rel) {
+    std::string abs = E.git.root + "/" + rel;
+    for (size_t i = 0; i < E.docs.size(); i++) if (E.docs[i]->mv && E.docs[i]->mv->root == E.git.root && E.docs[i]->mv->path == rel) { set_active((int)i); return; }
+    std::string text;
+    FILE *f = fopen(abs.c_str(), "rb");
+    if (f) { char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n); fclose(f); }
+    auto mv = std::make_shared<MergeView>();
+    if (!f || !merge_parse(text, *mv)) { open_path(abs); E.status_msg = "no conflict markers left in " + base_name(rel); return; }
+    mv->root = E.git.root; mv->path = rel;
+    merge_layout(*mv);
+    merge_goto(*mv, 0);
+    bool replace_first = E.docs.size() == 1 && D().pristine() && !E.blank_tab;
+    Doc &d = new_doc(false);
+    d.title = "Merge: " + base_name(rel);
+    d.mv = mv;
+    if (replace_first) E.docs.erase(E.docs.begin());
+    set_active((int)E.docs.size() - 1);
+}
+
+void merge_op(int id) {
+    Doc &d = D();
+    if (!d.mv) return;
+    MergeView &v = *d.mv;
+    if (id < 1000) {
+        size_t k = (size_t)(id / 8);
+        int op = id % 8;
+        if (k >= v.conf_seg.size()) return;
+        v.segs[(size_t)v.conf_seg[k]].choice = op;
+        v.cur = (int)k;
+        v.dirty = true;
+        return;
+    }
+    if (id == 1000) merge_goto(v, v.cur - 1);
+    else if (id == 1001) merge_goto(v, v.cur + 1);
+    else if (id == 1003) open_path(E.git.root + "/" + v.path);
+    else if (id == 1004 || id == 1005) { for (MergeSeg &s : v.segs) if (s.conflict && s.choice == 0) s.choice = id == 1004 ? 1 : 2; v.dirty = true; }
+    else if (id == 1002) {
+        if (v.dirty) merge_layout(v);
+        if (v.unresolved) { E.status_msg = sfmt("%d conflict%s still unresolved", v.unresolved, v.unresolved == 1 ? "" : "s"); return; }
+        std::string out = merge_result_text(v), abs = v.root + "/" + v.path, rel = v.path;
+        FILE *f = fopen(abs.c_str(), "wb");
+        if (!f) { E.status_msg = "cannot write " + rel; return; }
+        fwrite(out.data(), 1, out.size(), f);
+        fclose(f);
+        std::string root = v.root;
+        close_tab(E.active);
+        git_stage(root, rel);
+        git_refresh(); reload_open_docs();
+        E.status_msg = "merged " + base_name(rel) + " and staged it";
+    }
+}
+
+void draw_merge(const Layout &L, float ex, float ew) {
+    Doc &d = D();
+    MergeView &v = *d.mv;
+    if (v.dirty) merge_layout(v);
+    const MergeGeom g = merge_geom(L);
+    merge_clamp(v, g);
+    const float rh = (float)E.rowh, half = (ew - 1) / 2;
+    const uint32_t c_in = ui_mix(C_EDITOR, C_ACCENT, 0.17), c_cur = ui_mix(C_EDITOR, C_GIT_ADD, 0.15), dim = ui_mix(C_EDITOR, C_FG, 0.55);
+
+    /* toolbar */
+    r_rect(E.r, ex, (float)L.text_y, ew, g.tb_h, C_CHROME);
+    r_rect(E.r, ex, (float)L.text_y + g.tb_h - 1, ew, 1, C_BORDER);
+    const float by = (float)L.text_y + (g.tb_h - (float)S(22)) / 2, bh = (float)S(22);
+    float rx = ex + ew - (float)S(10);
+    auto button = [&](int id, const char *label, Icon ic, bool has_icon, bool primary, bool enabled) {
+        float tw = label ? text_width(E.ui, label) : 0.f;
+        float w = (float)S(12) + (has_icon ? (float)S(16) : 0.f) + (label ? tw + (has_icon ? (float)S(4) : 0.f) : 0.f);
+        float x = rx - w;
+        uint32_t bg = primary ? (enabled ? (hovered(H_MERGE, id) ? ui_mix(C_ACCENT, C_UI, 0.14) : C_ACCENT) : C_FIELD) : (hovered(H_MERGE, id) ? C_HOVER : 0);
+        if (bg) r_rect(E.r, x, by, w, bh, bg);
+        uint32_t fg = primary ? (enabled ? C_ON_ACCENT : C_UI_FAINT) : C_UI_DIM;
+        float px = x + (float)S(6);
+        if (has_icon) { draw_icon(ic, px, by + (bh - (float)S(16)) / 2, S(16), fg); px += (float)S(20); }
+        if (label) draw_text(E.ui, px, ui_base(by, bh), label, fg, tw + 2);
+        hit(x, by, w, bh, H_MERGE, id);
+        rx = x - (float)S(4);
+    };
+    button(1002, "Complete Merge", IC_CHECK, true, true, v.unresolved == 0);
+    button(1003, "Open File", IC_OPEN_FILE, true, false, true);
+    button(1005, "All Incoming", IC_ARROW_D, false, false, true);
+    button(1004, "All Current", IC_ARROW_D, false, false, true);
+    button(1001, nullptr, IC_ARROW_D, true, false, true);
+    button(1000, nullptr, IC_ARROW_U, true, false, true);
+    std::string lab = v.path + sfmt("   %d conflict%s, %d unresolved", v.nconf, v.nconf == 1 ? "" : "s", v.unresolved);
+    draw_text(E.ui, ex + (float)S(12), ui_base(by, bh), lab.c_str(), C_UI, std::max(0.f, rx - ex - (float)S(24)), FS_BOLD);
+
+    /* pane titles */
+    float y = g.body_y;
+    r_rect(E.r, ex, y, ew, rh, ui_mix(C_EDITOR, C_FG, 0.07));
+    draw_text(E.ui, ex + (float)S(12), ui_base(y, rh), ("Incoming  " + v.inc_label).c_str(), C_UI_DIM, half - (float)S(20), FS_BOLD);
+    draw_text(E.ui, ex + half + 1 + (float)S(12), ui_base(y, rh), ("Current  " + v.cur_label).c_str(), C_UI_DIM, half - (float)S(20), FS_BOLD);
+    y += rh;
+    const float top_body = (float)(g.top_rows - 1) * rh;
+    r_rect(E.r, ex + half, y, 1, top_body, C_BORDER);
+    auto code = [&](float x, float yy, const std::string &t, float w, uint32_t col) {
+        r_clip(E.r, (int)x, (int)yy, (int)w, E.rowh);
+        draw_text(E.font, x, yy + (float)E.rowasc, t.c_str(), col, w);
+        r_clip_off(E.r);
+    };
+    for (int r = 0; r < g.top_rows - 1; r++) {
+        long idx = v.top + r;
+        if (idx >= (long)v.rows.size()) break;
+        const MRow &row = v.rows[(size_t)idx];
+        const MergeSeg &s = v.segs[(size_t)row.seg];
+        float yy = y + (float)r * rh;
+        if (row.kind == 0) {
+            code(ex + (float)S(12), yy, s.common[(size_t)row.a], half - (float)S(16), dim);
+            code(ex + half + 1 + (float)S(12), yy, s.common[(size_t)row.a], half - (float)S(16), dim);
+        } else if (row.kind == 3) {
+            r_rect(E.r, ex, yy, ew, rh, C_DIFF_FOLD);
+            std::string t = sfmt("%d unchanged lines", row.a);
+            draw_text(E.ui, ex + (ew - text_width(E.ui, t.c_str())) / 2, ui_base(yy, rh), t.c_str(), C_UI_DIM, ew);
+        } else if (row.kind == 1) {
+            int k = 0;
+            for (size_t q = 0; q < v.conf_seg.size(); q++) if (v.conf_seg[q] == row.seg) k = (int)q;
+            r_rect(E.r, ex, yy, ew, rh, ui_mix(C_EDITOR, C_FG, 0.13));
+            if (v.cur == k) r_rect(E.r, ex, yy, (float)S(3), rh, C_ACCENT);
+            static const char *st[6] = {"unresolved", "taking current", "taking incoming", "taking both", "", "taking base"};
+            std::string head = sfmt("Conflict %d of %d  \xE2\x80\xA2  %s", k + 1, v.nconf, st[s.choice]);
+            draw_text(E.ui, ex + (float)S(12), ui_base(yy, rh), head.c_str(), s.choice ? C_GIT_ADD : C_GIT_MOD, ew * 0.4f, FS_BOLD);
+            float bx = ex + ew - (float)S(10);
+            const int ops[5] = {0, 5, 3, 2, 1};   /* right to left: Reset, Base, Both, Incoming, Current */
+            for (int q = 0; q < 5; q++) {
+                int op = ops[q];
+                if ((op == 5 && !s.has_base) || (op == 0 && !s.choice)) continue;
+                float w = text_width(E.ui, MERGE_OPS[op]) + (float)S(16);
+                bx -= w;
+                int id = k * 8 + op;
+                if (hovered(H_MERGE, id)) r_rect(E.r, bx, yy + 1, w, rh - 2, C_HOVER);
+                draw_text(E.ui, bx + (float)S(8), ui_base(yy, rh), MERGE_OPS[op], op == 0 ? C_UI_DIM : C_ACCENT, w);
+                hit(bx, yy, w, rh, H_MERGE, id);
+            }
+        } else {
+            if (row.b >= 0) { r_rect(E.r, ex, yy, half, rh, c_in); code(ex + (float)S(12), yy, s.theirs[(size_t)row.b], half - (float)S(16), C_FG); }
+            if (row.a >= 0) { r_rect(E.r, ex + half + 1, yy, half, rh, c_cur); code(ex + half + 1 + (float)S(12), yy, s.ours[(size_t)row.a], half - (float)S(16), C_FG); }
+            if (s.choice == 2 || s.choice == 3 || s.choice == 4) r_rect(E.r, ex, yy, (float)S(2), rh, C_ACCENT);
+            if (s.choice == 1 || s.choice == 3 || s.choice == 4) r_rect(E.r, ex + half + 1, yy, (float)S(2), rh, C_ACCENT);
+        }
+    }
+
+    /* the result */
+    float ry = y + top_body;
+    r_rect(E.r, ex, ry, ew, rh, ui_mix(C_EDITOR, C_FG, 0.07));
+    r_rect(E.r, ex, ry, ew, 1, C_BORDER);
+    std::string rt = v.unresolved ? sfmt("Result  \xE2\x80\xA2  %d conflict%s left to resolve", v.unresolved, v.unresolved == 1 ? "" : "s") : std::string("Result  \xE2\x80\xA2  all conflicts resolved, press Complete Merge");
+    draw_text(E.ui, ex + (float)S(12), ui_base(ry, rh), rt.c_str(), v.unresolved ? C_GIT_MOD : C_GIT_ADD, ew - (float)S(24), FS_BOLD);
+    ry += rh;
+    for (int r = 0; r < g.res_rows - 1; r++) {
+        long idx = v.rtop + r;
+        if (idx >= (long)v.res.size()) break;
+        const MRes &m = v.res[(size_t)idx];
+        float yy = ry + (float)r * rh;
+        if (yy + rh > (float)L.ed_bottom) break;
+        if (m.kind == 1) r_rect(E.r, ex, yy, ew, rh, ui_mix(C_EDITOR, C_GIT_MOD, 0.22));
+        else if (m.kind == 2) r_rect(E.r, ex, yy, ew, rh, ui_mix(C_EDITOR, C_GIT_ADD, 0.10));
+        code(ex + (float)S(12), yy, m.text, ew - (float)S(24), m.kind == 1 ? C_GIT_MOD : C_FG);
+    }
+}
+
+bool merge_key(const SDL_KeyboardEvent &k, bool ctrl, bool shift) {
+    MergeView &v = *D().mv;
+    Layout L = layout();
+    const MergeGeom g = merge_geom(L);
+    if (ctrl || (k.keysym.mod & KMOD_ALT)) return false;
+    switch (k.keysym.sym) {
+    case SDLK_UP: v.top -= 1; break;
+    case SDLK_DOWN: v.top += 1; break;
+    case SDLK_PAGEUP: v.top -= g.top_rows - 2; break;
+    case SDLK_PAGEDOWN: v.top += g.top_rows - 2; break;
+    case SDLK_HOME: v.top = 0; break;
+    case SDLK_END: v.top = (long)v.rows.size(); break;
+    case SDLK_F7: merge_goto(v, v.cur + (shift ? -1 : 1)); break;
+    case SDLK_BACKSPACE: case SDLK_DELETE: case SDLK_TAB: return true;
+    default: return false;
+    }
+    merge_clamp(v, g);
+    touch();
+    return true;
+}
+
+void open_picker(PickKind k);
+void do_action(int act);
+void follow_fleetwm();
+
+/* ---- Settings: one page for everything that can be changed, with a search box (File > Settings, Ctrl+,) ---- */
+
+enum SetKind { SK_TOGGLE, SK_CHOICE, SK_TEXT, SK_ACTION };
+struct SetItem {
+    const char *cat;
+    std::string label, desc;
+    int kind;
+    std::function<bool()> on;                 /* toggles */
+    std::function<void()> flip;
+    std::function<std::string()> value;       /* choices, text */
+    std::function<void()> act;                /* open the choice list, ask for the text, run the action */
+};
+struct SetRow { int item; const char *heading; };   /* a row of the page: an item, or the heading of a category */
+
+struct SetState {
+    bool open = false;
+    std::string q;
+    int cat = 0, sel = 0;
+    float scroll = 0;
+    std::vector<SetRow> rows;
+} g_set;
+
+const char *SET_CATS[] = {"Appearance", "Editor", "Explorer", "Source Control", "Terminal", "Files"};
+
+std::vector<SetItem> &set_items() {
+    static std::vector<SetItem> items;
+    if (!items.empty()) return items;
+    auto toggle = [&](const char *cat, const char *label, const char *desc, std::function<bool()> on, std::function<void()> flip) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_TOGGLE; it.on = std::move(on); it.flip = std::move(flip); items.push_back(std::move(it));
+    };
+    auto choice = [&](const char *cat, const char *label, const char *desc, std::function<std::string()> value, std::function<void()> act) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_CHOICE; it.value = std::move(value); it.act = std::move(act); items.push_back(std::move(it));
+    };
+    auto text = [&](const char *cat, const char *label, const char *desc, std::function<std::string()> value, std::function<void()> act) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_TEXT; it.value = std::move(value); it.act = std::move(act); items.push_back(std::move(it));
+    };
+    auto action = [&](const char *cat, const char *label, const char *desc, const char *button, std::function<void()> act) {
+        SetItem it; it.cat = cat; it.label = label; it.desc = desc; it.kind = SK_ACTION; it.value = [button] { return std::string(button); }; it.act = std::move(act); items.push_back(std::move(it));
+    };
+    choice("Appearance", "Color theme", "The colours of the editor and its chrome. Follow fleetwm takes them from the fleetwm theme.", [] { return E.follow_fleet ? std::string("Follow fleetwm") : std::string(E.theme ? E.theme->name : ""); }, [] { open_picker(PICK_THEME); });
+    toggle("Appearance", "Follow the fleetwm theme", "Take the colours from the fleetwm compositor's theme file and follow it when it changes.", [] { return E.follow_fleet; },
+           [] { if (E.follow_fleet) { E.follow_fleet = false; } else if (E.fleet.found || (fleetwm_read(&E.fleet), E.fleet.found)) { E.follow_fleet = true; follow_fleetwm(); } else E.status_msg = "fleetwm theme file not found"; settings_save(); });
+    toggle("Appearance", "Timing and memory in the status bar", "How long the last operation took, frames per second, CPU and memory, at the left of the status bar.", [] { return E.show_hud; }, [] { E.show_hud = !E.show_hud; settings_save(); });
+    toggle("Editor", "Vim keys", "Modal editing: normal, insert, visual and block modes, operators, text objects, macros, :s, :g and a command line at the bottom.", [] { return E.vim_on; }, [] { do_action(A_VIM); });
+    toggle("Editor", "Live checks", "Look for common mistakes while you type: Ansible, Kubernetes, YAML, JSON, shell, Python, C and more. Underlines, the problem list (Ctrl+Shift+M), F8, quick fixes (Ctrl+.).", [] { return E.lint_on; }, [] { do_action(A_LINT); });
+    text("Editor", "Ignored check codes", "Codes of live checks to leave out, separated by spaces, for example: trailing-whitespace name[casing] shell-no-set-e.", [] { return E.lint_ignore.empty() ? std::string("none") : E.lint_ignore; },
+         [] { dlg_show("Ignored check codes", "Codes of live checks to leave out, separated by spaces (the code is shown in the status bar, in [brackets]).", {"Save", "Cancel"}, [](int b, const std::string &t) { if (b == 0) { E.lint_ignore = trim_nl(t); settings_save(); for (auto &kv : g_lint) kv.second.rev = ~0ull; } }, true, E.lint_ignore, "trailing-whitespace name[casing]"); });
+    toggle("Editor", "Preview tabs", "A single click on a file in the Explorer opens an italic preview tab that the next click replaces. Double click or typing keeps it.", [] { return E.preview_tabs; }, [] { E.preview_tabs = !E.preview_tabs; settings_save(); });
+    toggle("Editor", "Reload files changed on disk", "When a program (an AI tool, a formatter, git) changes an open file, load the new text at once and say how long it took. Files with unsaved edits ask first.", [] { return E.hot_reload; }, [] { E.hot_reload = !E.hot_reload; settings_save(); });
+    toggle("Explorer", "Outline", "Show the symbols of the active file (types, functions, headings) in the Files tab.", [] { return E.outline_on; }, [] { do_action(A_OUTLINE); });
+    toggle("Explorer", "Pin the sidebar", "Keep the sidebar open beside the editor instead of floating over it.", [] { return E.pinned; }, [] { do_action(A_PIN); });
+    toggle("Explorer", "Compact folders", "Show a chain of folders that each hold only one folder as one row (a/b/c).", [] { return E.compact_folders; }, [] { E.compact_folders = !E.compact_folders; Tree::set_compact(E.compact_folders); E.tree.refresh(); settings_save(); });
+    choice("Source Control", "When committing with nothing staged", "Smart commit: stage everything, never do that, or ask each time.", [] { static const char *n[] = {"Ask", "Stage all changes", "Never"}; return std::string(n[std::max(0, std::min(2, E.g.smart_commit))]); },
+           [] { pick_custom("When committing with nothing staged", {{"Ask each time", 0, E.g.smart_commit == 0}, {"Always stage all changes", 1, E.g.smart_commit == 1}, {"Never stage automatically", 2, E.g.smart_commit == 2}}, [](const Ed::PItem &it) { E.g.smart_commit = it.id; settings_save(); }); });
+    toggle("Source Control", "Ask before Sync Changes", "Confirm before the pull and push that Sync Changes runs.", [] { return E.g.sync_confirm; }, [] { E.g.sync_confirm = !E.g.sync_confirm; settings_save(); });
+    toggle("Source Control", "Show changes as a tree", "List the changed files grouped by folder instead of as a flat list.", [] { return E.g.tree_view; }, [] { E.g.tree_view = !E.g.tree_view; settings_save(); });
+    choice("Terminal", "Terminal", "The built-in panel (Ctrl+`), or an external terminal emulator found on this system.", [] { return E.term_choice == "builtin" ? std::string("Built-in panel") : E.term_choice.substr(E.term_choice.find(':') + 1); }, [] { open_picker(PICK_TERMINAL); });
+    action("Files", "Settings file", "Everything on this page is stored in a plain text file.", "Open settings.ini", [] { open_path(settings_path()); E.mode = M_EDIT; g_set.open = false; });
+    action("Files", "Remote connections", "The saved ssh, sftp, ftp and smb connections.", "Open remotes.ini", [] { const char *x2 = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME"); open_path((x2 && *x2 ? std::string(x2) : std::string(h ? h : ".") + "/.config") + "/hootedit/remotes.ini"); E.mode = M_EDIT; g_set.open = false; });
+    action("Files", "Reset", "Put every setting on this page back to its default.", "Reset all", [] {
+        dlg_show("Reset all settings?", "Every setting on this page goes back to its default. Your files and connections are not touched.", {"Reset", "Cancel"}, [](int b, const std::string &) {
+            if (b != 0) return;
+            E.vim_on = false; E.lint_on = true; E.lint_ignore.clear(); E.preview_tabs = true; E.hot_reload = true; E.outline_on = false; E.compact_folders = true; Tree::set_compact(true); E.tree.refresh();
+            E.show_hud = true; E.g.smart_commit = 0; E.g.sync_confirm = true; E.g.tree_view = false; E.term_choice = "builtin"; E.pinned = true; vim_reset(); for (auto &kv : g_lint) kv.second.rev = ~0ull;
+            settings_save(); E.status_msg = "settings reset";
+        });
+    });
+    return items;
+}
+
+bool set_matches(const SetItem &it, const std::string &q) {
+    if (q.empty()) return true;
+    std::string hay = std::string(it.cat) + " " + it.label + " " + it.desc, ql;
+    for (char &c : hay) c = (char)tolower((unsigned char)c);
+    for (char c : q) ql += (char)tolower((unsigned char)c);
+    size_t p = 0;
+    for (size_t i = 0; i < ql.size();) {   /* every word of the query must appear */
+        size_t e = ql.find(' ', i);
+        if (e == std::string::npos) e = ql.size();
+        if (e > i && hay.find(ql.substr(i, e - i)) == std::string::npos) return false;
+        i = e + 1;
+    }
+    (void)p;
+    return true;
+}
+
+void set_rebuild() {
+    g_set.rows.clear();
+    const std::vector<SetItem> &items = set_items();
+    const char *last = nullptr;
+    for (size_t c = 0; c < sizeof SET_CATS / sizeof *SET_CATS; c++) {
+        if (g_set.q.empty() && (int)c != g_set.cat) continue;
+        for (size_t i = 0; i < items.size(); i++) {
+            if (strcmp(items[i].cat, SET_CATS[c]) != 0 || !set_matches(items[i], g_set.q)) continue;
+            if (last != SET_CATS[c]) { g_set.rows.push_back({-1, SET_CATS[c]}); last = SET_CATS[c]; }
+            g_set.rows.push_back({(int)i, nullptr});
+        }
+    }
+    if (g_set.sel >= (int)g_set.rows.size()) g_set.sel = (int)g_set.rows.size() - 1;
+    while (g_set.sel > 0 && g_set.rows[(size_t)g_set.sel].item < 0) g_set.sel--;
+    if (g_set.sel < 0 || (g_set.sel < (int)g_set.rows.size() && g_set.rows[(size_t)g_set.sel].item < 0)) { g_set.sel = 0; while (g_set.sel < (int)g_set.rows.size() && g_set.rows[(size_t)g_set.sel].item < 0) g_set.sel++; }
+}
+
+void set_open() { g_set.open = true; g_set.q.clear(); g_set.sel = 0; g_set.scroll = 0; set_rebuild(); E.mode = M_SETTINGS; }
+void set_close() { g_set.open = false; if (E.mode == M_SETTINGS) E.mode = M_EDIT; }
+void set_activate(int item) {
+    const SetItem &it = set_items()[(size_t)item];
+    if (it.kind == SK_TOGGLE) { it.flip(); E.status_msg.clear(); }
+    else if (it.act) it.act();
+}
+void set_move(int dir) {
+    int n = (int)g_set.rows.size(), i = g_set.sel;
+    for (int k = 0; k < n; k++) { i += dir; if (i < 0 || i >= n) return; if (g_set.rows[(size_t)i].item >= 0) { g_set.sel = i; return; } }
+}
+
+void draw_settings(const Layout &L) {
+    float top = (float)L.menu_h, bot = (float)L.bar_y, W = (float)E.W, ox = (float)L.side_w;   /* a docked sidebar stays visible, with its cog */
+    set_rebuild();
+    r_rect(E.r, ox, top, W - ox, bot - top, C_EDITOR);
+    float lw = ox + (float)S(210);
+    r_rect(E.r, ox, top, lw - ox, bot - top, C_CHROME);
+    r_rect(E.r, lw, top, 1, bot - top, C_BORDER);
+    hit(ox, top, W - ox, bot - top, H_SIDEBAR, 0);   /* swallows clicks that miss every control */
+    draw_text(E.ui, ox + (float)S(18), ui_base(top + (float)S(14), (float)S(28)), "Settings", C_UI, lw - (float)S(30), FS_BOLD);
+    float y = top + (float)S(54), ch = (float)S(32);
+    const std::vector<SetItem> &items = set_items();
+    for (size_t c = 0; c < sizeof SET_CATS / sizeof *SET_CATS; c++) {
+        int count = 0;
+        for (const SetItem &it : items) if (strcmp(it.cat, SET_CATS[c]) == 0) count++;
+        bool on = g_set.q.empty() && (int)c == g_set.cat;
+        if (on) { r_rect(E.r, ox, y, lw - ox, ch, C_SELROW); r_rect(E.r, ox, y, (float)S(2), ch, C_ACCENT); }
+        else if (hovered(H_SETCAT, (int)c)) r_rect(E.r, ox, y, lw - ox, ch, C_HOVER);
+        draw_text(E.ui, ox + (float)S(18), ui_base(y, ch), SET_CATS[c], on ? C_ACCENT : g_set.q.empty() ? C_UI : C_UI_DIM, lw - ox - (float)S(60));
+        std::string cs = std::to_string(count);
+        draw_text(E.ui, lw - (float)S(16) - text_width(E.ui, cs.c_str()), ui_base(y, ch), cs.c_str(), C_UI_FAINT, (float)S(30));
+        hit(ox, y, lw - ox, ch, H_SETCAT, (int)c);
+        y += ch;
+    }
+    // the search box
+    float px = lw + (float)S(30), pw = W - px - (float)S(30);
+    float sw = std::min(pw, (float)S(620)), sy = top + (float)S(16), sh = (float)S(34);
+    r_rect(E.r, px, sy, sw, sh, g_set.q.empty() ? C_FIELD : C_ACCENT);
+    r_rect(E.r, px + 1, sy + 1, sw - 2, sh - 2, C_FIELD);
+    float pen = draw_text(E.ui, px + (float)S(12), ui_base(sy, sh), g_set.q.empty() ? "Search settings" : g_set.q.c_str(), g_set.q.empty() ? C_UI_FAINT : C_UI, sw - (float)S(24));
+    if (E.blink_on && !g_set.q.empty()) r_rect(E.r, pen + 1, sy + (float)S(8), std::max(1.f, E.scale), sh - (float)S(16), C_CURSOR);
+    // the rows
+    float list_top = sy + sh + (float)S(14);
+    r_clip(E.r, (int)(lw + 1), (int)list_top, (int)(W - lw - 1), (int)(bot - list_top));
+    float rowh = (float)S(86), headh = (float)S(36), content = 0;
+    for (const SetRow &r : g_set.rows) content += r.item < 0 ? headh : rowh;
+    float max_scroll = std::max(0.f, content - (bot - list_top) + (float)S(20));
+    g_set.scroll = std::max(0.f, std::min(g_set.scroll, max_scroll));
+    // keep the selected row in view
+    {
+        float yy = 0;
+        for (size_t i = 0; i < g_set.rows.size(); i++) {
+            float h = g_set.rows[i].item < 0 ? headh : rowh;
+            if ((int)i == g_set.sel) { if (yy < g_set.scroll) g_set.scroll = yy; else if (yy + h > g_set.scroll + (bot - list_top)) g_set.scroll = yy + h - (bot - list_top); }
+            yy += h;
+        }
+        g_set.scroll = std::max(0.f, std::min(g_set.scroll, max_scroll));
+    }
+    float ry = list_top - g_set.scroll;
+    if (g_set.rows.empty()) draw_text(E.ui, px, ui_base(list_top + (float)S(10), (float)S(24)), "No setting matches that.", C_UI_DIM, pw);
+    for (size_t i = 0; i < g_set.rows.size(); i++) {
+        const SetRow &r = g_set.rows[i];
+        if (r.item < 0) {
+            if (ry + headh > list_top && ry < bot) draw_text(E.ui, px, ui_base(ry + (float)S(6), (float)S(24)), r.heading, C_GROUP, pw, FS_BOLD);
+            ry += headh;
+            continue;
+        }
+        if (ry + rowh > list_top && ry < bot) {
+            const SetItem &it = items[(size_t)r.item];
+            bool sel = (int)i == g_set.sel;
+            if (sel) { r_rect(E.r, px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, C_SELROW); r_rect(E.r, px - (float)S(10), ry + 2, (float)S(2), rowh - 4, C_ACCENT); }
+            else if (hovered(H_SETROW, r.item)) r_rect(E.r, px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, C_HOVER);
+            hit(px - (float)S(10), ry + 2, pw + (float)S(20), rowh - 4, H_SETROW, r.item);   /* before the control: the last hit box wins */
+            float cw = it.kind == SK_TOGGLE ? (float)S(44) : (float)S(220);
+            float textw = pw - cw - (float)S(30);
+            draw_text(E.ui, px, ui_base(ry + (float)S(8), (float)S(22)), it.label.c_str(), C_UI, textw, FS_BOLD);
+            // the description, wrapped to two lines at most
+            static std::unordered_map<int, std::pair<float, std::vector<std::string>>> wrapped;   /* shaping text is the slow part: wrap once per width */
+            auto &wr = wrapped[r.item];
+            if (wr.first != textw) { wr.first = textw; wr.second = wrap_lines(it.desc, textw); }
+            const std::vector<std::string> &lines = wr.second;
+            for (size_t k = 0; k < lines.size() && k < 3; k++) draw_text(E.ui, px, ui_base(ry + (float)S(30) + (float)k * (float)S(16), (float)S(18)), lines[k].c_str(), C_UI_FAINT, textw);
+            float cx = px + pw - cw, cy = ry + (rowh - (float)S(28)) / 2;   /* the control sits in the middle of the row */
+            if (it.kind == SK_TOGGLE) {
+                bool on = it.on();
+                float tw = (float)S(40), th = (float)S(20), ty = ry + (rowh - th) / 2;
+                draw_pill(cx + cw - tw, ty, tw, th, on ? C_ACCENT : C_BORDER);
+                draw_dot(cx + cw - tw + (on ? tw - th / 2 : th / 2), ty + th / 2, (int)(th - (float)S(6)) , on ? C_ON_ACCENT : C_UI_DIM);
+                hit(cx, ry + 2, cw, rowh - 4, H_SETCTL, r.item);
+            } else {
+                std::string v = it.value();
+                bool btn = it.kind == SK_ACTION;
+                r_rect(E.r, cx, cy, cw, (float)S(28), hovered(H_SETCTL, r.item) ? C_ACCENT : (btn ? C_BORDER : C_FIELD));
+                r_rect(E.r, cx + 1, cy + 1, cw - 2, (float)S(26), btn ? (hovered(H_SETCTL, r.item) ? C_ACCENT : C_HOVER) : C_FIELD);
+                float vw = text_width(E.ui, v.c_str());
+                float vx = btn ? cx + (cw - std::min(vw, cw - (float)S(16))) / 2 : cx + (float)S(10);
+                draw_text(E.ui, vx, ui_base(cy, (float)S(28)), v.c_str(), btn && hovered(H_SETCTL, r.item) ? C_ON_ACCENT : C_UI, cw - (float)S(36));
+                if (!btn) draw_icon(IC_CHEV_D, cx + cw - (float)S(22), cy + (float)S(6), S(16), C_UI_DIM);
+                hit(cx, cy, cw, (float)S(28), H_SETCTL, r.item);
+            }
+        }
+        ry += rowh;
+    }
+    r_clip_off(E.r);
+    if (max_scroll > 0) {   /* a thin scroll bar */
+        float trk = bot - list_top, th = std::max((float)S(24), trk * trk / (trk + max_scroll));
+        r_rect(E.r, W - (float)S(6), list_top + (trk - th) * (g_set.scroll / max_scroll), (float)S(3), th, C_BORDER);
+    }
+}
+
+void build_frame() {
+    Layout L = layout();
+    Doc &d = D();
+    if (E.follow) { ensure_visible(L); E.follow = false; }
+    E.hits.clear();
+    E.hit_floor = (float)L.bar_y;
+    size_t cl = d.buf.line_of(d.cur), cb = d.cur - d.buf.line_start(cl);
+    std::string t;
+    double tm0 = E.timing ? now_s() : 0;
+
+    r_rect(E.r, 0, 0, (float)E.W, (float)E.H, C_EDITOR);
+
+    /* ---- editor column: tab row ---- */
+    float ex = (float)L.ed_x, ew = (float)(E.W - L.ed_x);
+    bool can_preview = !d.dv && !d.mv && preview_format(d.path) != PreviewFormat::None;
+    float preview_w = can_preview ? (float)S(260) : 0.f;
+    float tab_ew = std::max(0.f, ew - preview_w);
+    if (can_preview && E.preview_open && E.preview_split) {
+        preview_refresh(d);
+        E.preview_scroll = std::min(preview_max_scroll(L, (float)(E.W - L.split_x)), (float)d.top * (float)E.rowh);
+    }
+    r_rect(E.r, ex, (float)L.tab_y, ew, (float)L.tab_h, C_CHROME);
+    r_rect(E.r, ex, (float)(L.tab_y + L.tab_h - 1), ew, 1, C_BORDER);
+    {
+        float tx = ex, ty = (float)L.tab_y, th = (float)L.tab_h;
+        if (splash()) hit(tx, ty, tab_ew, th, H_TABSPACE, 0);   /* no tabs yet: a double click anywhere on the strip opens an empty one */
+        const size_t nt = splash() ? 0 : E.docs.size();
+        std::vector<float> tw(nt);
+        float total = 0;
+        for (size_t i = 0; i < nt; i++) {
+            tw[i] = std::min((float)S(240), std::max((float)S(90), text_width(E.ui, E.docs[i]->name().c_str()) + (float)S(48)));
+            total += tw[i];
+        }
+        E.tab_x.assign(nt, 0); E.tab_w = tw;
+        { float acc = 0; for (size_t i = 0; i < nt; i++) { E.tab_x[i] = acc; acc += tw[i]; } }
+        if (E.tab_reveal && E.active >= 0 && (size_t)E.active < nt) {   /* a switch by keyboard or click scrolls the strip just enough to show the tab */
+            float l = E.tab_x[(size_t)E.active], r = l + tw[(size_t)E.active];
+            if (l < E.tab_scroll) E.tab_scroll = l;
+            else if (r > E.tab_scroll + tab_ew) E.tab_scroll = r - tab_ew;
+        }
+        E.tab_reveal = false;
+        E.tab_scroll = std::max(0.f, std::min(E.tab_scroll, total - tab_ew));
+        r_clip(E.r, (int)ex, (int)ty, (int)tab_ew, (int)th);
+        tx = ex - E.tab_scroll;
+        for (size_t i = 0; i < nt; i++) {
+            bool act = (int)i == E.active;
+            bool lift = E.tab_dragging && E.tab_press == (int)i;
+            if (tx + tw[i] < ex || tx > ex + tab_ew) { tx += tw[i]; continue; }   /* scrolled out of the strip */
+            r_rect(E.r, tx, ty, tw[i], th, act || lift ? C_EDITOR : C_CHROME);
+            if (act) r_rect(E.r, tx, ty + th - (float)S(2), tw[i], (float)S(2), C_ACCENT);
+            if (lift) r_rect(E.r, tx, ty, tw[i], (float)S(2), C_ACCENT);
+            r_rect(E.r, tx + tw[i] - 1, ty, 1, th, C_BORDER);
+            float ix = tx + (float)S(14);
+            const Doc &dd = *E.docs[i];
+            std::string nm = dd.name();
+            if (dd.preview && dd.modified()) E.docs[i]->preview = false;   /* typing in a preview keeps the tab */
+            draw_text(E.ui, ix, ui_base(ty, th), nm.c_str(), act ? C_UI : C_UI_DIM, tw[i] - (float)S(46), dd.preview ? FS_ITALIC : FS_REGULAR);
+            bool mod = dd.modified(), hv = hovered(H_TABCLOSE, (int)i) || hovered(H_TAB, (int)i);
+            float cx = tx + tw[i] - (float)S(26), cy = ty + (th - (float)S(16)) / 2;
+            if (mod && !hovered(H_TABCLOSE, (int)i)) draw_icon(IC_DOT, cx, cy, S(16), C_UI);
+            else if (act || hv) draw_icon(IC_CLOSE, cx, cy, S(16), hovered(H_TABCLOSE, (int)i) ? C_UI : C_UI_DIM);
+            auto clipped_hit = [&](float x0, float w0, int kind) {   /* a tab half under the sidebar must not take its clicks */
+                float x1 = std::max(x0, ex), x2 = std::min(x0 + w0, ex + tab_ew);
+                if (x2 > x1) hit(x1, ty, x2 - x1, th, kind, (int)i);
+            };
+            clipped_hit(tx, tw[i] - (float)S(30), H_TAB);
+            clipped_hit(tx + tw[i] - (float)S(30), (float)S(30), H_TABCLOSE);
+            tx += tw[i];
+        }
+        r_clip_off(E.r);
+        if (nt && tx < ex + tab_ew) hit(tx, ty, ex + tab_ew - tx, th, H_TABSPACE, 0);   /* the empty part of the strip: a double click opens a new empty tab */
+        if (can_preview) {
+            float bx = ex + tab_ew, by = ty + (float)S(4), bh = th - (float)S(8);
+            preview_mode_init();
+            float widths[4] = {(float)S(76), (float)S(48), (float)S(64), preview_w - (float)S(188)};
+            const char *labels[4] = {E.preview_open ? "Source" : "Preview", "Split", E.preview_target ? "GitLab" : "GitHub", E.preview_light ? "Light" : "Dark"};
+            for (int i = 0; i < 4; i++) {
+                bool selected = i == 0 ? E.preview_open : i == 1 ? E.preview_split : i == 2 ? true : false;
+                uint32_t bg = selected ? C_SELROW : hovered(H_PREVIEW, i) ? C_HOVER : C_CHROME;
+                r_rect(E.r, bx, by, widths[i], bh, bg);
+                if (selected) r_rect(E.r, bx, by + bh - (float)S(2), widths[i], (float)S(2), C_ACCENT);
+                draw_text(E.ui, bx + (widths[i] - text_width(E.ui, labels[i])) / 2, ui_base(by, bh), labels[i],
+                          selected ? C_ACCENT : C_UI_DIM, widths[i]);
+                hit(bx, ty, widths[i], th, H_PREVIEW, i);
+                bx += widths[i];
+            }
+        }
+    }
+    double tm1 = E.timing ? now_s() : 0;
+
+    /* ---- editor area ---- */
+    if (splash()) {
+        /* the owl in its tag as a faint watermark, then the name and a hint, centred in the editor area like the empty VS Code window */
+        const char *name = "Hootedit";
+        const char *hint = "Double click or Ctrl+N: new tab   Ctrl+P: open   Ctrl+B: sidebar";
+        float cxm = ex + ew / 2, areah = (float)(L.ed_bottom - L.text_y);
+        int ls = (int)std::max((float)S(96), std::min((float)S(200), std::min(ew, areah) * 0.34f)) / 16 * 16;   /* multiples of 16 px: a resize makes a few sizes, not hundreds */
+        float gap1 = (float)S(24), gap2 = (float)S(16), nameh = (float)S(36), hinth = (float)S(18);
+        float total = (float)ls + gap1 + nameh + gap2 + hinth;
+        float y0 = (float)L.text_y + std::max(0.f, (areah - total) / 2) - (float)S(10);
+        uint32_t wm = ui_mix(C_EDITOR, C_UI, 0.09f), wm_eyes = ui_mix(C_EDITOR, C_ACCENT, 0.34f);
+        draw_icon(IC_LOGO_BODY, cxm - (float)ls / 2, y0, ls, wm);
+        draw_icon(IC_LOGO_EYES, cxm - (float)ls / 2, y0, ls, wm_eyes);
+        float w = text_width(E.big, name);
+        draw_text(E.big, cxm - w / 2, y0 + (float)ls + gap1 + nameh - (float)S(8), name, wm, (float)E.W);
+        draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, y0 + (float)ls + gap1 + nameh + gap2 + (float)S(13), hint, C_UI_FAINT, ew);
+    } else if (d.dv) {
+        draw_diff(L, ex, ew);
+    } else if (d.mv) {
+        draw_merge(L, ex, ew);
+    } else if (E.preview_open && !E.preview_split && preview_format(d.path) != PreviewFormat::None) {
+        draw_preview(L, ex, ew);
+    } else {
+        /* the faint band behind the cursor line also covers the gutter */
+        if (cl >= d.top && cl < d.top + (size_t)L.rows) r_rect(E.r, (float)L.ed_x, (float)(L.text_y + (long)(cl - d.top) * E.rowh), (float)(L.text_x - L.ed_x), (float)E.rowh, C_CURLINE);
+        r_clip(E.r, L.text_x, L.text_y, L.split_x - L.text_x, L.ed_bottom - L.text_y);
+        /* pass 1: the visible lines, their indentation (blank lines borrow from their neighbours) and the active indent guide */
+        int nrows = (int)std::min<size_t>((size_t)L.rows, d.buf.lines() > d.top ? d.buf.lines() - d.top : 0);
+        std::vector<std::string> texts((size_t)nrows);
+        std::vector<int> ind((size_t)nrows);
+        std::vector<char> blank((size_t)nrows);
+        for (int row = 0; row < nrows; row++) { d.buf.line_text(d.top + (size_t)row, texts[(size_t)row]); bool bl; ind[(size_t)row] = indent_cols(texts[(size_t)row], &bl); blank[(size_t)row] = bl; }
+        const int step = indent_step(d);
+        {
+            std::vector<int> fixed(ind);
+            for (int row = 0; row < nrows; row++) {
+                if (!blank[(size_t)row]) continue;
+                int up = 0, down = 0;
+                for (int k = row - 1; k >= 0; k--) if (!blank[(size_t)k]) { up = ind[(size_t)k]; break; }
+                for (int k = row + 1; k < nrows; k++) if (!blank[(size_t)k]) { down = ind[(size_t)k]; break; }
+                fixed[(size_t)row] = std::min(up, down);
+            }
+            ind.swap(fixed);
+        }
+        int act_col = -1, act_lo = 0, act_hi = -1;   /* the guide just left of the cursor line's text, and the rows it runs along */
+        if (cl >= d.top && cl < d.top + (size_t)nrows) {
+            int crow = (int)(cl - d.top), ci = ind[(size_t)crow];
+            if (ci > 0) {
+                act_col = ((ci - 1) / step) * step;
+                act_lo = act_hi = crow;
+                while (act_lo > 0 && ind[(size_t)act_lo - 1] > act_col) act_lo--;
+                while (act_hi + 1 < nrows && ind[(size_t)act_hi + 1] > act_col) act_hi++;
+            }
+        }
+        /* what to mark besides the selection: the other occurrences of a selected word, or every find match */
+        std::string occ;
+        if (d.has_sel() && d.sel_hi() - d.sel_lo() >= 2 && d.sel_hi() - d.sel_lo() <= 64) { occ = d.selection(); if (occ.find('\n') != std::string::npos) occ.clear(); }
+        Regex find_re;
+        bool use_find = false;
+        if (E.mode == M_FIND && !E.find_q.empty()) {
+            bool ic = !E.find_case;
+            if (ic) for (unsigned char c : E.find_q) if (c >= 'A' && c <= 'Z') ic = false;
+            std::string err;
+            use_find = find_re.compile(E.find_regex ? E.find_q : Searcher::escape_literal(E.find_q), ic, &err);
+        }
+        std::unique_ptr<Matcher> find_mp;
+        if (use_find) find_mp.reset(new Matcher(find_re));
+        const std::vector<Conflict> *cfl = conflicts_for(d);
+        long bra = -1, brb = -1;
+        bracket_pair(d, &bra, &brb);
+        long bla = bra >= 0 ? (long)d.buf.line_of((size_t)bra) : -1, blb = brb >= 0 ? (long)d.buf.line_of((size_t)brb) : -1;
+        /* pass 2: per row, bottom layer first (cursor line, matches, selection, indent guides, bracket pair), then the text */
+        for (int row = 0; row < nrows; row++) {
+            size_t line = d.top + (size_t)row;
+            const std::string &tt = texts[(size_t)row];
+            float ry = (float)(L.text_y + row * E.rowh);
+            if (cfl) {
+                size_t ci_ = 0;
+                int ck = conflict_kind(*cfl, (long)line, &ci_);
+                if (ck) {
+                    uint32_t bg = ck == 1 ? ui_mix(C_EDITOR, C_GIT_ADD, 0.34) : ck == 2 ? ui_mix(C_EDITOR, C_GIT_ADD, 0.14) : ck == 7 ? ui_mix(C_EDITOR, C_ACCENT, 0.36) : ck == 6 ? ui_mix(C_EDITOR, C_ACCENT, 0.16) : ui_mix(C_EDITOR, C_FG, 0.10);
+                    r_rect(E.r, (float)L.text_x, ry, (float)(L.split_x - L.text_x), (float)E.rowh, bg);
+                }
+            }
+            if (line == cl) r_rect(E.r, (float)L.text_x, ry, (float)(L.split_x - L.text_x), (float)E.rowh, C_CURLINE);
+            auto mark = [&](size_t b0, size_t b1, uint32_t col) {
+                int c0 = col_of(tt, b0) - d.left, c1 = col_of(tt, b1) - d.left;
+                c0 = std::max(c0, 0); c1 = std::min(c1, L.cols);
+                if (c1 > c0) r_rect(E.r, (float)(L.text_x + c0 * E.cw), ry, (float)((c1 - c0) * E.cw), (float)E.rowh, col);
+            };
+            if (use_find) { size_t from = 0, ms, me; int guard = 0; while (from <= tt.size() && guard++ < 200 && find_mp->find(tt.data(), tt.size(), from, &ms, &me)) { if (me > ms) mark(ms, me, C_OCC); from = me > ms ? me : ms + 1; } }
+            else if (!occ.empty()) { size_t at = 0; while ((at = tt.find(occ, at)) != std::string::npos) { mark(at, at + occ.size(), C_OCC); at += occ.size(); } }
+            if (d.has_sel()) {
+                size_t ls = d.buf.line_start(line), le = ls + tt.size();
+                size_t lo = d.sel_lo(), hi = d.sel_hi();
+                if (hi > ls && lo <= le && !(lo == le && hi == le)) {
+                    int c0 = col_of(tt, lo > ls ? lo - ls : 0), c1 = col_of(tt, std::min(hi, le) - ls);
+                    if (hi > le && line + 1 < d.buf.lines()) c1++;
+                    c0 = std::max(c0 - d.left, 0);
+                    c1 = std::min(c1 - d.left, L.cols);
+                    if (c1 > c0) r_rect(E.r, (float)(L.text_x + c0 * E.cw), ry, (float)((c1 - c0) * E.cw), (float)E.rowh, C_SEL);
+                }
+            }
+            if (E.lint_on && !d.dv && !d.mv) {   /* wavy underline under every problem on this row */
+                auto lit = g_lint.find(&d);
+                if (lit != g_lint.end() && lit->second.rev == d.buf.revision() && !lit->second.d.empty()) {
+                    auto r = lint_line_range(lit->second.d, line);
+                    for (size_t k = r.first; k < r.second; k++) {
+                        const Diag &dg = lit->second.d[k];
+                        size_t b0 = std::min<size_t>(dg.c0, tt.size()), b1 = std::min<size_t>(dg.c1, tt.size());
+                        int c0 = col_of(tt, b0) - d.left, c1 = col_of(tt, b1) - d.left;
+                        if (dg.c1 > tt.size()) c1 = col_of(tt, tt.size()) - d.left + 1;
+                        c0 = std::max(c0, 0); c1 = std::min(c1, L.cols);
+                        if (c1 > c0) lint_squiggle((float)(L.text_x + c0 * E.cw), ry + (float)E.rowh - std::max(2.f, 2.f * E.scale), (float)((c1 - c0) * E.cw), lint_color(dg.sev));
+                    }
+                }
+            }
+            if (vim_active() && g_vim.mode == Vim::VBLOCK) {   /* the Ctrl+V block: one rectangle per line */
+                size_t bl0, bl1;
+                int bc0, bc1;
+                if (g_vim.block_rect(d, &bl0, &bl1, &bc0, &bc1) && line >= bl0 && line <= bl1) {
+                    int a = std::max(bc0 - d.left, 0), b = std::min((bc1 >= (1 << 27) ? std::max(col_of(tt, tt.size()), bc0 + 1) : bc1 + 1) - d.left, L.cols);
+                    if (b > a) r_rect(E.r, (float)(L.text_x + a * E.cw), ry, (float)((b - a) * E.cw), (float)E.rowh, C_SEL);
+                }
+            }
+            for (int g = 0; g < ind[(size_t)row]; g += step) {   /* one faint line per indent level that the text is inside of */
+                if (g < d.left) continue;
+                bool act = g == act_col && row >= act_lo && row <= act_hi;
+                r_rect(E.r, (float)(L.text_x + (g - d.left) * E.cw), ry, std::max(1.f, E.scale), (float)E.rowh, act ? C_GUIDE_ACT : C_GUIDE);
+            }
+            if ((long)line == bla) { size_t b0 = (size_t)bra - d.buf.line_start(line); mark(b0, b0 + 1, C_BRACKET); }
+            if ((long)line == blb) { size_t b0 = (size_t)brb - d.buf.line_start(line); mark(b0, b0 + 1, C_BRACKET); }
+            double tr0 = E.timing ? now_s() : 0;
+            const std::vector<RInst> &v = row_instances(tt, L.cols, d.lang, d.line_state(line));
+            if (!v.empty()) r_push_at(E.r, v.data(), (int)v.size(), (float)L.text_x, ry);
+            if (E.timing) E.t_rows += now_s() - tr0;
+        }
+        double tf0 = E.timing ? now_s() : 0;
+        r_clip_off(E.r);
+        if (E.timing) E.t_flush += now_s() - tf0;
+        {   /* a thin scrollbar on the right edge of the text; the thumb is the visible part of the file */
+            float sty, sth, sy0, sh;
+            if (sb_geom(L, d, &sty, &sth, &sy0, &sh)) {
+                float sx = (float)(L.split_x - S(10));
+                bool hot = E.sb_drag || (E.mx >= sx - (float)S(2) && E.my >= sty && E.my < sty + sth);
+                r_rect(E.r, sx + (float)S(2), sy0, (float)S(6), sh, hot ? C_SB_HOT : C_SB_THUMB);
+                if (cl >= 0) { float cy = sty + ((float)cl / (float)std::max<size_t>(1, d.buf.lines() - 1)) * sth; r_rect(E.r, sx + (float)S(2), cy, (float)S(6), std::max(1.f, E.scale), C_ACCENT); }
+                hit((float)(L.split_x - S(14)), sty, (float)S(14), sth, H_VSCROLL, 0);
+            }
+        }
+        for (int row = 0; row < L.rows; row++) {
+            size_t line = d.top + (size_t)row;
+            if (line >= d.buf.lines()) break;
+            char num[24];
+            snprintf(num, sizeof num, "%zu", line + 1);
+            float colw = (float)(L.text_x - L.ed_x - S(18));   /* the number column: the gutter without the space before the text */
+            float x = (float)L.ed_x + (colw - (float)(strlen(num) * (size_t)E.cw)) / 2;   /* centered, so 1, 42 and 1337 share one axis */
+            draw_text(E.font, x, (float)(L.text_y + row * E.rowh + E.rowasc), num, line == cl ? C_GUTTER_CUR : C_GUTTER, (float)E.W);
+        }
+        if (E.lint_on && !d.dv && !d.mv) {   /* a thin bar at the far left of every line that has a problem, in the colour of the worst one */
+            auto lit = g_lint.find(&d);
+            if (lit != g_lint.end() && lit->second.rev == d.buf.revision() && !lit->second.d.empty()) {
+                const std::vector<Diag> &dv = lit->second.d;
+                for (int row = 0; row < L.rows; row++) {
+                    size_t line = d.top + (size_t)row;
+                    if (line >= d.buf.lines()) break;
+                    auto r = lint_line_range(dv, line);
+                    if (r.first == r.second) continue;
+                    int worst = SEV_HINT;
+                    for (size_t k = r.first; k < r.second; k++) worst = std::min<int>(worst, dv[k].sev);
+                    if (worst == SEV_HINT) continue;
+                    r_rect(E.r, 1.f, (float)(L.text_y + row * E.rowh + 2), (float)S(3), (float)(E.rowh - 4), lint_color(worst));
+                }
+            }
+        }
+        if (GutterCache *gc = gutter_for(d)) {   /* change bars: green added, blue changed, a red wedge where lines were removed */
+            const std::vector<DiffHunk> &hs = gc->hunks;
+            size_t lo = 0, hi = hs.size();
+            while (lo < hi) { size_t mid = (lo + hi) / 2; if (hs[mid].b0 + std::max(hs[mid].bn, 1) <= (int)d.top) lo = mid + 1; else hi = mid; }
+            float bx = (float)(L.text_x - S(9)), bw = (float)S(3);
+            for (size_t k = lo; k < hs.size() && hs[k].b0 <= (int)(d.top + (size_t)L.rows); k++) {
+                const DiffHunk &h = hs[k];
+                if (h.bn > 0) {
+                    long r0 = std::max<long>(h.b0, (long)d.top), r1 = std::min<long>(h.b0 + h.bn, (long)(d.top + (size_t)L.rows));
+                    if (r1 > r0) {
+                        float y0 = (float)(L.text_y + (r0 - (long)d.top) * E.rowh);
+                        r_rect(E.r, bx, y0, bw, (float)((r1 - r0) * E.rowh), h.an == 0 ? C_GUT_ADD : C_GUT_MOD);
+                        hit((float)(L.text_x - S(14)), y0, (float)S(14), (float)((r1 - r0) * E.rowh), H_GUTTER, h.b0);
+                    }
+                } else {
+                    long row = (long)h.b0 - (long)d.top;
+                    if (row >= 0 && row <= L.rows) {
+                        float y0 = (float)(L.text_y + row * E.rowh);
+                        draw_icon(IC_TRI_R, bx - (float)S(1), y0 - (float)S(5), S(10), C_GUT_DEL);
+                        hit((float)(L.text_x - S(14)), y0 - (float)S(6), (float)S(14), (float)S(12), H_GUTTER, h.b0);
+                    }
+                }
+            }
+        }
+        if (E.blink_on && E.mode == M_EDIT && cl >= d.top && cl < d.top + (size_t)L.rows) {
+            d.buf.line_text(cl, t);
+            int c = col_of(t, cb) - d.left;
+            bool blk = vim_active() && g_vim.block_cursor();
+            if (c >= 0 && c <= L.cols) {
+                float cx0 = (float)(L.text_x + c * E.cw), cy0 = (float)(L.text_y + (long)(cl - d.top) * E.rowh);
+                r_rect(E.r, cx0, cy0, blk ? (float)E.cw : std::max(1.f, 1.5f * E.scale), (float)E.rowh, C_CURSOR);
+                if (blk && cb < t.size() && t[cb] != ' ' && t[cb] != '\t') {   /* the letter under a block cursor is drawn again in the editor colour so it stays readable */
+                    size_t n = 1;
+                    while (cb + n < t.size() && ((unsigned char)t[cb + n] & 0xC0) == 0x80) n++;
+                    std::string ch = t.substr(cb, n);
+                    draw_text(E.font, cx0, cy0 + (float)E.rowasc, ch.c_str(), C_EDITOR, (float)E.cw * 2);
+                }
+            }
+        }
+        draw_peek(L, d);
+        draw_conflict_actions(L, d);
+        draw_blame_tip(L, d);
+    }
+    if (E.preview_open && E.preview_split && can_preview) {
+        r_rect(E.r, (float)L.split_x - (float)S(1), (float)L.text_y, (float)S(1), (float)(L.ed_bottom - L.text_y), C_BORDER);
+        draw_preview(L, (float)L.split_x, (float)(E.W - L.split_x));
+    }
+    double tm3 = E.timing ? now_s() : 0;
+
+    if (L.panel_h > 0) draw_panel(L);
+
+    E.hit_floor = 1e9f;   /* the status bar owns the area below the editor */
+    /* ---- status bar ---- */
+    float by0 = (float)L.bar_y, bh = (float)L.status_h;
+    r_rect(E.r, 0, by0, (float)E.W, bh, C_CHROME);
+    r_rect(E.r, 0, by0, (float)E.W, 1, C_BORDER);
+    float sy = ui_base(by0, bh);
+    float rx = (float)E.W - (float)S(10);
+    {   /* right side, right to left: language, line ending, encoding, indent, position */
+        d.buf.line_text(cl, t);
+        std::string items[5] = {lang_name(d.lang), d.eol, "UTF-8", d.indent, sfmt("Ln %zu, Col %d", cl + 1, col_of(t, cb) + 1)};
+        if (d.has_sel()) items[4] += sfmt(" (%zu selected)", d.sel_hi() - d.sel_lo());
+        if (d.mv) { items[4] = sfmt("%d unresolved", d.mv->unresolved); items[1] = "merge"; items[3] = "three-way"; }
+        if (d.dv) { items[4] = d.dv->m.hunks.empty() ? "no changes" : sfmt("%zu change%s", d.dv->m.hunks.size(), d.dv->m.hunks.size() == 1 ? "" : "s"); items[1] = "diff"; items[3] = d.dv->vinline ? "inline" : "side by side"; }
+        for (int i = 0; i < 5; i++) {
+            float w = text_width(E.ui, items[(size_t)i].c_str());
+            float x = rx - w;
+            if (i == 0) { if (hovered(H_ACT, A_LANG)) r_rect(E.r, x - (float)S(6), by0 + 1, w + (float)S(12), bh - 1, C_HOVER); hit(x - (float)S(6), by0, w + (float)S(12), bh, H_ACT, A_LANG); }
+            draw_text(E.ui, x, sy, items[(size_t)i].c_str(), C_UI_DIM, w + 2);
+            rx = x - (float)S(18);
+        }
+        if (E.lint_on && !d.dv && !d.mv) {   /* problem counts; a click lists them */
+            const LintState *ls_ = lint_state(d);
+            if (ls_ && ls_->rev == d.buf.revision() && (ls_->counts[SEV_ERROR] || ls_->counts[SEV_WARN])) {
+                std::string pc;
+                if (ls_->counts[SEV_ERROR]) pc += sfmt("%d error%s", ls_->counts[SEV_ERROR], ls_->counts[SEV_ERROR] == 1 ? "" : "s");
+                if (ls_->counts[SEV_WARN]) pc += (pc.empty() ? "" : "  ") + sfmt("%d warning%s", ls_->counts[SEV_WARN], ls_->counts[SEV_WARN] == 1 ? "" : "s");
+                float w = text_width(E.ui, pc.c_str()), x = rx - w;
+                if (hovered(H_ACT, A_PROBLEMS)) r_rect(E.r, x - (float)S(6), by0 + 1, w + (float)S(12), bh - 1, C_HOVER);
+                draw_text(E.ui, x, sy, pc.c_str(), ls_->counts[SEV_ERROR] ? C_RED : C_ORANGE, w + 2);
+                hit(x - (float)S(6), by0, w + (float)S(12), bh, H_ACT, A_PROBLEMS);
+                rx = x - (float)S(18);
+            }
+        }
+    }
+    {   /* left side: branch, then the Lestrix-style performance segments */
+        float lx = (float)S(10);
+        if (E.git.repo) {
+            draw_icon(IC_GIT, lx, by0 + (bh - (float)S(13)) / 2, S(13), C_UI_DIM);
+            float pen = draw_text(E.ui, lx + (float)S(18), sy, E.git.branch.c_str(), C_UI_DIM, (float)S(160));
+            hit(lx, by0, pen - lx, bh, H_ACT, A_VIEW_GIT);
+            lx = pen + (float)S(18);
+        }
+        if (const GitBlame *bl = blame_for(d, cl)) {
+            std::string bt = blame_text(*bl, false);
+            float bw2 = std::min(text_width(E.ui, bt.c_str()), std::max(0.f, rx - lx - (float)S(200)));
+            if (bw2 > (float)S(60)) {
+                if (hovered(H_BLAME, 0)) r_rect(E.r, lx - (float)S(6), by0 + 1, bw2 + (float)S(12), bh - 1, C_HOVER);
+                draw_text(E.ui, lx, sy, bt.c_str(), C_UI_DIM, bw2 + 2);
+                hit(lx - (float)S(6), by0, bw2 + (float)S(12), bh, H_BLAME, 0);
+                lx += bw2 + (float)S(18);
+            }
+        }
+        std::string last = E.ops.empty() ? std::string() : (E.ops.back().brief.empty() ? E.ops.back().name : E.ops.back().brief) + "  " + fmt_ms(E.ops.back().ms);
+        std::string left = E.status_msg.empty() ? (!E.show_hud ? std::string() : last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
+        if (vim_active() && !d.dv && !d.mv) {
+            std::string vl = g_vim.label();
+            float vw = draw_text(E.ui, lx, sy, vl.c_str(), g_vim.typing() ? C_GREEN : C_ACCENT, std::max(0.f, rx - lx), FS_BOLD);
+            lx = vw + (float)S(14);
+        }
+        uint32_t left_col = E.status_msg.empty() ? C_UI_FAINT : C_UI_DIM;
+        if (E.status_msg.empty()) if (const Diag *cd = lint_at_cursor(d)) { left = cd->msg + "  [" + cd->code + "]"; left_col = lint_color(cd->sev); }   /* what is wrong where the cursor is */
+        draw_text(E.ui, lx, sy, left.c_str(), left_col, std::max(0.f, rx - lx));
+        if (vim_active() && g_vim.cmd_kind) {   /* the vim command line takes over the whole bar, like the last line of the terminal */
+            r_rect(E.r, 0, by0, (float)E.W, bh, C_CHROME);
+            r_rect(E.r, 0, by0, (float)E.W, 1, C_BORDER);
+            std::string cl = std::string(1, g_vim.cmd_kind) + g_vim.cmd;
+            float pen = draw_text(E.ui, (float)S(10), sy, cl.c_str(), C_UI, (float)E.W - (float)S(20));
+            if (E.blink_on) r_rect(E.r, pen + 1, by0 + (float)S(4), (float)S(8), bh - (float)S(8), C_CURSOR);
+        }
+    }
+    if (E.timing) { E.t_gutter += tm3 - tm1; E.t_status += now_s() - tm3; E.t_top += tm1 - tm0; }
+
+    /* ---- sidebar ---- */
+    E.hit_floor = (float)L.bar_y;
+    if (E.side_open) draw_sidebar(L);
+    E.hit_floor = 1e9f;   /* menus, the command box and dialogs may go anywhere */
+
+    if (g_set.open) draw_settings(L);
+
+    /* ---- menu bar and command box (drawn last so menus and the box sit above the sidebar) ---- */
+    float menu_end;
+    draw_menu_bar(L, &menu_end);
+    float mh = (float)L.menu_h;
+    std::string lname = lang_name(d.lang);
+    float lw = text_width(E.ui, lname.c_str()) + (float)S(34);
+    float bw = std::min((float)E.W * 0.36f, (float)S(560));
+    float bx = std::max(((float)E.W - bw) / 2, menu_end + (float)S(40));
+    bw = std::min(bw, (float)E.W - bx - lw - (float)S(24));
+    float by = (float)S(3), bhh = mh - (float)S(6);
+    if (bw > (float)S(120)) {
+        bool active_box = E.mode == M_FIND || E.mode == M_QUICK;
+        r_rect(E.r, bx, by, bw, bhh, active_box ? C_BOX_LINE : C_BOX_LINE);
+        r_rect(E.r, bx + 1, by + 1, bw - 2, bhh - 2, C_BOX);
+        if (active_box) r_rect(E.r, bx, by + bhh - 2, bw, 2, C_ACCENT);
+        hit(bx, by, bw, bhh, H_BOX, 0);
+        float tx0 = bx + (float)S(10);
+        if (E.mode == M_FIND || E.mode == M_QUICK) {
+            const std::string &q = E.mode == M_FIND ? E.find_q : E.quick_q;
+            float msgw = E.mode == M_FIND && !E.find_msg.empty() ? text_width(E.ui, E.find_msg.c_str()) + (float)S(10) : 0;
+            float togw = E.mode == M_FIND ? (float)S(54) : 0.f;
+            if (E.mode == M_FIND) {   /* case and regex toggles inside the box, like the sidebar search */
+                const char *lab[2] = {"Aa", ".*"};
+                int ids[2] = {A_TOG_CASE, A_TOG_REGEX};
+                bool on[2] = {E.find_case, E.find_regex};
+                float tx = bx + bw - togw - (float)S(4);
+                for (int k2 = 0; k2 < 2; k2++) {
+                    float w = (float)S(24), th = bhh - (float)S(8);
+                    if (on[k2]) r_rect(E.r, tx, by + (float)S(4), w, th, C_ACCENT);
+                    else if (hovered(H_ACT, ids[k2])) r_rect(E.r, tx, by + (float)S(4), w, th, C_HOVER);
+                    draw_text(E.ui, tx + (w - text_width(E.ui, lab[k2])) / 2, ui_base(by + (float)S(4), th), lab[k2], on[k2] ? C_ON_ACCENT : C_UI_DIM, w);
+                    hit(tx, by + (float)S(4), w, th, H_ACT, ids[k2]);
+                    tx += w + (float)S(2);
+                }
+                msgw += togw;
+            }
+            float pen = draw_text(E.ui, tx0, ui_base(by, bhh), q.c_str(), C_UI, bw - (float)S(20) - msgw);
+            if (q.empty()) draw_text(E.ui, tx0, ui_base(by, bhh), E.mode == M_FIND ? "Find in file" : "Type a file name to open", C_UI_FAINT, bw);
+            if (E.blink_on) r_rect(E.r, pen, by + (float)S(5), std::max(1.f, E.scale), bhh - (float)S(10), C_CURSOR);
+            if (!E.find_msg.empty() && E.mode == M_FIND) draw_text(E.ui, bx + bw - msgw, ui_base(by, bhh), E.find_msg.c_str(), C_RED, msgw);
+        } else {
+            std::string wn = E.tree.root_name();
+            draw_text(E.ui, tx0, ui_base(by, bhh), wn.empty() ? "Hootedit" : wn.c_str(), C_UI_DIM, bw - (float)S(20));
+        }
+        if (E.mode == M_FIND && E.repl_on) {   /* the Replace box hangs under the find box */
+            float ry2 = mh, rh2 = (float)S(34);
+            r_rect(E.r, bx, ry2, bw, rh2, C_BOX_LINE);
+            r_rect(E.r, bx + 1, ry2, bw - 2, rh2 - 1, C_BOX);
+            r_rect(E.r, bx, ry2 + rh2 - 1, bw, 1, C_ACCENT);
+            hit(bx, ry2, bw, rh2, H_REPL, 3);
+            const char *bl[2] = {"Replace", "All"};
+            float bxr = bx + bw - (float)S(6);
+            for (int k2 = 1; k2 >= 0; k2--) {
+                float w = text_width(E.ui, bl[k2]) + (float)S(16), hh = rh2 - (float)S(10);
+                bxr -= w;
+                r_rect(E.r, bxr, ry2 + (float)S(5), w, hh, hovered(H_REPL, k2) ? C_SELROW : C_FIELD);
+                draw_text(E.ui, bxr + (float)S(8), ui_base(ry2 + (float)S(5), hh), bl[k2], C_UI, w);
+                hit(bxr, ry2 + (float)S(5), w, hh, H_REPL, k2);
+                bxr -= (float)S(4);
+            }
+            float fx = bx + (float)S(10), fw = bxr - fx;
+            r_rect(E.r, fx - (float)S(6), ry2 + (float)S(5), fw + (float)S(8), rh2 - (float)S(10), E.repl_focus ? C_ACCENT : C_BOX_LINE);
+            r_rect(E.r, fx - (float)S(5), ry2 + (float)S(6), fw + (float)S(6), rh2 - (float)S(12), C_FIELD);
+            hit(fx - (float)S(6), ry2 + (float)S(5), fw + (float)S(8), rh2 - (float)S(10), H_REPL, 2);
+            float pen2 = draw_text(E.ui, fx, ui_base(ry2, rh2 - (float)S(1)), E.repl_q.c_str(), C_UI, fw - (float)S(4));
+            if (E.repl_q.empty()) draw_text(E.ui, fx, ui_base(ry2, rh2 - (float)S(1)), "Replace with", C_UI_FAINT, fw);
+            if (E.repl_focus && E.blink_on) r_rect(E.r, pen2, ry2 + (float)S(9), std::max(1.f, E.scale), rh2 - (float)S(19), C_CURSOR);
+        }
+        float lx2 = bx + bw + (float)S(12);
+        bool lopen = E.mode == M_PICK && E.pick_kind == PICK_LANG;
+        if (lopen || hovered(H_ACT, A_LANG)) r_rect(E.r, lx2, by, lw, bhh, lopen ? C_MENU_SEL : C_HOVER);
+        draw_text(E.ui, lx2 + (float)S(8), ui_base(by, bhh), lname.c_str(), d.lang_forced ? C_UI : C_UI_DIM, lw - (float)S(24));
+        draw_icon(IC_CHEV_D, lx2 + lw - (float)S(20), by + (bhh - (float)S(14)) / 2, S(14), C_UI_DIM);
+        hit(lx2, by, lw, bhh, H_ACT, A_LANG);
+    }
+    r_rect(E.r, 0, mh - 1, (float)E.W, 1, C_BORDER);
+
+    /* ---- overlays ---- */
+    if (E.mode == M_MENU && E.menu_open >= 0) {
+        const Menu &m = MENUS[(size_t)E.menu_open];
+        float x = (float)S(8);
+        for (int i = 0; i < E.menu_open; i++) x += text_width(E.ui, MENUS[(size_t)i].name) + (float)S(14);
+        float iw = 0;
+        for (const MenuItem &it : m.items) iw = std::max(iw, text_width(E.ui, it.label) + text_width(E.ui, it.keys) + (float)S(60));
+        iw = std::max(iw, (float)S(200));
+        float ih = (float)S(24), sep = (float)S(9);
+        float ph = (float)S(8);
+        for (const MenuItem &it : m.items) ph += it.label[0] ? ih : sep;
+        r_rect(E.r, x, mh, iw, ph, C_MENU_BORDER);
+        r_rect(E.r, x + 1, mh, iw - 2, ph - 1, C_MENU);
+        float y = mh + (float)S(4);
+        for (size_t i = 0; i < m.items.size(); i++) {
+            const MenuItem &it = m.items[i];
+            if (!it.label[0]) { r_rect(E.r, x + (float)S(8), y + sep / 2, iw - (float)S(16), 1, C_MENU_BORDER); y += sep; continue; }
+            bool enabled = it.act != A_NONE;
+            bool mouse_over = hovered(H_MENUITEM, (int)i);
+            if (enabled && (mouse_over || (E.hover_kind != H_MENUITEM && (int)i == E.menu_sel))) r_rect(E.r, x + (float)S(3), y, iw - (float)S(6), ih, C_MENU_SEL);
+            uint32_t col = enabled ? C_UI : C_UI_FAINT;
+            draw_text(E.ui, x + (float)S(26), ui_base(y, ih), ((it.act == A_VIM && E.vim_on) || (it.act == A_OUTLINE && E.outline_on) || (it.act == A_LINT && E.lint_on) ? std::string("\xE2\x9C\x93 ") + it.label : std::string(it.label)).c_str(), col, iw);
+            float kw = text_width(E.ui, it.keys);
+            draw_text(E.ui, x + iw - kw - (float)S(14), ui_base(y, ih), it.keys, C_UI_FAINT, kw + 2);
+            if (enabled) hit(x, y, iw, ih, H_MENUITEM, (int)i);
+            y += ih;
+        }
+    }
+    if (E.mode == M_QUICK && !E.quick_hits.empty()) {
+        float pw = bw, px = bx, py = mh - 1;
+        float ih = (float)S(24), ph = (float)E.quick_hits.size() * ih + (float)S(8);
+        r_rect(E.r, px, py, pw, ph, C_MENU_BORDER);
+        r_rect(E.r, px + 1, py, pw - 2, ph - 1, C_MENU);
+        size_t rl = E.tree.root().size() + 1;
+        for (size_t i = 0; i < E.quick_hits.size(); i++) {
+            float y = py + (float)S(4) + (float)i * ih;
+            if ((int)i == E.quick_sel) r_rect(E.r, px + (float)S(3), y, pw - (float)S(6), ih, C_MENU_SEL);
+            std::string rel = E.quick_hits[i].substr(std::min(rl, E.quick_hits[i].size()));
+            size_t sl = rel.rfind('/');
+            std::string base = sl == std::string::npos ? rel : rel.substr(sl + 1), dir = sl == std::string::npos ? "" : rel.substr(0, sl);
+            draw_icon(IC_FILE, px + (float)S(10), y + (ih - (float)S(14)) / 2, S(14), file_color(base));
+            const std::vector<int> &ps = i < E.quick_pos.size() ? E.quick_pos[i] : std::vector<int>();
+            float pen = draw_text_hl(E.ui, px + (float)S(32), ui_base(y, ih), base, ps, (int)(sl == std::string::npos ? 0 : sl + 1), C_UI, C_ACCENT, pw - (float)S(40));
+            if (!dir.empty()) draw_text_hl(E.ui, pen + (float)S(8), ui_base(y, ih), dir, ps, 0, C_UI_FAINT, C_ACCENT, px + pw - pen - (float)S(16));
+            hit(px, y, pw, ih, H_QUICKITEM, (int)i);
+        }
+    }
+    if (E.mode == M_PICK) {
+        std::vector<int> view = pick_view();
+        float ih = (float)S(24);
+        int maxrows = std::max(3, std::min(16, (int)(((float)E.H - mh - (float)S(60)) / ih)));
+        int n = (int)view.size();
+        E.pick_sel = std::max(0, std::min(E.pick_sel, n - 1));
+        if (E.pick_sel < E.pick_scroll) E.pick_scroll = E.pick_sel;
+        if (E.pick_sel >= E.pick_scroll + maxrows) E.pick_scroll = E.pick_sel - maxrows + 1;
+        float pw = std::max(bw, (float)S(340)), px = std::min(std::max(0.f, bx), (float)E.W - pw - (float)S(4));
+        float py = mh - 1, ph = (float)(std::min(n, maxrows) + 1) * ih + (float)S(8);
+        r_rect(E.r, px, py, pw, ph, C_MENU_BORDER);
+        r_rect(E.r, px + 1, py, pw - 2, ph - 1, C_MENU);
+        const char *ph_txt = E.pick_kind == PICK_LANG ? "Select Language Mode" : E.pick_kind == PICK_THEME ? "Select Color Theme" : E.pick_kind == PICK_CUSTOM ? E.pick_title.c_str() : "Select the Terminal";
+        std::string fl = E.pick_filter.empty() ? ph_txt : E.pick_filter;
+        float pen = draw_text(E.ui, px + (float)S(12), ui_base(py + (float)S(4), ih), fl.c_str(), E.pick_filter.empty() ? C_UI_FAINT : C_UI, pw - (float)S(24));
+        if (E.blink_on && !E.pick_filter.empty()) r_rect(E.r, pen, py + (float)S(8), std::max(1.f, E.scale), ih - (float)S(8), C_CURSOR);
+        for (int k = 0; k < maxrows && E.pick_scroll + k < n; k++) {
+            const Ed::PItem &it = E.pick_items[(size_t)view[(size_t)(E.pick_scroll + k)]];
+            float iy = py + (float)S(4) + (float)(k + 1) * ih;
+            if (E.pick_scroll + k == E.pick_sel) r_rect(E.r, px + (float)S(3), iy, pw - (float)S(6), ih, C_MENU_SEL);
+            draw_text(E.ui, px + (float)S(16), ui_base(iy, ih), it.label.c_str(), it.current ? C_ACCENT : C_UI, pw - (float)S(32));
+            hit(px, iy, pw, ih, H_PICKITEM, E.pick_scroll + k);
+        }
+    }
+    if (E.mode == M_CONFIRM || E.mode == M_PROMPT) {
+        r_rect(E.r, 0, 0, (float)E.W, (float)E.H, C_SHADE);
+        float pw = std::min((float)E.W - (float)S(24), (float)S(560)), ph = (float)S(118);
+        float px = ((float)E.W - pw) / 2, py = ((float)E.H - ph) / 2;
+        r_rect(E.r, px, py, pw, ph, C_MENU_BORDER);
+        r_rect(E.r, px + 1, py + 1, pw - 2, ph - 2, C_MENU);
+        if (E.mode == M_CONFIRM) {
+            std::string msg = "Save changes to " + E.docs[(size_t)E.confirm_idx]->name() + " before closing?";
+            draw_text(E.ui, px + (float)S(18), ui_base(py + (float)S(14), (float)S(24)), msg.c_str(), C_UI, pw - (float)S(36));
+            const char *lab[3] = {"Save (S)", "Don't save (D)", "Cancel (Esc)"};
+            int kind[3] = {H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL};
+            float bx2 = px + (float)S(18), byy = py + (float)S(60), bth = (float)S(30);
+            for (int k = 0; k < 3; k++) {
+                float w = text_width(E.ui, lab[k]) + (float)S(28);
+                r_rect(E.r, bx2, byy, w, bth, k == 0 ? C_ACCENT : C_HOVER);
+                draw_text(E.ui, bx2 + (float)S(14), ui_base(byy, bth), lab[k], k == 0 ? C_ON_ACCENT : C_UI, w);
+                hit(bx2, byy, w, bth, kind[k], 0);
+                bx2 += w + (float)S(10);
+            }
+        } else {
+            const char *what = E.prompt_kind == PK_SAVEAS ? "Save as" : E.prompt_kind == PK_OPEN_FILE ? "Open file" : "Open folder";
+            std::string msg = std::string(what) + " (Enter to confirm, Esc to cancel):";
+            draw_text(E.ui, px + (float)S(18), ui_base(py + (float)S(12), (float)S(24)), msg.c_str(), C_UI, pw - (float)S(36));
+            r_rect(E.r, px + (float)S(18), py + (float)S(46), pw - (float)S(36), (float)S(30), C_BOX_LINE);
+            r_rect(E.r, px + (float)S(19), py + (float)S(47), pw - (float)S(38), (float)S(28), C_BOX);
+            float pen = draw_text(E.ui, px + (float)S(28), ui_base(py + (float)S(46), (float)S(30)), E.prompt_q.c_str(), C_UI, pw - (float)S(56));
+            if (E.blink_on) r_rect(E.r, pen, py + (float)S(52), std::max(1.f, E.scale), (float)S(18), C_CURSOR);
+            if (!E.status_msg.empty()) draw_text(E.ui, px + (float)S(18), ui_base(py + (float)S(84), (float)S(22)), E.status_msg.c_str(), C_RED, pw - (float)S(36));
+        }
+    }
+    if (E.mode == M_DIALOG) draw_dialog();
+    if (E.mode == M_CTX) draw_ctx_menu();
+    if (E.mode == M_FILEDLG) {
+        r_rect(E.r, 0, 0, (float)E.W, (float)E.H, C_SHADE);
+        float pw = std::min((float)E.W - (float)S(24), (float)S(700)), ph = std::min((float)E.H - (float)S(24), (float)S(520));
+        float px = ((float)E.W - pw) / 2, py = ((float)E.H - ph) / 2;
+        r_rect(E.r, px, py, pw, ph, C_MENU_BORDER);
+        r_rect(E.r, px + 1, py + 1, pw - 2, ph - 2, C_MENU);
+        r_rect(E.r, px, py, pw, (float)S(2), C_ACCENT);
+        float ix = px + (float)S(18), iw = pw - (float)S(36);
+        const char *title = E.fd.kind == FD_OPEN_FOLDER ? "Open Folder" : E.fd.kind == FD_OPEN_FILE ? "Open File" : "Save As";
+        draw_text(E.ui, ix, ui_base(py + (float)S(10), (float)S(28)), title, C_UI, iw, FS_BOLD);
+        std::string htxt = std::string("hidden files: ") + (E.fd.hidden ? "shown" : "hidden") + "   (Ctrl+H)";
+        float hw = text_width(E.ui, htxt.c_str());
+        if (hovered(H_FD_HIDDEN, 0)) r_rect(E.r, px + pw - hw - (float)S(24), py + (float)S(10), hw + (float)S(12), (float)S(28), C_HOVER);
+        draw_text(E.ui, px + pw - hw - (float)S(18), ui_base(py + (float)S(10), (float)S(28)), htxt.c_str(), C_UI_DIM, hw + 2);
+        hit(px + pw - hw - (float)S(24), py + (float)S(10), hw + (float)S(12), (float)S(28), H_FD_HIDDEN, 0);
+        /* places and the current folder */
+        float y = py + (float)S(46);
+        const char *places[3] = {"Home", "Workspace", "/"};
+        float bx3 = ix;
+        for (int k2 = 0; k2 < 3; k2++) {
+            float w = text_width(E.ui, places[k2]) + (float)S(20), h2 = (float)S(26);
+            r_rect(E.r, bx3, y, w, h2, hovered(H_FD_PLACE, k2) ? C_HOVER : C_FIELD);
+            draw_text(E.ui, bx3 + (float)S(10), ui_base(y, h2), places[k2], C_UI, w);
+            hit(bx3, y, w, h2, H_FD_PLACE, k2);
+            bx3 += w + (float)S(6);
+        }
+        std::string dirshow = E.fd.dir;
+        float maxw = ix + iw - bx3 - (float)S(8);
+        while (dirshow.size() > 8 && text_width(E.ui, dirshow.c_str()) > maxw) dirshow = dirshow.substr(dirshow.size() > 40 ? 6 : 2);   /* cut the front of a long path */
+        if (dirshow != E.fd.dir) dirshow = "..." + dirshow;
+        draw_text(E.ui, bx3 + (float)S(8), ui_base(y, (float)S(26)), dirshow.c_str(), C_UI_DIM, maxw);
+        /* filter / path box */
+        y += (float)S(36);
+        float fh = (float)S(30);
+        bool list_focus = !(E.fd.kind == FD_SAVE && E.fd.name_focus);
+        r_rect(E.r, ix, y, iw, fh, list_focus ? C_ACCENT : C_BOX_LINE);
+        r_rect(E.r, ix + 1, y + 1, iw - 2, fh - 2, C_FIELD);
+        float pen = draw_text(E.ui, ix + (float)S(10), ui_base(y, fh), E.fd.filter.c_str(), C_UI, iw - (float)S(20));
+        if (E.fd.filter.empty()) draw_text(E.ui, ix + (float)S(10), ui_base(y, fh), "Type to filter, or a path starting with / or ~", C_UI_FAINT, iw - (float)S(20));
+        if (list_focus && E.blink_on) r_rect(E.r, pen, y + (float)S(6), std::max(1.f, E.scale), fh - (float)S(12), C_CURSOR);
+        /* the list */
+        y += fh + (float)S(8);
+        float footer = E.fd.kind == FD_SAVE ? (float)S(104) : (float)S(64);
+        float lh = py + ph - footer - y, rowh2 = (float)S(26);
+        std::vector<int> view = fd_view();
+        int n = (int)view.size(), maxrows = std::max(1, (int)(lh / rowh2));
+        E.fd.sel = std::max(0, std::min(E.fd.sel, std::max(0, n - 1)));
+        if (E.fd.sel < E.fd.scroll) E.fd.scroll = E.fd.sel;
+        if (E.fd.sel >= E.fd.scroll + maxrows) E.fd.scroll = E.fd.sel - maxrows + 1;
+        E.fd.scroll = std::max(0, std::min(E.fd.scroll, std::max(0, n - maxrows)));
+        r_rect(E.r, ix, y, iw, lh, C_EDITOR);
+        r_clip(E.r, (int)ix, (int)y, (int)iw, (int)lh);
+        for (int k2 = 0; k2 < maxrows && E.fd.scroll + k2 < n; k2++) {
+            int vi = E.fd.scroll + k2;
+            const Ed::FdEntry &en = E.fd.all[(size_t)view[(size_t)vi]];
+            float ry2 = y + (float)k2 * rowh2;
+            bool selr = vi == E.fd.sel && (E.fd.picked || E.fd.kind != FD_OPEN_FOLDER);
+            if (selr) r_rect(E.r, ix, ry2, iw, rowh2, E.fd.picked ? C_MENU_SEL : C_HOVER);
+            else if (hovered(H_FD_ITEM, vi)) r_rect(E.r, ix, ry2, iw, rowh2, C_HOVER);
+            draw_icon(en.name == ".." ? IC_ARROW_L : en.dir ? IC_FOLDER : IC_FILE, ix + (float)S(10), ry2 + (rowh2 - (float)S(16)) / 2, S(16), en.dir ? C_ACCENT : file_color(en.name));
+            std::string label = en.name == ".." ? "..  (up one folder)" : en.name + (en.dir ? "/" : "");
+            draw_text(E.ui, ix + (float)S(36), ui_base(ry2, rowh2), label.c_str(), en.dir ? C_UI : C_UI_DIM, iw - (float)S(46));
+            hit(ix, ry2, iw, rowh2, H_FD_ITEM, vi);
+        }
+        r_clip_off(E.r);
+        if (n == 0) draw_text(E.ui, ix + (float)S(12), ui_base(y, rowh2), "nothing matches", C_UI_FAINT, iw);
+        /* footer: file name when saving, a message, the buttons */
+        float fy = y + lh + (float)S(8);
+        if (E.fd.kind == FD_SAVE) {
+            draw_text(E.ui, ix, ui_base(fy, (float)S(30)), "Name:", C_UI_DIM, (float)S(60));
+            float nx = ix + (float)S(56), nw = iw - (float)S(56);
+            r_rect(E.r, nx, fy, nw, (float)S(30), E.fd.name_focus ? C_ACCENT : C_BOX_LINE);
+            r_rect(E.r, nx + 1, fy + 1, nw - 2, (float)S(28), C_FIELD);
+            float np = draw_text(E.ui, nx + (float)S(10), ui_base(fy, (float)S(30)), E.fd.name.c_str(), C_UI, nw - (float)S(20));
+            if (E.fd.name_focus && E.blink_on) r_rect(E.r, np, fy + (float)S(6), std::max(1.f, E.scale), (float)S(18), C_CURSOR);
+            hit(nx, fy, nw, (float)S(30), H_FD_PLACE, 99);
+            fy += (float)S(40);
+        }
+        if (!E.fd.msg.empty()) draw_text(E.ui, ix, ui_base(fy, (float)S(24)), E.fd.msg.c_str(), C_RED, iw - (float)S(280));
+        std::string oklabel = E.fd.kind == FD_OPEN_FOLDER ? "Open Folder" : E.fd.kind == FD_OPEN_FILE ? "Open" : "Save";
+        const char *lab2[2] = {"Cancel", oklabel.c_str()};
+        float bx4 = ix + iw;
+        for (int k2 = 1; k2 >= 0; k2--) {
+            float w = text_width(E.ui, lab2[k2]) + (float)S(36), h2 = (float)S(30);
+            bx4 -= w;
+            r_rect(E.r, bx4, fy, w, h2, k2 == 1 ? C_ACCENT : (hovered(H_FD_CANCEL, 0) ? C_HOVER : C_FIELD));
+            draw_text(E.ui, bx4 + (float)S(18), ui_base(fy, h2), lab2[k2], k2 == 1 ? C_ON_ACCENT : C_UI, w);
+            hit(bx4, fy, w, h2, k2 == 1 ? H_FD_OK : H_FD_CANCEL, 0);
+            bx4 -= (float)S(8);
+        }
+    }
+    if (E.show_stats) {
+        std::string s = cache_stats_text();
+        std::vector<std::string> ls;
+        size_t p = 0;
+        while (p <= s.size()) { size_t q = s.find('\n', p); if (q == std::string::npos) q = s.size(); ls.push_back(s.substr(p, q - p)); p = q + 1; }
+        float pw = 0;
+        for (auto &l : ls) pw = std::max(pw, text_width(E.ui, l.c_str()));
+        pw = std::min(pw, (float)E.W - (float)S(60));
+        float lh = (float)S(22), ph = (float)ls.size() * lh + (float)S(28);
+        float px = ((float)E.W - pw) / 2 - (float)S(14), py = ((float)E.H - ph) / 2;
+        r_rect(E.r, px, py, pw + (float)S(28), ph, C_MENU_BORDER);
+        r_rect(E.r, px + 1, py + 1, pw + (float)S(26), ph - 2, C_MENU);
+        for (size_t i = 0; i < ls.size(); i++) draw_text(E.ui, px + (float)S(14), ui_base(py + (float)S(14) + (float)i * lh, lh), ls[i].c_str(), C_UI, pw);
+    }
+}
+
+/* ---- status segments (same numbers as the Lestrix bar) ---- */
+
+void hud_tick() {
+    double dt = E.prev_time ? E.now - E.prev_time : 0;
+    long ticks = proc_cpu_ticks();
+    double cpu = dt > 0 ? (double)(ticks - E.prev_ticks) / (double)sysconf(_SC_CLK_TCK) / dt * 100 : 0;
+    double fps = dt > 0 ? (double)(E.frames - E.prev_frames) / dt : 0;
+    CacheStats d = {sd_cache.glyph_hit - E.prev_cache.glyph_hit, sd_cache.glyph_miss - E.prev_cache.glyph_miss, sd_cache.glyph_recycle - E.prev_cache.glyph_recycle,
+                    sd_cache.row_hit - E.prev_cache.row_hit, sd_cache.row_miss - E.prev_cache.row_miss, sd_cache.row_recycle - E.prev_cache.row_recycle};
+    E.prev_cache = sd_cache; E.prev_time = E.now; E.prev_ticks = ticks; E.prev_frames = E.frames;
+    char rp[16], gp[16], rc[24];
+    uint64_t rt = d.row_hit + d.row_miss, gt = d.glyph_hit + d.glyph_miss;
+    if (rt) snprintf(rp, sizeof rp, "%.0f%%", 100.0 * (double)d.row_hit / (double)rt); else snprintf(rp, sizeof rp, "--");
+    if (gt) snprintf(gp, sizeof gp, "%.0f%%", 100.0 * (double)d.glyph_hit / (double)gt); else snprintf(gp, sizeof gp, "--");
+    fmt_count((double)(d.row_recycle + d.glyph_recycle), rc, sizeof rc);
+    snprintf(E.hud, sizeof E.hud, "fps %.0f  cpu %.0f%% (%ld)  mem %s  cache rows %s glyphs %s recyc %s", fps, cpu,
+             sysconf(_SC_NPROCESSORS_ONLN), fmt_mb((double)proc_rss_kb() * 1024).c_str(), rp, gp, rc);
+    if (strcmp(E.hud, E.hud_last) != 0) { memcpy(E.hud_last, E.hud, sizeof E.hud); redraw(); }
+}
+
+/* ---- window ---- */
+
+bool gl_init(GlKind kind, int w, int h) {
+    if (E.gl) { SDL_GL_DeleteContext(E.gl); E.gl = nullptr; }
+    if (E.win) { SDL_DestroyWindow(E.win); E.win = nullptr; }
+    if (kind == GLK_CORE) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    } else {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, kind == GLK_ES3 ? 3 : 2);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    }
+    E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN);   /* shown after the first frame is drawn: no empty window while the editor starts */
+    if (E.win) {   /* the owl as the window icon (64x64, embedded) */
+        SDL_Surface *ic = SDL_CreateRGBSurfaceWithFormatFrom((void *)APP_ICON_RGBA, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
+        if (ic) { SDL_SetWindowIcon(E.win, ic); SDL_FreeSurface(ic); }
+    }
+    E.gl = E.win ? SDL_GL_CreateContext(E.win) : nullptr;
+    if (!E.gl || sd_gl_load(kind)) return false;
+    SDL_GL_SetSwapInterval(1);
+    int ww, wh;
+    SDL_GetWindowSize(E.win, &ww, &wh);
+    SDL_GL_GetDrawableSize(E.win, &E.W, &E.H);
+    E.scale = ww ? (float)E.W / (float)ww : 1.f;
+    E.atlas = atlas_new(E.scale > 1.5f ? 4096 : 2048);
+    E.r = E.atlas ? r_new(E.atlas) : nullptr;
+    if (!E.r) return false;
+    const char *ver = (const char *)glGetString(GL_VERSION), *rend = (const char *)glGetString(GL_RENDERER);
+    snprintf(E.gl_desc, sizeof E.gl_desc, "%s on %s", ver ? ver : "OpenGL", rend ? rend : "unknown GPU");
+    return true;
+}
+
+void write_ppm(const char *file) {
+    std::vector<uint8_t> px((size_t)E.W * (size_t)E.H * 4);
+    glReadPixels(0, 0, E.W, E.H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    FILE *f = fopen(file, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", E.W, E.H);
+    for (int y = E.H - 1; y >= 0; y--)
+        for (int x = 0; x < E.W; x++) fwrite(&px[((size_t)y * (size_t)E.W + (size_t)x) * 4], 1, 3, f);
+    fclose(f);
+}
+
+/* ---- input ---- */
+
+size_t pos_from_xy(int mx, int my) {
+    Layout L = layout();
+    Doc &d = D();
+    long row = (my - L.text_y) / E.rowh;
+    if (my < L.text_y) row = -1;
+    long line = (long)d.top + row;
+    line = std::max(0L, std::min(line, (long)d.buf.lines() - 1));
+    std::string t;
+    d.buf.line_text((size_t)line, t);
+    int col = d.left + (mx - L.text_x) / E.cw;
+    if (mx < L.text_x) col = 0;
+    return d.buf.line_start((size_t)line) + byte_of(t, col);
+}
+
+void move_line(long delta, bool extend) {
+    Doc &d = D();
+    size_t l = d.buf.line_of(d.cur);
+    long nl = (long)l + delta;
+    if (nl < 0) { d.move_to(0, extend, false); return; }
+    if (nl >= (long)d.buf.lines()) { d.move_to(d.buf.size(), extend, false); return; }
+    std::string t;
+    d.buf.line_text((size_t)nl, t);
+    d.move_to(d.buf.line_start((size_t)nl) + byte_of(t, d.want_col), extend, true);
+}
+
+
+/* ---- VS Code style editing commands: word moves, line operations, comments, indent ---- */
+
+int char_class(unsigned char c) { return c == ' ' || c == '\t' ? 0 : (isalnum(c) || c == '_' || c >= 0x80) ? 1 : 2; }
+
+size_t word_left(Doc &d, size_t pos) {
+    size_t l = d.buf.line_of(pos), ls = d.buf.line_start(l);
+    if (pos == ls) return l ? ls - 1 : 0;
+    std::string t;
+    d.buf.line_text(l, t);
+    size_t i = pos - ls;
+    while (i > 0 && char_class((unsigned char)t[i - 1]) == 0) i--;
+    if (i > 0) { int c = char_class((unsigned char)t[i - 1]); while (i > 0 && char_class((unsigned char)t[i - 1]) == c) i--; }
+    return ls + i;
+}
+
+size_t word_right(Doc &d, size_t pos) {
+    size_t l = d.buf.line_of(pos), ls = d.buf.line_start(l), n = d.buf.line_len(l);
+    if (pos - ls >= n) return l + 1 < d.buf.lines() ? d.buf.line_start(l + 1) : pos;
+    std::string t;
+    d.buf.line_text(l, t);
+    size_t i = pos - ls;
+    while (i < n && char_class((unsigned char)t[i]) == 0) i++;
+    if (i < n) { int c = char_class((unsigned char)t[i]); while (i < n && char_class((unsigned char)t[i]) == c) i++; }
+    return ls + i;
+}
+
+/* the lines the selection touches: a selection ending at the very start of a line does not include that line */
+void sel_lines(Doc &d, size_t *l0, size_t *l1) {
+    *l0 = d.buf.line_of(d.sel_lo());
+    *l1 = d.buf.line_of(d.sel_hi());
+    if (d.has_sel() && *l1 > *l0 && d.sel_hi() == d.buf.line_start(*l1)) (*l1)--;
+}
+
+size_t line_end(Doc &d, size_t l) { return d.buf.line_start(l) + d.buf.line_len(l); }
+
+std::string lines_text(Doc &d, size_t l0, size_t l1) {
+    std::string out, t;
+    for (size_t l = l0; l <= l1; l++) { d.buf.line_text(l, t); if (l > l0) out += '\n'; out += t; }
+    return out;
+}
+
+void set_sel(Doc &d, size_t anchor, size_t cur) { d.anchor = anchor; d.cur = cur; d.want_col = d.col_of_byte(d.buf.line_of(cur), cur - d.buf.line_start(d.buf.line_of(cur))); }
+
+void line_move(Doc &d, int dir) {   /* Alt+Up / Alt+Down: the selected lines trade places with their neighbour */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    if (dir < 0 && l0 == 0) return;
+    if (dir > 0 && l1 + 1 >= d.buf.lines()) return;
+    size_t a = d.anchor, c = d.cur;
+    std::string block = lines_text(d, l0, l1), nb;
+    size_t from = d.buf.line_start(dir < 0 ? l0 - 1 : l0), to = line_end(d, dir < 0 ? l1 : l1 + 1);
+    d.buf.line_text(dir < 0 ? l0 - 1 : l1 + 1, nb);
+    std::string out = dir < 0 ? block + "\n" + nb : nb + "\n" + block;
+    d.break_group();
+    d.replace(from, to - from, out.data(), out.size());
+    d.break_group();
+    long delta = dir < 0 ? -(long)(nb.size() + 1) : (long)(nb.size() + 1);
+    set_sel(d, (size_t)((long)a + delta), (size_t)((long)c + delta));
+}
+
+void line_copy(Doc &d, int dir) {   /* Shift+Alt+Up / Down: duplicate the selected lines above or below */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t a = d.anchor, c = d.cur;
+    std::string block = lines_text(d, l0, l1);
+    d.break_group();
+    if (dir > 0) { std::string ins = "\n" + block; d.replace(line_end(d, l1), 0, ins.data(), ins.size()); set_sel(d, a + block.size() + 1, c + block.size() + 1); }
+    else { std::string ins = block + "\n"; d.replace(d.buf.line_start(l0), 0, ins.data(), ins.size()); set_sel(d, a, c); }
+    d.break_group();
+}
+
+void line_delete(Doc &d) {   /* Ctrl+Shift+K */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t from = d.buf.line_start(l0), to = l1 + 1 < d.buf.lines() ? d.buf.line_start(l1 + 1) : d.buf.size();
+    if (l1 + 1 >= d.buf.lines() && l0 > 0) from--;   /* the last line takes the break before it with it */
+    d.break_group();
+    d.replace(from, to - from, "", 0);
+    d.break_group();
+}
+
+void line_open(Doc &d, bool below) {   /* Ctrl+Enter / Ctrl+Shift+Enter: a new line without moving the line break */
+    size_t l = d.buf.line_of(d.cur);
+    std::string t;
+    d.buf.line_text(l, t);
+    size_t w = 0;
+    while (w < t.size() && (t[w] == ' ' || t[w] == '\t')) w++;
+    std::string ind = t.substr(0, w);
+    d.break_group();
+    if (below) { std::string ins = "\n" + ind; d.replace(line_end(d, l), 0, ins.data(), ins.size()); }
+    else { std::string ins = ind + "\n"; size_t ls = d.buf.line_start(l); d.replace(ls, 0, ins.data(), ins.size()); set_sel(d, ls + ind.size(), ls + ind.size()); }
+    d.break_group();
+}
+
+std::string indent_unit(Doc &d) { return d.indent.compare(0, 3, "Tab") == 0 ? std::string("\t") : std::string((size_t)std::max(1, indent_step(d)), ' '); }
+
+void indent_lines(Doc &d, bool out) {   /* Ctrl+] / Ctrl+[ and Tab / Shift+Tab over several lines */
+    size_t l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t a = d.anchor, c = d.cur;
+    std::string unit = indent_unit(d), res, t;
+    long first = 0, last = 0;
+    for (size_t l = l0; l <= l1; l++) {
+        d.buf.line_text(l, t);
+        long delta = 0;
+        if (!out) { if (!t.empty()) { t.insert(0, unit); delta = (long)unit.size(); } }
+        else if (!t.empty() && t[0] == '\t') { t.erase(0, 1); delta = -1; }
+        else { size_t k = 0; while (k < t.size() && k < unit.size() && t[k] == ' ') k++; t.erase(0, k); delta = -(long)k; }
+        if (l == l0) first = delta;
+        if (l == l1) last = delta;
+        if (l > l0) res += '\n';
+        res += t;
+    }
+    size_t from = d.buf.line_start(l0), to = line_end(d, l1);
+    d.break_group();
+    d.replace(from, to - from, res.data(), res.size());
+    d.break_group();
+    auto adj = [&](size_t pos) {
+        size_t l = d.buf.line_of(std::min(pos, d.buf.size()));
+        return (size_t)std::max<long>((long)from, (long)pos + (l == l0 ? first : l == l1 ? last : first));
+    };
+    size_t na = adj(a), nc = adj(c);
+    if (a == c) nc = na;
+    set_sel(d, na, nc);
+}
+
+const char *comment_prefix(const Lang *l) {
+    const char *n = lang_name(l);
+    static const char *hash[] = {"Python", "Shell", "YAML", "TOML", "Makefile", "CMake", "Ruby", "Perl", "Dockerfile", "Diff"};
+    for (const char *h : hash) if (!strcmp(n, h)) return "#";
+    if (!strcmp(n, "Lua") || !strcmp(n, "SQL") || !strcmp(n, "Haskell")) return "--";
+    if (!strcmp(n, "INI")) return ";";
+    if (!strcmp(n, "Plain Text") || !strcmp(n, "Markdown") || !strcmp(n, "JSON") || !strcmp(n, "HTML") || !strcmp(n, "XML") || !strcmp(n, "CSS")) return nullptr;
+    return "//";
+}
+
+void toggle_comment(Doc &d) {   /* Ctrl+/ */
+    const char *pre = comment_prefix(d.lang);
+    if (!pre) { E.status_msg = std::string("no line comment for ") + lang_name(d.lang); return; }
+    size_t pl = strlen(pre), l0, l1;
+    sel_lines(d, &l0, &l1);
+    size_t a = d.anchor, c = d.cur;
+    std::vector<std::string> ls;
+    bool all = true, any = false;
+    size_t minind = (size_t)-1;
+    for (size_t l = l0; l <= l1; l++) {
+        ls.emplace_back();
+        d.buf.line_text(l, ls.back());
+        const std::string &t = ls.back();
+        size_t w = 0;
+        while (w < t.size() && (t[w] == ' ' || t[w] == '\t')) w++;
+        if (w == t.size()) continue;   /* blank lines neither count nor change */
+        any = true;
+        minind = std::min(minind, w);
+        if (t.compare(w, pl, pre) != 0) all = false;
+    }
+    if (!any) return;
+    std::string res;
+    long first = 0, last = 0;
+    for (size_t i = 0; i < ls.size(); i++) {
+        std::string &t = ls[i];
+        size_t w = 0;
+        while (w < t.size() && (t[w] == ' ' || t[w] == '\t')) w++;
+        long delta = 0;
+        if (w < t.size()) {
+            if (all) { size_t k = pl + (t.compare(w + pl, 1, " ") == 0 ? 1 : 0); t.erase(w, k); delta = -(long)k; }
+            else { std::string ins = std::string(pre) + " "; t.insert(minind, ins); delta = (long)ins.size(); }
+        }
+        if (i == 0) first = delta;
+        if (i + 1 == ls.size()) last = delta;
+        if (i) res += '\n';
+        res += t;
+    }
+    size_t from = d.buf.line_start(l0), to = line_end(d, l1);
+    d.break_group();
+    d.replace(from, to - from, res.data(), res.size());
+    d.break_group();
+    auto adj = [&](size_t pos) { size_t l = d.buf.line_of(std::min(pos, d.buf.size())); return (size_t)std::max<long>((long)from, (long)pos + (l == l0 ? first : l == l1 ? last : first)); };
+    set_sel(d, a == c ? adj(c) : adj(a), adj(c));
+}
+
+void select_next_occurrence(Doc &d) {   /* Ctrl+D: first the word under the cursor, then the next match of the selection */
+    if (!d.has_sel()) {
+        size_t l = d.buf.line_of(d.cur), ls = d.buf.line_start(l);
+        std::string t;
+        d.buf.line_text(l, t);
+        size_t i = d.cur - ls, a = i, b = i;
+        while (a > 0 && char_class((unsigned char)t[a - 1]) == 1) a--;
+        while (b < t.size() && char_class((unsigned char)t[b]) == 1) b++;
+        if (b > a) set_sel(d, ls + a, ls + b);
+        return;
+    }
+    std::string needle = d.selection();
+    if (needle.empty() || needle.size() > 4096) return;
+    size_t from = d.sel_hi(), cap = 8u << 20;
+    std::string hay;
+    d.buf.copy(from, std::min(cap, d.buf.size() - from), hay);
+    size_t at = hay.find(needle);
+    if (at != std::string::npos) { set_sel(d, from + at, from + at + needle.size()); return; }
+    d.buf.copy(0, std::min(d.sel_lo(), cap), hay);   /* wrapped around */
+    at = hay.find(needle);
+    if (at != std::string::npos) set_sel(d, at, at + needle.size());
+}
+
+void goto_line(const std::string &q) {
+    long n = atol(q.c_str());
+    Doc &d = D();
+    if (n < 1) n = 1;
+    size_t l = std::min((size_t)n - 1, d.buf.lines() - 1);
+    d.break_group();
+    set_sel(d, d.buf.line_start(l), d.buf.line_start(l));
+    E.follow = true;
+    size_t rows = (size_t)std::max(1, layout().rows);   /* centre the line like VS Code does */
+    d.top = l > rows / 2 ? l - rows / 2 : 0;
+    E.follow = false;
+}
+
+void reopen_closed_tab() {
+    while (!E.closed_tabs.empty()) {
+        std::string p = E.closed_tabs.back();
+        E.closed_tabs.pop_back();
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) { open_path(p); return; }
+    }
+    E.status_msg = "no closed tab to reopen";
+}
+
+void close_all_tabs() {
+    int kept = 0;
+    for (int i = (int)E.docs.size() - 1; i >= 0; i--) {
+        if (E.docs[(size_t)i]->modified()) { kept++; continue; }
+        remove_doc(i);
+    }
+    if (kept) E.status_msg = sfmt("%d tab%s with unsaved changes kept", kept, kept == 1 ? "" : "s");
+}
+
+void pop_utf8(std::string &s) {
+    if (s.empty()) return;
+    size_t i = s.size() - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xc0) == 0x80) i--;
+    s.resize(i);
+}
+
+/* ---- terminal panel: the Lestrix terminal engine drawn into a rectangle at the bottom of the editor ---- */
+
+Ed::Term *cur_term() { return E.term_active >= 0 && E.term_active < (int)E.terms.size() ? E.terms[(size_t)E.term_active].get() : nullptr; }
+
+void thook_wake(void *) { app_wake(); }
+void thook_exited(void *u, int) { static_cast<Ed::Term *>(u)->dead = true; app_wake(); }
+void thook_title(void *u, const char *title) { if (title && *title) static_cast<Ed::Term *>(u)->title = title; redraw(); }
+void thook_clip_set(void *, const char *text, bool primary) { if (primary) SDL_SetPrimarySelectionText(text); else SDL_SetClipboardText(text); }
+void thook_clip_request(void *u, bool primary) {
+    Ed::Term *t = static_cast<Ed::Term *>(u);
+    char *c = primary ? SDL_GetPrimarySelectionText() : SDL_GetClipboardText();
+    if (c && *c && t->core) tcore_paste(t->core, c);
+    SDL_free(c);
+}
+
+bool new_terminal() {
+    const char *sh = getenv("SHELL");
+    std::string shell = sh && *sh ? sh : "/bin/sh";
+    std::string cwd = E.tree.root().empty() ? "." : E.tree.root();
+    TermHooks h{};
+    h.wake = thook_wake; h.exited = thook_exited; h.title = thook_title; h.clip_set = thook_clip_set; h.clip_request = thook_clip_request;
+    auto t = std::make_unique<Ed::Term>();
+    int cols = 80, rows = 24;
+    Layout L = layout();
+    tv_fit(E.font, (float)(E.W - L.ed_x), (float)(S(E.panel_logical) - S(30)), &cols, &rows);
+    char *argv[] = {const_cast<char *>(shell.c_str()), nullptr};
+    t->core = tcore_new(argv, cwd.c_str(), std::max(cols, 20), std::max(rows, 4), &h, t.get(), true);
+    if (!t->core) { E.status_msg = "cannot start " + shell; return false; }
+    size_t sl = shell.rfind('/');
+    t->title = sl == std::string::npos ? shell : shell.substr(sl + 1);
+    E.terms.push_back(std::move(t));
+    E.term_active = (int)E.terms.size() - 1;
+    E.term_open = true;
+    E.term_focus = true;
+    return true;
+}
+
+void kill_terminal(int i) {
+    if (i < 0 || i >= (int)E.terms.size()) return;
+    Ed::Term *t = E.terms[(size_t)i].get();
+    if (t->core) { tcore_close(t->core); tcore_free(t->core); t->core = nullptr; }
+    E.terms.erase(E.terms.begin() + i);
+    if (E.terms.empty()) { E.term_active = -1; E.term_open = false; E.term_focus = false; }
+    else E.term_active = std::min(E.term_active > i ? E.term_active - 1 : E.term_active, (int)E.terms.size() - 1);
+    redraw();
+}
+
+void terms_pump() {
+    bool changed = false;
+    for (auto &t : E.terms) if (t->core && tcore_pump(t->core)) changed = true;
+    if (changed) { E.last_active = E.now; redraw(); }
+    for (size_t i = E.terms.size(); i-- > 0;) if (E.terms[i]->dead) kill_terminal((int)i);   /* a shell that exited closes its tab */
+}
+
+void mark_terms_dirty() {
+    for (auto &t : E.terms) if (t->core) { tcore_lock(t->core); vt_mark_all_dirty(tcore_vt(t->core)); tcore_unlock(t->core); }
+}
+
+/* external terminals: what is installed, and how to ask each one to start in a directory */
+struct ExtKnown { const char *name, *dirflag; };
+const ExtKnown EXT_KNOWN[] = {
+    {"x-terminal-emulator", ""}, {"gnome-terminal", "--working-directory="}, {"konsole", "--workdir "}, {"xfce4-terminal", "--working-directory="},
+    {"mate-terminal", "--working-directory="}, {"tilix", "--working-directory="}, {"terminator", "--working-directory="}, {"kitty", "--directory "},
+    {"alacritty", "--working-directory "}, {"foot", "--working-directory "}, {"wezterm", "start --cwd "}, {"lestrix", "--working-directory "}, {"xterm", ""},
+};
+
+bool on_path(const std::string &name) {
+    const char *path = getenv("PATH");
+    if (!path) return false;
+    std::string p = path;
+    for (size_t b = 0; b <= p.size();) {
+        size_t e = p.find(':', b);
+        if (e == std::string::npos) e = p.size();
+        std::string f = p.substr(b, e - b) + "/" + name;
+        if (access(f.c_str(), X_OK) == 0) return true;
+        b = e + 1;
+    }
+    return false;
+}
+
+void detect_externals() {
+    E.term_ext.clear();
+    for (const ExtKnown &k : EXT_KNOWN) if (on_path(k.name)) E.term_ext.push_back({k.name, k.dirflag});
+    const char *t = getenv("TERMINAL");
+    if (t && *t && on_path(t)) { bool have = false; for (auto &x : E.term_ext) if (x.name == t) have = true; if (!have) E.term_ext.push_back({t, ""}); }
+}
+
+void launch_external(std::string name) {
+    if (name.empty()) { detect_externals(); if (E.term_ext.empty()) { E.status_msg = "no terminal emulator found"; redraw(); return; } name = E.term_ext[0].name; }
+    std::string flag;
+    for (const ExtKnown &k : EXT_KNOWN) if (name == k.name) flag = k.dirflag;
+    std::string cwd = E.tree.root().empty() ? "." : E.tree.root();
+    std::vector<std::string> args = {name};
+    if (!flag.empty()) {
+        if (flag.back() == '=') args.push_back(flag + cwd);
+        else { size_t b = 0; while (b < flag.size()) { size_t e = flag.find(' ', b); if (e == std::string::npos) e = flag.size(); if (e > b) args.push_back(flag.substr(b, e - b)); b = e + 1; } args.push_back(cwd); }
+    }
+    std::vector<char *> argv;
+    for (std::string &a : args) argv.push_back(const_cast<char *>(a.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid = fork();
+    if (pid == 0) {   /* double fork: the terminal is not our child, so there is nothing to reap and no SIGCHLD handling to disturb */
+        if (fork() != 0) _exit(0);
+        setsid();
+        if (chdir(cwd.c_str()) != 0) {}
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    if (pid > 0) waitpid(pid, nullptr, 0);
+    E.status_msg = "opened " + name;
+    redraw();
+}
+
+void apply_theme(const UiTheme *t) {
+    if (E.theme && E.frames) begin_op("theme switch");
+    E.theme = t;
+    const char *acc = E.follow_fleet && E.fleet.found && !E.fleet.accent.empty() ? E.fleet.accent.c_str() : t->accent;
+    uint32_t bg0 = ui_rgba(t->bg0, 255), bg1 = ui_rgba(t->bg1, 255), bg2 = ui_rgba(t->bg2, 255), ink = ui_rgba(t->ink, 255);
+    uint32_t accent = ui_rgba(acc, 255), tbg = ui_rgba(t->term_bg, 255), tfg = ui_rgba(t->term_fg, 255);
+    C_CHROME = bg1; C_MENUBAR = bg0; C_EDITOR = tbg; C_FIELD = bg2; C_SELROW = ui_mix(bg1, ink, 0.10);
+    C_HOVER = ui_mix(bg1, ink, 0.06); C_BORDER = ui_mix(bg1, ink, 0.16); C_GROUP = ui_mix(bg1, ink, 0.40);
+    C_UI = ink; C_UI_DIM = ui_mix(bg1, ink, 0.70); C_UI_FAINT = ui_mix(bg1, ink, 0.48);
+    C_ACCENT = accent; C_FG = tfg; C_CURSOR = tfg;
+    C_GUTTER = ui_mix(tbg, tfg, 0.40); C_GUTTER_CUR = ui_mix(tbg, tfg, 0.85);
+    C_MENU = (ui_mix(bg1, bg0, 0.25) & 0x00ffffffu) | (250u << 24); C_MENU_BORDER = ui_mix(bg1, ink, 0.28); C_MENU_SEL = ui_mix(bg1, accent, 0.40);
+    C_CURLINE = ui_mix(tbg, tfg, 0.055);   /* the faint band behind the cursor line */
+    C_GUIDE = ui_mix(tbg, tfg, 0.13); C_GUIDE_ACT = ui_mix(tbg, tfg, 0.38);   /* indent guides, and the one of the block the cursor is in */
+    C_OCC = ui_mix(tbg, accent, 0.24); C_BRACKET = ui_mix(tbg, accent, 0.50);
+    C_SB_THUMB = ui_mix(tbg, tfg, 0.20); C_SB_HOT = ui_mix(tbg, tfg, 0.38);
+    C_SEL = ui_mix(tbg, accent, 0.38); C_BOX = ui_mix(bg1, bg0, 0.55); C_BOX_LINE = ui_mix(bg1, ink, 0.22);
+    {   /* VS Code's own colours (git extension manifest, Dark/Light Modern, diff editor registry); dark or light by the editor background */
+        double lum = (0.299 * (tbg & 255) + 0.587 * ((tbg >> 8) & 255) + 0.114 * ((tbg >> 16) & 255)) / 255.0;
+        bool light = lum > 0.5;
+        C_GIT_ADD = light ? RGBA(0x58, 0x7c, 0x0c, 255) : RGBA(0x81, 0xb8, 0x8b, 255);
+        C_GIT_MOD = light ? RGBA(0x89, 0x55, 0x03, 255) : RGBA(0xe2, 0xc0, 0x8d, 255);
+        C_GIT_DEL = light ? RGBA(0xad, 0x07, 0x07, 255) : RGBA(0xc7, 0x4e, 0x39, 255);
+        C_GIT_UNT = light ? RGBA(0x00, 0x71, 0x00, 255) : RGBA(0x73, 0xc9, 0x91, 255);
+        C_GIT_CONF = light ? RGBA(0xad, 0x07, 0x07, 255) : RGBA(0xe4, 0x67, 0x6b, 255);
+        C_GUT_ADD = RGBA(0x2e, 0xa0, 0x43, 255);
+        C_GUT_MOD = light ? RGBA(0x00, 0x5f, 0xb8, 255) : RGBA(0x00, 0x78, 0xd4, 255);
+        C_GUT_DEL = RGBA(0xf8, 0x51, 0x49, 255);
+        C_DIFF_ADD = ui_mix(tbg, RGBA(155, 185, 85, 255), light ? 0.30 : 0.20);        /* diffEditor.insertedLineBackground */
+        C_DIFF_ADD_TXT = ui_mix(tbg, RGBA(156, 204, 44, 255), light ? 0.42 : 0.34);    /* diffEditor.insertedTextBackground, over the line colour */
+        C_DIFF_DEL = ui_mix(tbg, RGBA(255, 0, 0, 255), light ? 0.16 : 0.20);           /* diffEditor.removedLineBackground */
+        C_DIFF_DEL_TXT = ui_mix(tbg, RGBA(255, 0, 0, 255), light ? 0.30 : 0.38);
+        C_DIFF_FILL = ui_mix(tbg, tfg, 0.14);                                          /* diffEditor.diagonalFill */
+        C_DIFF_FOLD = ui_mix(bg1, tbg, 0.5);
+    }
+    C_RED = ui_rgba(t->red, 255); C_GREEN = ui_rgba(t->up, 255); C_ORANGE = ui_rgba(t->ansi[3], 255);
+    unsigned r = accent & 255, g = (accent >> 8) & 255, b = (accent >> 16) & 255;
+    C_ON_ACCENT = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0 > 0.47 ? RGBA(16, 18, 20, 255) : RGBA(255, 255, 255, 255);
+    /* syntax colours from the theme's ANSI palette: bright blue keywords, cyan types, yellow functions, orange strings, dim green comments */
+    auto an = [&](int i) { return ui_rgba(t->ansi[i], 255); };
+    TOKCOL[T_PLAIN] = tfg;
+    TOKCOL[T_COMMENT] = ui_mix(tbg, an(2), 0.70);
+    TOKCOL[T_STRING] = ui_mix(an(3), an(1), 0.45);
+    TOKCOL[T_NUMBER] = an(10);
+    TOKCOL[T_KEYWORD] = an(12);
+    TOKCOL[T_TYPE] = an(14);
+    TOKCOL[T_PREPROC] = an(13);
+    TOKCOL[T_PUNCT] = tfg;
+    TOKCOL[T_FUNC] = an(11);
+    TOKCOL[T_KEY] = an(12);
+    TOKCOL[T_HEADING] = an(12);
+    TOKCOL[T_INS] = an(2);
+    TOKCOL[T_DEL] = an(1);
+    ui_palette(&E.pal, t, acc);
+    mark_terms_dirty();
+    E.rows.clear();
+    redraw();
+}
+
+void follow_fleetwm() {
+    fleetwm_read(&E.fleet);
+    if (!E.follow_fleet || !E.fleet.found) return;
+    const char *name = fleetwm_theme_name(E.fleet.theme);
+    apply_theme(ui_theme_find(name ? name : "fleetwm Dark"));
+}
+
+void open_picker(PickKind k) {
+    begin_op(k == PICK_LANG ? "language picker" : k == PICK_THEME ? "theme picker" : "terminal picker");
+    E.pick_kind = k;
+    E.pick_filter.clear();
+    E.pick_items.clear();
+    E.pick_sel = E.pick_scroll = 0;
+    Doc &d = D();
+    if (k == PICK_LANG) {
+        E.pick_items.push_back({"Auto Detect (" + std::string(lang_name(lang_detect(d.path.c_str(), nullptr, 0))) + ")", -1, !d.lang_forced});
+        for (int i = 0; i < lang_count(); i++) E.pick_items.push_back({lang_name(lang_at(i)), i, d.lang_forced && d.lang == lang_at(i)});
+    } else if (k == PICK_THEME) {
+        E.pick_items.push_back({"Follow fleetwm theme" + std::string(E.fleet.found ? "" : " (fleetwm not found)"), -2, E.follow_fleet});
+        for (int i = 0; i < UI_THEME_COUNT; i++) E.pick_items.push_back({UI_THEMES[i].name, i, !E.follow_fleet && E.theme == &UI_THEMES[i]});
+    }
+    else if (k == PICK_TERMINAL) {
+        detect_externals();
+        E.pick_items.push_back({"Built-in terminal (Lestrix engine, in the panel)", 0, E.term_choice == "builtin"});
+        for (size_t i = 0; i < E.term_ext.size(); i++) {
+            std::string label = E.term_ext[i].name == "x-terminal-emulator" ? "System default (x-terminal-emulator)" : E.term_ext[i].name;
+            E.pick_items.push_back({"External: " + label, (int)i + 1, E.term_choice == "external:" + E.term_ext[i].name});
+        }
+    }
+    for (size_t i = 0; i < E.pick_items.size(); i++) if (E.pick_items[i].current) E.pick_sel = (int)i;
+    E.mode = M_PICK;
+    redraw();
+}
+
+void pick_custom(const std::string &title, std::vector<Ed::PItem> items, std::function<void(const Ed::PItem &)> cb) {
+    E.pick_kind = PICK_CUSTOM; E.pick_title = title; E.pick_items = std::move(items); E.pick_cb = std::move(cb);
+    E.pick_filter.clear(); E.pick_sel = E.pick_scroll = 0;
+    for (size_t i = 0; i < E.pick_items.size(); i++) if (E.pick_items[i].current) E.pick_sel = (int)i;
+    E.mode = M_PICK;
+    redraw();
+}
+
+void settings_save();
+
+void pick_choose(int idx) {
+    std::vector<int> view = pick_view();
+    if (idx < 0 || idx >= (int)view.size()) return;
+    Ed::PItem it = E.pick_items[(size_t)view[(size_t)idx]];
+    E.mode = M_EDIT;
+    if (E.pick_kind == PICK_CUSTOM) { auto cb = E.pick_cb; if (cb) cb(it); redraw(); return; }
+    if (E.pick_kind == PICK_LANG) {
+        Doc &d = D();
+        if (it.id < 0) d.set_language(nullptr, false); else d.set_language(lang_at(it.id), true);
+        E.rows.clear();
+    } else if (E.pick_kind == PICK_THEME) {
+        if (it.id == -2) {
+            if (E.fleet.found || (fleetwm_read(&E.fleet), E.fleet.found)) { E.follow_fleet = true; follow_fleetwm(); }
+            else E.status_msg = "fleetwm theme file not found";
+        } else { E.follow_fleet = false; apply_theme(&UI_THEMES[it.id]); }
+        settings_save();
+    } else if (E.pick_kind == PICK_TERMINAL) {
+        E.term_choice = it.id == 0 ? "builtin" : "external:" + E.term_ext[(size_t)it.id - 1].name;
+        E.status_msg = it.id == 0 ? "terminal: built-in panel" : "terminal: " + E.term_ext[(size_t)it.id - 1].name + " (opens in its own window)";
+        settings_save();
+    }
+    redraw();
+}
+
+void open_side(bool open) {
+    E.side_open = open;
+    E.side_close_at = 0;
+    redraw();
+}
+
+void show_view(View v) {
+    E.view = v;
+    if (v == V_GIT) git_refresh();
+    open_side(true);
+    settings_save();
+}
+
+/* ---- file browser dialog ---- */
+
+void fd_load(const std::string &dir0) {
+    char real[4096];
+    std::string dir = realpath(dir0.c_str(), real) ? real : dir0;
+    E.fd.dir = dir;
+    E.fd.all.clear();
+    E.fd.sel = E.fd.scroll = 0;
+    E.fd.picked = false;
+    if (dir != "/") E.fd.all.push_back({"..", true});
+    std::vector<Ed::FdEntry> v;
+    if (DIR *dp = opendir(dir.c_str())) {
+        while (dirent *e = readdir(dp)) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            if (!E.fd.hidden && e->d_name[0] == '.') continue;
+            std::string full = dir + (dir == "/" ? "" : "/") + e->d_name;
+            struct stat st;
+            bool isdir = e->d_type == DT_DIR;
+            if (e->d_type == DT_LNK || e->d_type == DT_UNKNOWN) isdir = stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+            if (E.fd.kind == FD_OPEN_FOLDER && !isdir) continue;
+            v.push_back({e->d_name, isdir});
+        }
+        closedir(dp);
+    }
+    std::sort(v.begin(), v.end(), [](const Ed::FdEntry &a, const Ed::FdEntry &b) { return a.dir != b.dir ? a.dir : lower_ascii(a.name) < lower_ascii(b.name); });
+    E.fd.all.insert(E.fd.all.end(), v.begin(), v.end());
+}
+
+std::vector<int> fd_view() {   /* indices into E.fd.all that match the filter, best first */
+    std::vector<int> out;
+    bool path_mode = !E.fd.filter.empty() && (E.fd.filter[0] == '/' || E.fd.filter[0] == '~');
+    if (E.fd.filter.empty() || path_mode) { for (size_t i = 0; i < E.fd.all.size(); i++) out.push_back((int)i); return out; }
+    FuzzyQuery fq;
+    fq.parse(E.fd.filter);
+    std::vector<std::pair<int, int>> sc;
+    for (size_t i = 0; i < E.fd.all.size(); i++) {
+        if (E.fd.all[i].name == "..") continue;
+        int s2;
+        if (fq.match(E.fd.all[i].name.data(), E.fd.all[i].name.size(), &s2, nullptr)) sc.push_back({-s2, (int)i});
+    }
+    std::sort(sc.begin(), sc.end());
+    for (auto &p : sc) out.push_back(p.second);
+    return out;
+}
+
+void open_filedlg(FdKind k) {
+    E.fd.kind = k;
+    E.fd.filter.clear();
+    E.fd.msg.clear();
+    E.fd.overwrite_armed = false;
+    Doc &d = D();
+    std::string start = E.tree.root();
+    if (!d.path.empty()) start = d.path.substr(0, d.path.rfind('/') == std::string::npos ? 0 : d.path.rfind('/'));
+    if (start.empty()) { const char *h = getenv("HOME"); start = h ? h : "/"; }
+    E.fd.name = k == FD_SAVE ? (d.path.empty() ? "untitled.txt" : d.name()) : "";
+    E.fd.name_focus = k == FD_SAVE;
+    E.mode = M_FILEDLG;
+    std::string pick_name;
+    if (k == FD_OPEN_FOLDER && E.tree.root().size() > 1) {   /* start beside the current workspace, with it highlighted: the usual reason is to switch to a sibling */
+        size_t sl = E.tree.root().rfind('/');
+        start = sl == 0 ? "/" : E.tree.root().substr(0, sl);
+        pick_name = E.tree.root().substr(sl + 1);
+    }
+    fd_load(start);
+    if (!pick_name.empty()) for (size_t i = 0; i < E.fd.all.size(); i++) if (E.fd.all[i].name == pick_name) { E.fd.sel = (int)i; E.fd.picked = true; }
+    redraw();
+}
+
+void fd_cancel() { E.mode = M_EDIT; E.pending = P_NONE; E.status_msg.clear(); redraw(); }
+
+void fd_go(const std::string &dir) { E.fd.filter.clear(); E.fd.msg.clear(); fd_load(dir); redraw(); }
+
+void fd_accept();
+
+/* Enter / double click on a row: folders open in the dialog, files are opened (or, when saving, their name is taken) */
+void fd_activate(int idx) {
+    std::vector<int> view = fd_view();
+    if (idx < 0 || idx >= (int)view.size()) return;
+    const Ed::FdEntry &en = E.fd.all[(size_t)view[(size_t)idx]];
+    std::string full = en.name == ".." ? E.fd.dir.substr(0, std::max<size_t>(1, E.fd.dir.rfind('/'))) : E.fd.dir + (E.fd.dir == "/" ? "" : "/") + en.name;
+    if (en.dir) { fd_go(full); return; }
+    if (E.fd.kind == FD_SAVE) { E.fd.name = en.name; E.fd.name_focus = true; E.fd.overwrite_armed = false; redraw(); return; }
+    E.mode = M_EDIT;
+    if (!E.pinned) open_side(false);
+    open_path(full);
+}
+
+/* the dialog's main button: open the folder, open the selected file, or save under the typed name */
+void fd_accept() {
+    bool path_mode = !E.fd.filter.empty() && (E.fd.filter[0] == '/' || E.fd.filter[0] == '~');
+    if (path_mode) {   /* a typed path: go there, or take the file */
+        std::string p = expand_path(E.fd.filter);
+        struct stat st;
+        if (stat(p.c_str(), &st) != 0) { E.fd.msg = "not found: " + p; redraw(); return; }
+        if (S_ISDIR(st.st_mode)) {
+            if (E.fd.kind == FD_OPEN_FOLDER) { E.mode = M_EDIT; set_workspace(p); redraw(); return; }
+            fd_go(p);
+            return;
+        }
+        if (E.fd.kind == FD_OPEN_FILE) { E.mode = M_EDIT; if (!E.pinned) open_side(false); open_path(p); return; }
+        if (E.fd.kind == FD_SAVE) { E.fd.name = p.substr(p.rfind('/') + 1); fd_go(p.substr(0, p.rfind('/'))); return; }
+    }
+    std::vector<int> view = fd_view();
+    if (E.fd.kind == FD_OPEN_FOLDER) {
+        std::string target = E.fd.dir;
+        if (E.fd.picked && E.fd.sel >= 0 && E.fd.sel < (int)view.size()) { const Ed::FdEntry &en = E.fd.all[(size_t)view[(size_t)E.fd.sel]]; if (en.name != ".." && en.dir) target = E.fd.dir + (E.fd.dir == "/" ? "" : "/") + en.name; }
+        E.mode = M_EDIT;
+        set_workspace(target);
+        redraw();
+        return;
+    }
+    if (E.fd.kind == FD_OPEN_FILE) { if (E.fd.sel >= 0 && E.fd.sel < (int)view.size()) fd_activate(E.fd.sel); return; }
+    /* save */
+    if (E.fd.name.empty() || E.fd.name.find('/') != std::string::npos) { E.fd.msg = "type a file name (no slash)"; redraw(); return; }
+    std::string target = E.fd.dir + (E.fd.dir == "/" ? "" : "/") + E.fd.name;
+    struct stat st;
+    if (stat(target.c_str(), &st) == 0 && target != D().path && !E.fd.overwrite_armed) { E.fd.overwrite_armed = true; E.fd.msg = E.fd.name + " already exists: press Save again to replace it"; redraw(); return; }
+    E.prompt_kind = PK_SAVEAS;
+    E.prompt_q = target;
+    finish_prompt();
+    if (E.mode == M_FILEDLG && E.status_msg.compare(0, 11, "SAVE FAILED") == 0) { E.fd.msg = E.status_msg; }
+    else if (E.mode != M_FILEDLG) {}
+}
+
+void fd_key(const SDL_KeyboardEvent &k) {
+    SDL_Keycode sym = k.keysym.sym;
+    bool ctrl = k.keysym.mod & KMOD_CTRL;
+    std::vector<int> view = fd_view();
+    int n = (int)view.size();
+    bool save_name = E.fd.kind == FD_SAVE && E.fd.name_focus;
+    bool path_mode = !E.fd.filter.empty() && (E.fd.filter[0] == '/' || E.fd.filter[0] == '~');
+    if (sym != SDLK_RETURN && sym != SDLK_KP_ENTER) E.fd.overwrite_armed = false;
+    E.fd.msg.clear();
+    if (sym == SDLK_ESCAPE) { fd_cancel(); return; }
+    if (sym == SDLK_h && ctrl) { E.fd.hidden = !E.fd.hidden; fd_load(E.fd.dir); return; }
+    if (sym == SDLK_UP) { E.fd.sel = std::max(0, E.fd.sel - 1); E.fd.picked = true; return; }
+    if (sym == SDLK_DOWN) { E.fd.sel = std::min(std::max(0, n - 1), E.fd.sel + 1); E.fd.picked = true; return; }
+    if (sym == SDLK_PAGEUP) { E.fd.sel = std::max(0, E.fd.sel - 10); E.fd.picked = true; return; }
+    if (sym == SDLK_PAGEDOWN) { E.fd.sel = std::min(std::max(0, n - 1), E.fd.sel + 10); E.fd.picked = true; return; }
+    if (sym == SDLK_TAB && E.fd.kind == FD_SAVE) { E.fd.name_focus = !E.fd.name_focus; return; }
+    if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+        if (ctrl || save_name || path_mode) { fd_accept(); return; }
+        if (E.fd.kind == FD_OPEN_FOLDER && !E.fd.picked) { fd_accept(); return; }   /* nothing chosen: take the folder we are in */
+        if (!E.fd.picked && n > 1 && E.fd.all[0].name == "..") E.fd.sel = 1;          /* files: Enter without choosing takes the first entry */
+        fd_activate(E.fd.sel);
+        return;
+    }
+    if (sym == SDLK_BACKSPACE) {
+        E.fd.overwrite_armed = false;
+        if (save_name) pop_utf8(E.fd.name);
+        else if (!E.fd.filter.empty()) { pop_utf8(E.fd.filter); E.fd.sel = 0; E.fd.picked = false; }
+        else if (E.fd.dir != "/") fd_go(E.fd.dir.substr(0, std::max<size_t>(1, E.fd.dir.rfind('/'))));   /* an empty filter: Backspace goes up a level */
+        return;
+    }
+    if (sym == SDLK_v && ctrl) {
+        char *c = SDL_GetClipboardText();
+        if (c) { (save_name ? E.fd.name : E.fd.filter) += c; SDL_free(c); }
+        return;
+    }
+}
+
+void open_hit(int row_idx) {
+    if (row_idx < 0 || (size_t)row_idx >= E.srows.size()) return;
+    Ed::SRow row = E.srows[(size_t)row_idx];
+    std::string path = E.search.files()[(size_t)row.file];
+    SearchHit h;
+    bool have = row.hit >= 0;
+    if (have) h = E.sres[(size_t)row.hit];
+    E.mode = M_EDIT;
+    if (!E.pinned) open_side(false);
+    open_path(path);
+    if (have) {
+        Doc &d = D();
+        size_t line = h.line > 0 ? h.line - 1 : 0;
+        if (line < d.buf.lines()) {
+            size_t base = d.buf.line_start(line) + h.off;
+            d.break_group();
+            d.anchor = base + h.ms;
+            d.move_to(base + h.me, true, false);
+        }
+        E.follow = true;
+    }
+    touch();
+}
+
+void toggle_search_option(int act) {
+    if (E.mode == M_FIND) {
+        if (act == A_TOG_CASE) E.find_case = !E.find_case; else if (act == A_TOG_REGEX) E.find_regex = !E.find_regex;
+        if (!E.find_q.empty()) find_from(D().sel_lo());
+        return;
+    }
+    if (act == A_TOG_CASE) E.sq_case = !E.sq_case; else if (act == A_TOG_REGEX) E.sq_regex = !E.sq_regex; else if (act == A_TOG_WORD) E.sq_word = !E.sq_word;
+    if (E.view == V_SEARCH) start_search();
+}
+
+void search_step(int dir) {   /* Up/Down in the results list: next or previous match row */
+    if (E.srows.empty()) return;
+    int i = E.sel_hit;
+    for (int n = 0; n < (int)E.srows.size(); n++) {
+        i += dir;
+        if (i < 0 || i >= (int)E.srows.size()) { i = i < 0 ? (int)E.srows.size() : -1; continue; }
+        if (E.srows[(size_t)i].hit >= 0) break;
+    }
+    if (i < 0 || i >= (int)E.srows.size() || E.srows[(size_t)i].hit < 0) return;
+    E.sel_hit = i;
+    float rh = (float)S(24), topy = (float)i * rh, vh = (float)(E.H - S(190));
+    if (topy < E.side_scroll) E.side_scroll = topy;
+    else if (topy + rh > E.side_scroll + vh) E.side_scroll = topy + rh - vh;
+}
+
+void command_palette();
+void show_shortcuts();
+void do_action(int act) {
+    if ((D().dv || D().mv) && (act == A_CUT || act == A_PASTE || act == A_UNDO || act == A_REDO || act == A_SAVE || act == A_SAVEAS)) { E.status_msg = "diff tabs are read only"; redraw(); return; }
+    Doc &d = D();
+    if (act > A_NONE && act < A_COUNT) begin_op(ACT_LABEL[act]);
+    switch (act) {
+    case A_NEW:
+        if (splash()) { E.blank_tab = true; set_active(0); }   /* the start screen turns into an empty tab */
+        else { new_doc(); set_active((int)E.docs.size() - 1); }
+        break;
+    case A_OPEN_FILE: begin_prompt(PK_OPEN_FILE); break;
+    case A_OPEN_FOLDER: begin_prompt(PK_OPEN_FOLDER); break;
+    case A_SAVE: save_active(); break;
+    case A_SAVEAS: begin_prompt(PK_SAVEAS); break;
+    case A_CLOSE: close_tab(E.active); break;
+    case A_QUIT: request_quit(); break;
+    case A_UNDO: d.undo(); break;
+    case A_REDO: d.redo(); break;
+    case A_CUT: { std::string s = d.selection(); if (!s.empty()) { SDL_SetClipboardText(s.c_str()); d.erase_back(); } break; }
+    case A_COPY: { std::string s = d.selection(); if (!s.empty()) SDL_SetClipboardText(s.c_str()); break; }
+    case A_PASTE: { char *c = SDL_GetClipboardText(); if (c && *c) { d.break_group(); d.insert_text(c, strlen(c)); d.break_group(); } if (c) SDL_free(c); break; }
+    case A_SELALL: d.break_group(); d.select_all(); break;
+    case A_FIND: E.mode = M_FIND; E.find_msg.clear(); E.repl_on = false; E.repl_focus = false; break;
+    case A_QUICK: E.mode = M_QUICK; E.quick_q.clear(); E.quick_sel = 0; quick_update(); break;
+    case A_TOGGLE_SIDEBAR:   /* pinned -> unpin and hide (it comes back on the left edge); anything else -> pin and show */
+        if (E.pinned) { E.pinned = false; E.side_open = false; E.side_close_at = 0; }
+        else { E.pinned = true; E.side_open = true; E.side_close_at = 0; }
+        settings_save();
+        break;
+    case A_PIN:
+        E.pinned = !E.pinned;
+        E.side_open = true;
+        E.side_close_at = E.pinned ? 0 : E.now + 0.6;   /* unpinned: it floats, and leaves when the pointer is elsewhere */
+        settings_save();
+        break;
+    case A_VIEW_EXPLORER: show_view(V_EXPLORER); break;
+    case A_VIEW_GIT: show_view(V_GIT); break;
+    case A_LANG: open_picker(PICK_LANG); break;
+    case A_PREVIEW:
+        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc, reStructuredText and Mermaid files";
+        else { E.preview_open = !E.preview_open; E.preview_split = false; E.preview_scroll = 0; E.status_msg.clear(); }
+        break;
+    case A_PREVIEW_SPLIT:
+        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc, reStructuredText and Mermaid files";
+        else { E.preview_open = true; E.preview_split = !E.preview_split; E.preview_scroll = (float)d.top * (float)E.rowh; E.status_msg.clear(); }
+        break;
+    case A_THEME: open_picker(PICK_THEME); break;
+    case A_SEARCH: show_view(V_SEARCH); E.mode = M_SIDE; if (E.s_active && E.srows.empty()) start_search(); break;
+    case A_TOG_REGEX: case A_TOG_CASE: case A_TOG_WORD: toggle_search_option(act); break;
+    case A_TERM_TOGGLE:
+        if (E.term_choice != "builtin") { launch_external(E.term_choice.substr(E.term_choice.find(':') + 1)); break; }
+        if (E.term_open && E.term_focus) { E.term_open = false; E.term_focus = false; }
+        else if (E.term_open) E.term_focus = true;
+        else { E.term_open = true; if (E.terms.empty() && !new_terminal()) E.term_open = false; else E.term_focus = true; }
+        break;
+    case A_TERM_NEW:
+        if (E.term_choice != "builtin") launch_external(E.term_choice.substr(E.term_choice.find(':') + 1)); else new_terminal();
+        break;
+    case A_TERM_KILL: kill_terminal(E.term_active); break;
+    case A_TERM_PICK: open_picker(PICK_TERMINAL); break;
+    case A_TERM_EXTERNAL: launch_external(E.term_choice.compare(0, 9, "external:") == 0 ? E.term_choice.substr(9) : std::string()); break;
+    case A_STATS: E.show_stats = !E.show_stats; break;
+    case A_NEXT_TAB: set_active((E.active + 1) % (int)E.docs.size()); break;
+    case A_PREV_TAB: set_active((E.active + (int)E.docs.size() - 1) % (int)E.docs.size()); break;
+    case A_PALETTE: command_palette(); break;
+    case A_OUTLINE: E.outline_on = !E.outline_on; settings_save(); E.status_msg = E.outline_on ? "outline on (Files tab)" : "outline off"; break;
+    case A_SHORTCUTS: show_shortcuts(); break;
+    case A_PROBLEMS: lint_problems_list(); break;
+    case A_NEXT_PROBLEM: lint_next(1); break;
+    case A_PREV_PROBLEM: lint_next(-1); break;
+    case A_QUICKFIX: lint_quick_fix(); break;
+    case A_FIXALL: lint_fix_all(); break;
+    case A_LINT: E.lint_on = !E.lint_on; settings_save(); if (!E.lint_on) g_lint.clear(); E.status_msg = E.lint_on ? "live checks on" : "live checks off"; break;
+    case A_ANSIBLE: template_insert(false); break;
+    case A_K8S: template_insert(true); break;
+    case A_SETTINGS: set_open(); break;
+    case A_K8S_CRD: lint_crd_reset(); g_crd_force = true; E.status_msg = "scanning the workspace for CustomResourceDefinitions"; break;
+    case A_VIM: E.vim_on = !E.vim_on; vim_reset(); settings_save(); E.status_msg = E.vim_on ? "vim keys on (Esc for normal mode)" : "vim keys off"; break;
+    case A_REPLACE: if (D().dv || D().mv) { E.status_msg = "diff tabs are read only"; break; } E.mode = M_FIND; E.find_msg.clear(); E.repl_on = true; E.repl_focus = false; break;
+    case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
+    case A_REOPEN: reopen_closed_tab(); break;
+    case A_CLOSE_ALL: close_all_tabs(); break;
+    case A_ABOUT: E.status_msg = "Hootedit 0.2.0 - BeanGreen247 - fast native editor"; break;
+    case A_REFRESH: E.tree.refresh(); git_refresh(); break;
+    default: return;
+    }
+    if ((act == A_TERM_TOGGLE || act == A_TERM_NEW) && E.term_focus && E.mode != M_EDIT && E.mode != M_CONFIRM && E.mode != M_PROMPT) E.mode = M_EDIT;   /* a focused terminal owns the keyboard */
+    E.follow = true;
+    touch();
+}
+
+int menu_next(int menu, int sel, int dir) {
+    const std::vector<MenuItem> &it = MENUS[(size_t)menu].items;
+    int n = (int)it.size();
+    for (int k = 1; k <= n; k++) {
+        int j = ((sel + dir * k) % n + n) % n;
+        if (it[(size_t)j].label[0] && it[(size_t)j].act != A_NONE) return j;
+    }
+    return sel;
+}
+
+void open_menu(int m) {
+    begin_op(std::string("menu ") + MENUS[(size_t)m].name);
+    E.menu_open = m;
+    E.mode = M_MENU;
+    E.menu_sel = -1;
+    E.menu_sel = menu_next(m, -1, 1);
+    redraw();
+}
+
+/* Ctrl+Shift+P: every menu command and the git and remote actions in one filterable list */
+void command_palette() {
+    struct Cmd { std::string label; std::function<void()> run; };
+    auto cmds = std::make_shared<std::vector<Cmd>>();
+    for (const Menu &m : MENUS)
+        for (const MenuItem &it : m.items)
+            if (it.label[0] && it.act != A_NONE && it.act != A_PALETTE) { int act = it.act; cmds->push_back({std::string(m.name) + ": " + it.label + (it.keys[0] ? std::string("    ") + it.keys : std::string()), [act] { do_action(act); }}); }
+    auto add = [&](const char *l, std::function<void()> f) { cmds->push_back({l, std::move(f)}); };
+    add("Open Settings", [] { do_action(A_SETTINGS); });
+    add("Settings: Toggle Vim Keys", [] { do_action(A_VIM); });
+    add("Settings: Toggle Outline", [] { do_action(A_OUTLINE); });
+    add("Settings: Toggle Live Checks", [] { do_action(A_LINT); });
+    add("Git: Pull", [] { git_pull_flow(); });
+    add("Git: Pull (Rebase)", [] { git_pull_rebase(); });
+    add("Git: Pull from...", [] { git_pull_from(); });
+    add("Git: Push", [] { git_push_flow(); });
+    add("Git: Push to...", [] { git_push_to(); });
+    add("Git: Fetch", [] { git_fetch_flow(); });
+    add("Git: Sync", [] { git_sync_flow(); });
+    add("Git: Checkout to...", [] { git_branch_picker(); });
+    add("Git: Create Branch...", [] { git_create_branch(""); });
+    add("Git: Merge Branch...", [] { git_branch_ops(2); });
+    add("Git: Rebase Branch...", [] { git_rebase_onto(); });
+    add("Git: Stage All Changes", [] { git_stage_all(E.git.root); git_refresh(); });
+    add("Git: Unstage All Changes", [] { git_unstage(E.git.root, "."); git_refresh(); });
+    add("Git: Commit", [] { git_commit_flow(0); });
+    add("Git: Commit (Amend)", [] { git_commit_flow(1); });
+    add("Git: Stash", [] { git_stash_push(false); });
+    add("Git: Pop Latest Stash", [] { git_stash_op("pop", true); });
+    add("Git: Create Tag...", [] { git_tag_create(""); });
+    add("Git: Add Remote...", [] { git_remote_add(); });
+    add("Git: Remove Remote...", [] { git_remote_remove(); });
+    add("Remote: New Connection...", [] { remote_new_connection(); });
+    add("Remote: Open SSH Terminal", [] { if (!g_rem.profiles.empty()) { for (size_t i = 0; i < g_rem.conns.size(); i++) if (g_rem.conns[i].connected) { remote_open_terminal((int)i); return; } } E.status_msg = "connect to an ssh server in the Remote tab first"; });
+    std::vector<Ed::PItem> items;
+    for (size_t i = 0; i < cmds->size(); i++) items.push_back({(*cmds)[i].label, (int)i, false});
+    pick_custom("Command Palette", items, [cmds](const Ed::PItem &it) { if ((size_t)it.id < cmds->size()) (*cmds)[(size_t)it.id].run(); });
+}
+
+/* Help > Keyboard Shortcuts: every shortcut in one filterable list; picking an entry that is a menu command runs it */
+void show_shortcuts() {
+    std::vector<Ed::PItem> items;
+    for (const Menu &m : MENUS)
+        for (const MenuItem &it : m.items)
+            if (it.label[0] && it.keys[0] && it.act != A_NONE) items.push_back({std::string(it.label) + "    " + it.keys, it.act + 1, false});
+    static const char *extra[] = {
+        "Select Next Occurrence    Ctrl+D", "Move Line Up / Down    Alt+Up / Alt+Down", "Copy Line Up / Down    Shift+Alt+Up / Down", "Delete Line    Ctrl+Shift+K",
+        "Insert Line Below / Above    Ctrl+Enter / Ctrl+Shift+Enter", "Select Line    Ctrl+L", "Toggle Line Comment    Ctrl+/", "Indent / Outdent    Ctrl+] / Ctrl+[",
+        "Go to Tab 1-9    Alt+1 ... Alt+9", "Recent Tabs    Ctrl+Tab", "Next Change in a Diff    F7", "Save All    Ctrl+K Ctrl+S", "Close All Tabs    Ctrl+K Ctrl+W",
+        "Keyboard Shortcuts    Ctrl+K Ctrl+H",
+        "Vim: normal mode    Esc", "Vim: insert    i a I A o O", "Vim: move    h j k l w b e 0 ^ $ gg G f t % { }", "Vim: edit    x dd D cc C yy p P u Ctrl+R . J r ~",
+        "Vim: operators    d y c > <  with motions and objects (diw ci\" da( yap)", "Vim: select    v V, then d y c > <", "Vim: command line    :w :q :wq :e file :42 /text n"};
+    for (const char *e : extra) items.push_back({e, 0, false});
+    pick_custom("Keyboard Shortcuts", items, [](const Ed::PItem &it) { if (it.id > 0) do_action(it.id - 1); });
+}
+
+void key_down(const SDL_KeyboardEvent &k) {
+    bool ctrl = k.keysym.mod & KMOD_CTRL, shift = k.keysym.mod & KMOD_SHIFT;
+    SDL_Keycode sym = k.keysym.sym;
+    Doc &d = D();
+    Layout L = layout();
+
+    if ((E.mode == M_SIDE || E.mode == M_FIND || E.mode == M_QUICK || E.mode == M_PICK) && ctrl && sym == SDLK_BACKQUOTE) {   /* the terminal shortcut works from any input box */
+        E.mode = M_EDIT;
+        do_action(shift ? A_TERM_NEW : A_TERM_TOGGLE);
+        touch();
+        return;
+    }
+    if (E.mode == M_DIALOG) {
+        Dialog &d = E.dlg;
+        int n = (int)d.btns.size();
+        if (sym == SDLK_ESCAPE) dlg_finish(-1);
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) dlg_finish(d.focus);
+        else if (sym == SDLK_TAB) d.focus = (d.focus + (shift ? n - 1 : 1)) % std::max(1, n);
+        else if (sym == SDLK_LEFT && !d.input) d.focus = (d.focus + n - 1) % std::max(1, n);
+        else if (sym == SDLK_RIGHT && !d.input) d.focus = (d.focus + 1) % std::max(1, n);
+        else if (d.input && sym == SDLK_BACKSPACE) { if (d.fresh) { d.text.clear(); d.fresh = false; } else pop_utf8(d.text); }
+        else if (d.input && sym == SDLK_v && ctrl) { char *c = SDL_GetClipboardText(); if (c) { if (d.fresh) { d.text.clear(); d.fresh = false; } d.text += c; SDL_free(c); } }
+        else if (d.input && sym == SDLK_u && ctrl) d.text.clear();
+        touch();
+        return;
+    }
+    if (E.mode == M_CTX) {
+        if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; E.ctx.items.clear(); E.ctx.open.clear(); }
+        touch();
+        return;
+    }
+    if (E.mode == M_CONFIRM) {
+        if (sym == SDLK_s || sym == SDLK_y || sym == SDLK_RETURN) {
+            Doc &c = *E.docs[(size_t)E.confirm_idx];
+            if (c.path.empty()) { E.active = E.confirm_idx; begin_prompt(PK_SAVEAS); }
+            else if (c.save(nullptr)) after_save();
+            else { E.status_msg = "SAVE FAILED, buffer kept"; E.mode = M_EDIT; E.pending = P_NONE; }
+        } else if (sym == SDLK_d || sym == SDLK_n) {
+            Pending p = E.pending;
+            close_confirmed();
+            if (p == P_QUIT) request_quit();
+        } else if (sym == SDLK_ESCAPE || sym == SDLK_c) { E.mode = M_EDIT; E.pending = P_NONE; }
+        else return;
+        touch();
+        return;
+    }
+    if (E.mode == M_FILEDLG) { fd_key(k); touch(); return; }
+    if (E.mode == M_PROMPT) {
+        if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) finish_prompt();
+        else if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; E.pending = P_NONE; E.status_msg.clear(); }
+        else if (sym == SDLK_BACKSPACE) pop_utf8(E.prompt_q);
+        else if (sym == SDLK_v && ctrl) { char *c = SDL_GetClipboardText(); if (c) { E.prompt_q += c; SDL_free(c); } }
+        else return;
+        touch();
+        return;
+    }
+    if (E.mode == M_MENU) {
+        int n = (int)MENUS.size();
+        if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; E.menu_open = -1; }
+        else if (sym == SDLK_LEFT) open_menu((E.menu_open + n - 1) % n);
+        else if (sym == SDLK_RIGHT) open_menu((E.menu_open + 1) % n);
+        else if (sym == SDLK_UP) E.menu_sel = menu_next(E.menu_open, E.menu_sel, -1);
+        else if (sym == SDLK_DOWN) E.menu_sel = menu_next(E.menu_open, E.menu_sel, 1);
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+            int act = E.menu_sel >= 0 ? MENUS[(size_t)E.menu_open].items[(size_t)E.menu_sel].act : A_NONE;
+            E.mode = M_EDIT; E.menu_open = -1;
+            do_action(act);
+        } else return;
+        touch();
+        return;
+    }
+    if (E.mode == M_EDIT && ctrl && shift && sym == SDLK_v) { do_action(A_PREVIEW); touch(); return; }
+    if (E.mode == M_SETTINGS) {
+        if (sym == SDLK_ESCAPE) { if (!g_set.q.empty()) { g_set.q.clear(); g_set.sel = 0; } else set_close(); }
+        else if (sym == SDLK_UP) set_move(-1);
+        else if (sym == SDLK_DOWN) set_move(1);
+        else if (sym == SDLK_PAGEUP) { for (int i = 0; i < 5; i++) set_move(-1); }
+        else if (sym == SDLK_PAGEDOWN) { for (int i = 0; i < 5; i++) set_move(1); }
+        else if (sym == SDLK_HOME) { g_set.sel = 0; set_move(1); if (g_set.rows.size() && g_set.rows[0].item >= 0) g_set.sel = 0; }
+        else if (sym == SDLK_LEFT && g_set.q.empty()) { g_set.cat = std::max(0, g_set.cat - 1); g_set.sel = 0; g_set.scroll = 0; }
+        else if (sym == SDLK_RIGHT && g_set.q.empty()) { g_set.cat = std::min((int)(sizeof SET_CATS / sizeof *SET_CATS) - 1, g_set.cat + 1); g_set.sel = 0; g_set.scroll = 0; }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER || (sym == SDLK_SPACE && g_set.q.empty())) { if (g_set.sel >= 0 && g_set.sel < (int)g_set.rows.size() && g_set.rows[(size_t)g_set.sel].item >= 0) set_activate(g_set.rows[(size_t)g_set.sel].item); }
+        else if (sym == SDLK_BACKSPACE) { pop_utf8(g_set.q); g_set.sel = 0; }
+        else if (ctrl && !shift && sym == SDLK_COMMA) set_close();
+        else return;
+        set_rebuild();
+        touch();
+        return;
+    }
+    if (E.mode == M_PICK) {
+        int n = (int)pick_view().size();
+        if (sym == SDLK_ESCAPE) E.mode = M_EDIT;
+        else if (sym == SDLK_UP) E.pick_sel = std::max(0, E.pick_sel - 1);
+        else if (sym == SDLK_DOWN) E.pick_sel = std::min(n - 1, E.pick_sel + 1);
+        else if (sym == SDLK_PAGEUP) E.pick_sel = std::max(0, E.pick_sel - 10);
+        else if (sym == SDLK_PAGEDOWN) E.pick_sel = std::min(n - 1, E.pick_sel + 10);
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) pick_choose(E.pick_sel);
+        else if (sym == SDLK_BACKSPACE) { pop_utf8(E.pick_filter); E.pick_sel = 0; }
+        else return;
+        touch();
+        return;
+    }
+    if (E.mode == M_GITMSG) {
+        if (sym == SDLK_ESCAPE) E.mode = M_EDIT;
+        else if (sym == SDLK_BACKSPACE) pop_utf8(E.g.msg);
+        else if ((sym == SDLK_RETURN || sym == SDLK_KP_ENTER) && ctrl) { E.mode = M_EDIT; git_commit_now(); }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) E.g.msg += '\n';
+        else if (sym == SDLK_v && ctrl) { char *t = SDL_GetClipboardText(); if (t) { E.g.msg += t; SDL_free(t); } }
+        else if (sym == SDLK_u && ctrl) E.g.msg.clear();
+        else return;
+        E.g.err.clear();
+        touch();
+        return;
+    }
+    if (E.mode == M_QUICK) {
+        int n = (int)E.quick_hits.size();
+        if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; quick_end(false); }
+        else if (sym == SDLK_UP) { E.quick_sel = std::max(0, E.quick_sel - 1); quick_preview(); }
+        else if (sym == SDLK_DOWN) { E.quick_sel = std::min(n - 1, E.quick_sel + 1); quick_preview(); }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) { E.mode = M_EDIT; quick_end(true); if (!E.quick_q.empty() && E.quick_q[0] == ':') goto_line(E.quick_q.substr(1)); else if (n) open_path(E.quick_hits[(size_t)E.quick_sel]); }
+        else if (sym == SDLK_BACKSPACE) { pop_utf8(E.quick_q); E.quick_sel = 0; quick_update(); }
+        else return;
+        touch();
+        return;
+    }
+    if (E.mode == M_SIDE) {
+        bool alt = k.keysym.mod & KMOD_ALT;
+        bool searching = E.view == V_SEARCH;
+        std::string &qs = searching ? E.sq : E.side_q;
+        auto changed = [&]() { if (searching) start_search(); else { E.side_scroll = 0; side_filter_update(); } };
+        if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; if (!searching) E.side_q.clear(); }
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+            if (searching) { int r = E.sel_hit; if (r < 0) for (size_t i = 0; i < E.srows.size(); i++) if (E.srows[i].hit >= 0) { r = (int)i; break; } open_hit(r); }
+            else if (!E.side_hits.empty()) { std::string p = E.side_hits[0]; E.mode = M_EDIT; E.side_q.clear(); if (!E.pinned) open_side(false); open_path(p); }
+        }
+        else if (sym == SDLK_DOWN && searching) search_step(1);
+        else if (sym == SDLK_UP && searching) search_step(-1);
+        else if (sym == SDLK_BACKSPACE) { pop_utf8(qs); changed(); }
+        else if (sym == SDLK_v && ctrl) { char *c = SDL_GetClipboardText(); if (c) { qs += c; SDL_free(c); changed(); } }
+        else if (alt && searching && sym == SDLK_r) toggle_search_option(A_TOG_REGEX);
+        else if (alt && searching && sym == SDLK_c) toggle_search_option(A_TOG_CASE);
+        else if (alt && searching && sym == SDLK_w) toggle_search_option(A_TOG_WORD);
+        else return;
+        touch();
+        return;
+    }
+    if (E.mode == M_FIND) {
+        bool alt2 = k.keysym.mod & KMOD_ALT;
+        if (sym == SDLK_ESCAPE) { E.mode = M_EDIT; E.repl_on = false; E.repl_focus = false; }
+        else if (sym == SDLK_h && ctrl) { E.repl_on = true; E.repl_focus = !E.repl_focus; }
+        else if (sym == SDLK_TAB && E.repl_on) E.repl_focus = !E.repl_focus;
+        else if ((sym == SDLK_RETURN || sym == SDLK_KP_ENTER) && E.repl_on && ctrl && alt2) replace_all();
+        else if ((sym == SDLK_RETURN || sym == SDLK_KP_ENTER) && E.repl_on && E.repl_focus) replace_one();
+        else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) find_from(d.sel_hi());
+        else if (sym == SDLK_BACKSPACE && E.repl_focus) pop_utf8(E.repl_q);
+        else if (sym == SDLK_v && ctrl && E.repl_focus) { char *c = SDL_GetClipboardText(); if (c) { E.repl_q += c; SDL_free(c); } }
+        else if (sym == SDLK_BACKSPACE) { pop_utf8(E.find_q); find_from(d.sel_lo()); }
+        else if (sym == SDLK_f && ctrl) { E.find_q.clear(); E.find_msg.clear(); }
+        else if (sym == SDLK_v && ctrl) { char *c = SDL_GetClipboardText(); if (c) { E.find_q += c; SDL_free(c); find_from(d.sel_lo()); } }
+        else if (sym == SDLK_w && ctrl) { E.mode = M_EDIT; close_tab(E.active); }
+        else if (sym == SDLK_n && ctrl) { E.mode = M_EDIT; do_action(A_NEW); }
+        else if (sym == SDLK_p && ctrl) do_action(A_QUICK);
+        else if ((k.keysym.mod & KMOD_ALT) && sym == SDLK_r) toggle_search_option(A_TOG_REGEX);
+        else if ((k.keysym.mod & KMOD_ALT) && sym == SDLK_c) toggle_search_option(A_TOG_CASE);
+        else return;
+        touch();
+        return;
+    }
+
+    if (E.term_open && E.term_focus && cur_term() && cur_term()->core) {
+        bool alt = k.keysym.mod & KMOD_ALT;
+        TermCore *core = cur_term()->core;
+        if (ctrl && sym == SDLK_BACKQUOTE) { do_action(shift ? A_TERM_NEW : A_TERM_TOGGLE); touch(); return; }
+        if (ctrl && shift && sym == SDLK_c) { tcore_copy(core); touch(); return; }
+        if (ctrl && shift && sym == SDLK_v) { tcore_paste_request(core); touch(); return; }
+        if (ctrl && !shift && !alt && (sym == SDLK_PAGEUP || sym == SDLK_PAGEDOWN) && E.terms.size() > 1) {
+            int n = (int)E.terms.size();
+            E.term_active = (E.term_active + (sym == SDLK_PAGEDOWN ? 1 : n - 1)) % n;
+            touch();
+            return;
+        }
+        TKey tk = TK_NONE;
+        switch (sym) {
+        case SDLK_UP: case SDLK_KP_8: tk = TK_UP; break; case SDLK_DOWN: case SDLK_KP_2: tk = TK_DOWN; break;
+        case SDLK_LEFT: case SDLK_KP_4: tk = TK_LEFT; break; case SDLK_RIGHT: case SDLK_KP_6: tk = TK_RIGHT; break;
+        case SDLK_HOME: tk = TK_HOME; break; case SDLK_END: tk = TK_END; break; case SDLK_INSERT: tk = TK_INSERT; break;
+        case SDLK_DELETE: tk = TK_DELETE; break; case SDLK_PAGEUP: tk = TK_PGUP; break; case SDLK_PAGEDOWN: tk = TK_PGDN; break;
+        case SDLK_F1: tk = TK_F1; break; case SDLK_F2: tk = TK_F2; break; case SDLK_F3: tk = TK_F3; break; case SDLK_F4: tk = TK_F4; break;
+        case SDLK_F5: tk = TK_F5; break; case SDLK_F6: tk = TK_F6; break; case SDLK_F7: tk = TK_F7; break; case SDLK_F8: tk = TK_F8; break;
+        case SDLK_F9: tk = TK_F9; break; case SDLK_F10: tk = TK_F10; break; case SDLK_F11: tk = TK_F11; break; case SDLK_F12: tk = TK_F12; break;
+        case SDLK_RETURN: case SDLK_KP_ENTER: tk = TK_ENTER; break; case SDLK_BACKSPACE: tk = TK_BACKSPACE; break;
+        case SDLK_TAB: tk = TK_TAB; break; case SDLK_ESCAPE: tk = TK_ESCAPE; break;
+        default: break;
+        }
+        int mods = (shift ? TM_SHIFT : 0) | (alt ? TM_ALT : 0) | (ctrl ? TM_CTRL : 0) | ((k.keysym.mod & KMOD_GUI) ? TM_META : 0);
+        uint32_t cp = (sym >= 32 && sym < 127) ? (uint32_t)sym : 0;
+        if (tk == TK_ENTER) tcore_cmd_begin(core, now_s());
+        begin_op("terminal key");
+        if (tcore_key(core, tk, cp, mods)) touch();
+        return;
+    }
+    E.status_msg.clear();
+    if (sym == SDLK_BACKSPACE || sym == SDLK_DELETE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER || sym == SDLK_LEFT || sym == SDLK_RIGHT || sym == SDLK_UP || sym == SDLK_DOWN) begin_op(sym == SDLK_BACKSPACE || sym == SDLK_DELETE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER ? "keystroke" : "cursor move");
+    if (E.show_stats && sym == SDLK_ESCAPE) { E.show_stats = false; touch(); return; }
+    bool alt = k.keysym.mod & KMOD_ALT;
+    if (E.mode == M_EDIT && vim_active() && !d.dv && !d.mv && !E.chord_k) {
+        if (g_vim.cmd_kind) {
+            if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) g_vim.cmd_enter(d);
+            else if (sym == SDLK_ESCAPE) g_vim.cmd_cancel();
+            else if (sym == SDLK_BACKSPACE) g_vim.cmd_back();
+            else if (ctrl && sym == SDLK_u) g_vim.cmd.clear();
+            else if (ctrl && sym == SDLK_v) { char *c = SDL_GetClipboardText(); if (c) { g_vim.cmd_text(c); SDL_free(c); } }
+            E.follow = true; touch(); return;
+        }
+        if (sym == SDLK_ESCAPE || (ctrl && sym == SDLK_LEFTBRACKET)) { g_vim.escape(d); E.follow = true; touch(); return; }
+        if (g_vim.typing()) { if (sym == SDLK_BACKSPACE && !ctrl) { if (g_vim.backspace(d)) { E.follow = true; touch(); return; } g_vim.erased(); } }
+        else if (!alt) {
+            if (ctrl && !shift && sym == SDLK_v) { g_vim.text(d, "\x16"); E.follow = true; touch(); return; }
+            if (ctrl && !shift && (sym == SDLK_a || sym == SDLK_x)) { g_vim.increment(d, sym == SDLK_a ? 1 : -1); E.follow = true; touch(); return; }
+            if (ctrl && !shift && sym == SDLK_r) { d.redo(); g_vim.after_history(d); E.follow = true; touch(); return; }
+            if (ctrl && !shift && (sym == SDLK_d || sym == SDLK_u)) { g_vim.half_page(d, sym == SDLK_d ? 1 : -1); E.follow = true; touch(); return; }
+            if (!ctrl) {
+                const char *km = sym == SDLK_BACKSPACE ? "h" : sym == SDLK_DELETE ? "x" : (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) ? "+" : nullptr;
+                if (km) { g_vim.text(d, km); E.follow = true; touch(); return; }
+                if (sym == SDLK_TAB) return;
+            }
+        }
+    }
+    if (E.side_open && !E.pinned && sym == SDLK_ESCAPE) { open_side(false); touch(); return; }
+    if (E.chord_k) {   /* the second key of Ctrl+K */
+        E.chord_k = false;
+        E.status_msg.clear();
+        if (sym == SDLK_LSHIFT || sym == SDLK_RSHIFT || sym == SDLK_LCTRL || sym == SDLK_RCTRL) { E.chord_k = true; return; }
+        if (sym == SDLK_t && ctrl) do_action(A_THEME);
+        else if (sym == SDLK_o && ctrl) do_action(A_OPEN_FOLDER);
+        else if (sym == SDLK_w && ctrl) do_action(A_CLOSE_ALL);
+        else if (sym == SDLK_m) do_action(A_LANG);
+        else if (sym == SDLK_h && ctrl) do_action(A_SHORTCUTS);
+        else if (sym == SDLK_s && ctrl) { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); after_save(); }
+        touch();
+        return;
+    }
+    if (ctrl && !shift && !alt && sym == SDLK_k) { E.chord_k = true; E.status_msg = "(Ctrl+K) was pressed. Waiting for the second key of the chord..."; touch(); return; }
+    if (alt && !ctrl && (sym == SDLK_UP || sym == SDLK_DOWN)) { begin_op(shift ? "copy line" : "move line"); if (shift) line_copy(d, sym == SDLK_UP ? -1 : 1); else line_move(d, sym == SDLK_UP ? -1 : 1); E.follow = true; touch(); return; }
+    if (alt && !ctrl && !shift && sym >= SDLK_1 && sym <= SDLK_9) { if ((size_t)(sym - SDLK_1) < E.docs.size()) set_active((int)(sym - SDLK_1)); touch(); return; }
+    if (alt && !ctrl && !shift && sym == SDLK_0) { set_active((int)E.docs.size() - 1); touch(); return; }
+    if (ctrl && (sym == SDLK_PAGEUP || sym == SDLK_PAGEDOWN) && shift && E.docs.size() > 1) {   /* move the tab itself */
+        int to = E.active + (sym == SDLK_PAGEUP ? -1 : 1);
+        if (to >= 0 && to < (int)E.docs.size()) { std::swap(E.docs[(size_t)E.active], E.docs[(size_t)to]); E.active = to; E.tab_reveal = true; }
+        touch();
+        return;
+    }
+    if (g_peek.doc == &d && sym == SDLK_ESCAPE) { g_peek.doc = nullptr; touch(); return; }
+    if (d.dv && diff_key(k, ctrl, shift)) return;
+    if (d.mv && merge_key(k, ctrl, shift)) return;
+    if (ctrl && !alt && (sym == SDLK_LEFT || sym == SDLK_RIGHT)) { d.break_group(); d.move_to(sym == SDLK_LEFT ? word_left(d, d.cur) : word_right(d, d.cur), shift, false); E.follow = true; touch(); return; }
+    if (ctrl && !shift && (sym == SDLK_BACKSPACE || sym == SDLK_DELETE)) {
+        if (!d.has_sel()) { size_t o = sym == SDLK_BACKSPACE ? word_left(d, d.cur) : word_right(d, d.cur); d.anchor = o; }
+        d.erase_back();   /* with a selection set, Backspace removes exactly it */
+        E.follow = true; touch(); return;
+    }
+    if (ctrl && (sym == SDLK_RETURN || sym == SDLK_KP_ENTER)) { line_open(d, !shift); E.follow = true; touch(); return; }
+    if (ctrl && !shift && sym == SDLK_g) { do_action(A_GOTO); touch(); return; }
+    if (ctrl && !shift && sym == SDLK_l) { size_t l = d.buf.line_of(d.cur); size_t e = l + 1 < d.buf.lines() ? d.buf.line_start(l + 1) : d.buf.size(); set_sel(d, d.buf.line_start(l), e); touch(); return; }
+    if (ctrl && shift && sym == SDLK_k) { line_delete(d); E.follow = true; touch(); return; }
+    if (ctrl && !shift && sym == SDLK_SLASH) { toggle_comment(d); E.follow = true; touch(); return; }
+    if (ctrl && !shift && (sym == SDLK_RIGHTBRACKET || sym == SDLK_LEFTBRACKET)) { indent_lines(d, sym == SDLK_LEFTBRACKET); E.follow = true; touch(); return; }
+    if (ctrl && !shift && sym == SDLK_d) { select_next_occurrence(d); E.follow = true; touch(); return; }
+    if (ctrl && shift && sym == SDLK_t) { do_action(A_REOPEN); touch(); return; }
+    if (sym == SDLK_TAB && !ctrl && (shift || (d.has_sel() && d.buf.line_of(d.sel_lo()) != d.buf.line_of(d.sel_hi())))) { indent_lines(d, shift); E.follow = true; touch(); return; }
+    if (ctrl && !shift && !alt && sym == SDLK_COMMA) { do_action(A_SETTINGS); touch(); return; }
+    if (sym == SDLK_F8 && !ctrl && !alt) { do_action(shift ? A_PREV_PROBLEM : A_NEXT_PROBLEM); touch(); return; }
+    if (ctrl && !shift && sym == SDLK_PERIOD) { do_action(A_QUICKFIX); touch(); return; }
+    if (ctrl && shift && sym == SDLK_m) { do_action(A_PROBLEMS); touch(); return; }
+    if (sym == SDLK_F3 && !E.find_q.empty()) { find_from(d.sel_hi()); E.follow = true; touch(); return; }
+    switch (sym) {
+    case SDLK_LEFT: { d.break_group(); size_t p = d.has_sel() && !shift ? d.sel_lo() : d.prev_char(d.cur); d.move_to(p, shift, false); break; }
+    case SDLK_RIGHT: { d.break_group(); size_t p = d.has_sel() && !shift ? d.sel_hi() : d.next_char(d.cur); d.move_to(p, shift, false); break; }
+    case SDLK_UP: d.break_group(); move_line(-1, shift); break;
+    case SDLK_DOWN: d.break_group(); move_line(1, shift); break;
+    case SDLK_PAGEUP:
+        if (ctrl) { do_action(A_PREV_TAB); return; }
+        d.break_group(); move_line(-std::max(1, L.rows - 1), shift); break;
+    case SDLK_PAGEDOWN:
+        if (ctrl) { do_action(A_NEXT_TAB); return; }
+        d.break_group(); move_line(std::max(1, L.rows - 1), shift); break;
+    case SDLK_HOME: { d.break_group(); size_t l = d.buf.line_of(d.cur); d.move_to(ctrl ? 0 : d.buf.line_start(l), shift, false); break; }
+    case SDLK_END: { d.break_group(); size_t l = d.buf.line_of(d.cur); d.move_to(ctrl ? d.buf.size() : d.buf.line_start(l) + d.buf.line_len(l), shift, false); break; }
+    case SDLK_BACKSPACE: d.erase_back(); break;
+    case SDLK_DELETE: d.erase_fwd(); break;
+    case SDLK_RETURN: case SDLK_KP_ENTER: d.insert_text("\n", 1); break;
+    case SDLK_TAB:
+        if (ctrl) { mru_cycle(shift ? -1 : 1); touch(); return; }
+        d.insert_text("\t", 1); break;
+    case SDLK_a: if (ctrl) do_action(A_SELALL); else return; return;
+    case SDLK_c: if (ctrl) do_action(A_COPY); else return; return;
+    case SDLK_x: if (ctrl) do_action(A_CUT); else return; return;
+    case SDLK_v: if (ctrl) do_action(A_PASTE); else return; return;
+    case SDLK_z: if (ctrl) do_action(shift ? A_REDO : A_UNDO); else return; return;
+    case SDLK_y: if (ctrl) do_action(A_REDO); else return; return;
+    case SDLK_s: if (ctrl) do_action(shift ? A_SAVEAS : A_SAVE); else return; return;
+    case SDLK_n: if (ctrl) do_action(A_NEW); else return; return;
+    case SDLK_o: if (ctrl) do_action(A_OPEN_FILE); else return; return;
+    case SDLK_w: if (ctrl) do_action(A_CLOSE); else return; return;
+    case SDLK_q: if (ctrl) do_action(A_QUIT); else return; return;
+    case SDLK_f: if (ctrl) do_action(shift ? A_SEARCH : A_FIND); else return; return;
+    case SDLK_h: if (ctrl && !shift) { do_action(A_REPLACE); touch(); } else return; return;
+    case SDLK_p: if (ctrl && shift) do_action(A_PALETTE); else if (ctrl) do_action(A_QUICK); else return; return;
+    case SDLK_F1: do_action(A_PALETTE); return;
+    case SDLK_b: if (ctrl) do_action(A_TOGGLE_SIDEBAR); else return; return;
+    case SDLK_e: if (ctrl && shift) do_action(A_VIEW_EXPLORER); else return; return;
+    case SDLK_g: if (ctrl && shift) do_action(A_VIEW_GIT); else return; return;
+    case SDLK_BACKQUOTE: if (ctrl) do_action(shift ? A_TERM_NEW : A_TERM_TOGGLE); else return; return;
+    case SDLK_i: if (ctrl && shift) do_action(A_STATS); else return; return;
+    default: return;
+    }
+    E.follow = true;
+    touch();
+}
+
+void copy_text(const std::string &t) { SDL_SetClipboardText(t.c_str()); E.status_msg = "copied"; }
+
+void context_menu_at(const Hit &h, float mx, float my) {
+    if (h.kind == H_GITROW || h.kind == H_GITOPEN || h.kind == H_GITSTG || h.kind == H_GITDISC) {
+        size_t idx = (size_t)(h.id / 2);
+        bool staged = (h.id & 1) != 0;
+        if (h.id < 0 || idx >= E.git.changes.size()) return;
+        GitChange c = E.git.changes[idx];
+        bool unt = c.x == '?' && c.y == '?';
+        std::vector<CtxItem> v = {ci("Open Changes", [c, staged] { if (!E.pinned) open_side(false); open_change_diff(c, staged); }),
+                                  ci("Open File", [c] { if (!E.pinned) open_side(false); open_path(E.git.root + "/" + c.path); }, "", c.y != 'D' || unt), ci_sep()};
+        if (!staged) v.push_back(ci("Discard Changes", [idx] { discard_files({(int)idx * 1}); }));
+        v.push_back(ci(staged ? "Unstage Changes" : "Stage Changes", [c, staged] { begin_op(staged ? "git unstage" : "git stage"); git_do(staged ? git_unstage(E.git.root, c.path) : git_stage(E.git.root, c.path), staged ? "unstage" : "stage"); }));
+        if (unt) { v.push_back(ci_sep()); v.push_back(ci("Add to .gitignore", [c] { git_add_ignore(c.path); })); }
+        v.push_back(ci_sep());
+        v.push_back(ci("Copy Path", [c] { copy_text(E.git.root + "/" + c.path); }));
+        v.push_back(ci("Copy Relative Path", [c] { copy_text(c.path); }));
+        ctx_show(mx, my, std::move(v));
+    } else if (h.kind == H_GITSEC && h.id < 2) {
+        if (h.id == 0) ctx_show(mx, my, {ci("Unstage All Changes", [] { git_unstage(E.git.root, "."); git_refresh(); }), ci_sep(), ci(E.g.tree_view ? "View as List" : "View as Tree", [] { E.g.tree_view = !E.g.tree_view; settings_save(); })});
+        else ctx_show(mx, my, {ci("Stage All Changes", [] { git_stage_all(E.git.root); git_refresh(); }), ci("Discard All Changes", [] { discard_all_changes(); }), ci_sep(), ci(E.g.tree_view ? "View as List" : "View as Tree", [] { E.g.tree_view = !E.g.tree_view; settings_save(); })});
+    } else if ((h.kind == H_GITLOG || h.kind == H_GITTL) && h.id >= 0) {
+        const std::vector<GitCommit> &src = h.kind == H_GITLOG ? E.g.log : E.g.tl;
+        if ((size_t)h.id >= src.size()) return;
+        GitCommit c = src[(size_t)h.id];
+        ctx_show(mx, my, {ci("Copy Commit Hash", [c] { copy_text(c.hash); }), ci("Copy Commit Message", [c] { copy_text(c.subject); }), ci_sep(),
+                          ci("Select for Compare", [c] { E.g.mark_hash = c.hash; E.g.mark_label = c.hash.substr(0, 7); }),
+                          ci_sep(), ci("Checkout (Detached)", [c] { git_checkout(c.hash, false); }), ci("Create Branch...", [c] { git_create_branch(c.hash); }), ci("Create Tag...", [c] { git_tag_create(c.hash); }),
+                          ci("Cherry Pick", [c] { std::string o; if (git_sync_run("cherry-pick", "cherry-pick " + git_quote(c.hash), &o, false)) { git_refresh(); reload_open_docs(); } else { git_error("cherry-pick", o); git_refresh(); } })});
+    } else if (h.kind == H_RROW && h.id >= 0 && (size_t)h.id < g_rrows.size()) {
+        RRow r = g_rrows[(size_t)h.id];
+        remote_menu(r.prof, r.path, r.kind, mx, my);
+    } else if (h.kind == H_TAB && h.id >= 0 && (size_t)h.id < E.docs.size()) {
+        int i = h.id;
+        bool has_path = !E.docs[(size_t)i]->path.empty();
+        auto close_range = [](int from, int to, int keep) {   /* closes the clean tabs in [from, to), the dirty ones stay */
+            for (int k = to - 1; k >= from; k--) if (k != keep && k < (int)E.docs.size() && !E.docs[(size_t)k]->modified()) { E.confirm_idx = k; remove_doc(k); }
+        };
+        ctx_show(mx, my, {ci("Close", [i] { close_tab(i); }, "Ctrl+W"), ci("Close Others", [i, close_range] { close_range(0, (int)E.docs.size(), i); }), ci("Close to the Right", [i, close_range] { close_range(i + 1, (int)E.docs.size(), -1); }),
+                          ci("Close All", [] { close_all_tabs(); }, "Ctrl+K W"), ci_sep(), ci("Copy Path", [i] { copy_text(E.docs[(size_t)i]->path); }, "", has_path),
+                          ci("Copy Relative Path", [i] { copy_text(rel_to_root(E.docs[(size_t)i]->path)); }, "", has_path)});
+    }
+}
+
+/* Stage, unstage or revert the current change of a diff tab by rebuilding the file from the two sides: the lines outside the change are kept. */
+std::vector<std::string> split_keep(const std::string &t) {
+    std::vector<std::string> v;
+    size_t p0 = 0;
+    while (p0 < t.size()) { size_t e = t.find('\n', p0); if (e == std::string::npos) e = t.size() - 1; v.push_back(t.substr(p0, e - p0 + 1)); p0 = e + 1; }
+    return v;
+}
+
+void diff_hunk_apply(DiffView &v, int op) {   /* 4 stage, 5 revert, 6 unstage */
+    if (v.cur_change < 0 || (size_t)v.cur_change >= v.m.hunks.size()) { E.status_msg = "Select a change first (F7)"; return; }
+    DiffHunk h = v.m.hunks[(size_t)v.cur_change];
+    std::string root = v.root, path = v.path;
+    if (op == 4 && v.left_rev.empty()) { git_do(git_stage(root, path), "stage"); return; }
+    if (op == 4 && v.right_rev == "WORK") { struct stat st0; if (stat((root + "/" + path).c_str(), &st0) != 0) { git_do(git_stage(root, path), "stage"); return; } }   /* the file is gone: staging the change stages the deletion */
+    std::string lt = v.left_rev.empty() ? std::string() : git_show(root, v.left_rev, path);
+    std::string rt;
+    if (v.right_rev == "WORK") { FILE *f = fopen((root + "/" + path).c_str(), "rb"); if (f) { char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) rt.append(buf, n); fclose(f); } }
+    else rt = git_show(root, v.right_rev, path);
+    std::vector<std::string> L = split_keep(lt), R = split_keep(rt);
+    if (L.size() != v.m.a.size() || R.size() != v.m.b.size()) { E.status_msg = "the file changed since the diff was made; refresh and try again"; git_refresh(); return; }
+    auto splice = [&](const std::vector<std::string> &base, int b0, int bn, const std::vector<std::string> &with, int w0, int wn) {
+        std::string o;
+        for (int i = 0; i < b0; i++) o += base[(size_t)i];
+        for (int i = 0; i < wn; i++) o += with[(size_t)(w0 + i)];
+        for (size_t i = (size_t)(b0 + bn); i < base.size(); i++) o += base[i];
+        return o;
+    };
+    std::string out;
+    if (op == 4) out = splice(L, h.a0, h.an, R, h.b0, h.bn);          /* new index: the index with this change taken from the file */
+    else if (op == 6) out = splice(R, h.b0, h.bn, L, h.a0, h.an);     /* new index: the index with this change put back to HEAD */
+    else out = splice(R, h.b0, h.bn, L, h.a0, h.an);                  /* new file: the file with this change put back to the index */
+    if (op == 5) {
+        FILE *f = fopen((root + "/" + path).c_str(), "wb");
+        if (!f) { E.status_msg = "cannot write " + path; return; }
+        fwrite(out.data(), 1, out.size(), f);
+        fclose(f);
+        git_refresh(); reload_open_docs();
+        E.status_msg = "change reverted";
+        return;
+    }
+    char tmpl[] = "/tmp/hootedit-hunk-XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return;
+    if (write(fd, out.data(), out.size()) != (ssize_t)out.size()) { close(fd); unlink(tmpl); return; }
+    close(fd);
+    std::string sha, ls;
+    git_exec(root, "hash-object -w " + git_quote(tmpl), &sha);
+    unlink(tmpl);
+    sha = trim_nl(sha);
+    git_exec(root, "ls-files -s -- " + git_quote(path), &ls);
+    std::string mode = ls.size() > 6 ? ls.substr(0, 6) : "100644";
+    std::string o;
+    if (sha.size() >= 40 && git_exec(root, "update-index --add --cacheinfo " + mode + "," + sha.substr(0, 40) + "," + git_quote(path), &o) == 0) { git_refresh(); E.status_msg = op == 4 ? "change staged" : "change unstaged"; }
+    else git_error(op == 4 ? "stage change" : "unstage change", o);
+}
+
+void diff_change_op(const std::shared_ptr<DiffView> &dv, int op) {   /* 4 stage, 5 revert (asks first), 6 unstage: the current change */
+    DiffView &v = *dv;
+    if (op != 5) { diff_hunk_apply(v, op); return; }
+    if (v.cur_change < 0) { E.status_msg = "Select a change first (F7)"; return; }
+    std::shared_ptr<DiffView> keep = dv;
+    dlg_show("Are you sure you want to revert this change in '" + base_name(v.path) + "'?", "The change is removed from the file on disk. This action is irreversible!", {"Revert Change", "Cancel"}, [keep](int i, const std::string &) { if (i == 0) diff_hunk_apply(*keep, 5); });
+}
+
+void click_hit(const Hit &h) {
+    bool term_hit = h.kind == H_TERMTAB || h.kind == H_SPLIT || (h.kind == H_ACT && (h.id == A_TERM_NEW || h.id == A_TERM_KILL || h.id == A_TERM_TOGGLE));
+    E.term_focus = term_hit && E.term_open;
+    if (term_hit && h.kind == H_ACT) E.term_focus = true;
+    switch (h.kind) {
+    case H_TAB: if (g_clicks >= 2 && h.id < (int)E.docs.size()) E.docs[(size_t)h.id]->preview = false; set_active(h.id); E.mode = M_EDIT; E.tab_press = h.id; E.tab_press_x = E.mx; E.tab_dragging = false; break;
+    case H_TABCLOSE: E.mode = M_EDIT; close_tab(h.id >= 1000 ? h.id - 1000 : h.id); break;
+    case H_BOX: do_action(E.mode == M_FIND ? A_NONE : A_FIND); break;
+    case H_ACT: if (h.id != A_TOG_CASE && h.id != A_TOG_REGEX && h.id != A_TOG_WORD) E.mode = M_EDIT; do_action(h.id); break;
+    case H_MENU: if (E.mode == M_MENU && E.menu_open == h.id) { E.mode = M_EDIT; E.menu_open = -1; } else open_menu(h.id); break;
+    case H_MENUITEM: { int act = MENUS[(size_t)E.menu_open].items[(size_t)h.id].act; E.mode = M_EDIT; E.menu_open = -1; do_action(act); break; }
+    case H_PICKITEM: pick_choose(h.id); break;
+    case H_SETCAT: g_set.q.clear(); g_set.cat = h.id; g_set.sel = 0; g_set.scroll = 0; E.mode = M_SETTINGS; set_rebuild(); break;
+    case H_SETROW: for (size_t i = 0; i < g_set.rows.size(); i++) if (g_set.rows[i].item == h.id) g_set.sel = (int)i; E.mode = M_SETTINGS; break;
+    case H_SETCTL: for (size_t i = 0; i < g_set.rows.size(); i++) if (g_set.rows[i].item == h.id) g_set.sel = (int)i; E.mode = M_SETTINGS; set_activate(h.id); break;
+    case H_QUICKITEM: E.mode = M_EDIT; quick_end(true); if (h.id < (int)E.quick_hits.size()) open_path(E.quick_hits[(size_t)h.id]); break;
+    case H_BTN_SAVE: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_s; key_down(k); break; }
+    case H_BTN_DISCARD: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_d; key_down(k); break; }
+    case H_BTN_CANCEL: { SDL_KeyboardEvent k = {}; k.keysym.sym = SDLK_ESCAPE; key_down(k); break; }
+    case H_ROOT: E.root_open = !E.root_open; break;
+    case H_SECT: if (h.id == 0) E.opened_open = !E.opened_open; else E.outline_open = !E.outline_open; break;
+    case H_OPENED: if (h.id < (int)E.docs.size()) { if (g_clicks >= 2) E.docs[(size_t)h.id]->preview = false; set_active(h.id); E.mode = M_EDIT; } break;
+    case H_OUTLINE: { const std::vector<OItem> &oi = outline_for(D()); if ((size_t)h.id < oi.size()) { E.mode = M_EDIT; goto_line(std::to_string(oi[(size_t)h.id].line + 1)); } break; }
+    case H_TREE: {
+        const std::vector<Tree::Row> &rows = E.tree.rows();
+        if ((size_t)h.id >= rows.size()) break;
+        if (rows[(size_t)h.id].dir) E.tree.toggle((size_t)h.id);
+        else if (rows[(size_t)h.id].ghost) {   /* a deleted file: show what was removed */
+            std::string p = rows[(size_t)h.id].path;
+            for (const GitChange &c : E.git.changes) if (E.git.root + "/" + c.path == p) { if (!E.pinned) open_side(false); open_change_diff(c, c.y == ' '); break; }
+        }
+        else { std::string p = rows[(size_t)h.id].path; if (!E.pinned) open_side(false); open_path(p, g_clicks < 2 && E.preview_tabs); }
+        break;
+    }
+    case H_SIDETOG: do_action(A_TOGGLE_SIDEBAR); break;
+    case H_PREVIEW:
+        if (h.id == 0) do_action(A_PREVIEW);
+        else if (h.id == 1) do_action(A_PREVIEW_SPLIT);
+        else if (h.id == 2) { E.preview_target = 1 - E.preview_target; }
+        else if (h.id == 3) { preview_mode_init(); E.preview_light = !E.preview_light; }
+        break;
+    case H_SETCOG: if (E.mode == M_SETTINGS) set_close(); else set_open(); break;
+    case H_ACTIVITY: set_close(); show_view((View)h.id); break;
+    case H_PIN: do_action(A_PIN); break;
+    case H_GITROW: case H_GITOPEN: case H_GITSTG: {
+        size_t idx = (size_t)(h.id / 2);
+        bool staged = (h.id & 1) != 0;
+        if (idx >= E.git.changes.size()) break;
+        GitChange c = E.git.changes[idx];
+        E.mode = M_EDIT;
+        if (h.kind == H_GITSTG) { begin_op(staged ? "git unstage" : "git stage"); git_do(staged ? git_unstage(E.git.root, c.path) : git_stage(E.git.root, c.path), staged ? "unstage" : "stage"); break; }
+        if (!E.pinned) open_side(false);
+        bool conflict = c.x == 'U' || c.y == 'U' || (c.x == 'A' && c.y == 'A') || (c.x == 'D' && c.y == 'D');
+        if (conflict && h.kind != H_GITOPEN && !(SDL_GetModState() & KMOD_CTRL)) merge_open(c.path);
+        else if (h.kind == H_GITOPEN || conflict || (SDL_GetModState() & KMOD_CTRL)) open_path(E.git.root + "/" + c.path); else open_change_diff(c, staged);
+        break;
+    }
+    case H_GITSEC: {
+        bool *f[5] = {&E.g.open_staged, &E.g.open_changes, &E.g.open_graph, &E.g.open_tl, &E.g.open_merge};
+        if (h.id >= 0 && h.id < 5) *f[h.id] = !*f[h.id];
+        break;
+    }
+    case H_BLAME: {
+        Doc &d = D();
+        const GitBlame *bl = blame_for(d, d.buf.line_of(d.cur));
+        if (bl) { GitBlame b = *bl; open_blame_commit(b, rel_to_root(d.path)); }
+        break;
+    }
+    case H_GUTTER: {   /* a click on a change bar opens or closes the inline peek of that change */
+        Doc &d = D();
+        if (g_peek.doc == &d && g_peek.b0 == h.id) g_peek.doc = nullptr; else { g_peek.doc = &d; g_peek.b0 = h.id; }
+        break;
+    }
+    case H_PEEK: {
+        Doc &d = D();
+        if (g_peek.doc != &d || h.id == 0) break;
+        GutterCache *gc = gutter_for(d);
+        if (h.id == 3) g_peek.doc = nullptr;
+        else if (h.id == 1) peek_revert(d);
+        else if (h.id == 2) { int b0 = g_peek.b0; g_peek.doc = nullptr; peek_open_diff(d, b0); }
+        else if ((h.id == 4 || h.id == 5) && gc) {
+            for (size_t k = 0; k < gc->hunks.size(); k++) if (gc->hunks[k].b0 == g_peek.b0) {
+                size_t to = h.id == 5 ? k + 1 : k;
+                if (h.id == 4) { if (k == 0) break; to = k - 1; }
+                if (to >= gc->hunks.size()) break;
+                g_peek.b0 = gc->hunks[to].b0;
+                size_t ln = std::min((size_t)gc->hunks[to].b0, d.buf.lines() - 1);
+                d.break_group(); d.move_to(d.buf.line_start(ln), false, false);
+                E.follow = true;
+                break;
+            }
+        }
+        break;
+    }
+    case H_DIFFFOLD: {
+        Doc &d = D();
+        if (!d.dv || (size_t)h.id >= d.dv->vrows.size()) break;
+        d.dv->open_folds.push_back(d.dv->vrows[(size_t)h.id].row);
+        d.dv->vdirty = true;
+        break;
+    }
+    case H_DIFFHUNK: {   /* the buttons that appear on the change under the mouse: id = change * 8 + operation */
+        Doc &d = D();
+        if (!d.dv || (size_t)(h.id / 8) >= d.dv->m.hunks.size()) break;
+        d.dv->cur_change = h.id / 8;
+        diff_change_op(d.dv, h.id % 8);
+        break;
+    }
+    case H_DIFFBTN: {
+        Doc &d = D();
+        if (!d.dv) break;
+        DiffView &v = *d.dv;
+        Layout L = layout();
+        if (h.id == 0) diff_step(v, -1, L);
+        else if (h.id == 1) diff_step(v, 1, L);
+        else if (h.id == 2) { v.mode = v.vinline ? 1 : 2; v.vdirty = true; }
+        else if (h.id == 4 || h.id == 5 || h.id == 6) diff_change_op(d.dv, h.id);
+        else if (h.id == 3) { std::string p = v.root + "/" + v.path; struct stat st; if (stat(p.c_str(), &st) == 0) open_path(p); else E.status_msg = "the file is not on disk any more"; }
+        break;
+    }
+    case H_GITOP: git_op_do(h.id); break;
+    case H_CONFLICT: if (h.id % 4 == 3) { merge_open(rel_to_root(D().path)); break; } conflict_accept(D(), (size_t)(h.id / 4), h.id % 4); break;
+    case H_MERGE: merge_op(h.id); break;
+    case H_REPL: if (h.id == 0) replace_one(); else if (h.id == 1) replace_all(); else if (h.id == 2) E.repl_focus = true; else if (h.id == 3) E.repl_focus = false; break;
+    case H_GITREFRESH: begin_op("git refresh"); git_refresh(); break;
+    case H_GITALL: {
+        begin_op(h.id == 0 ? "git stage all" : "git unstage all");
+        git_do(h.id == 0 ? git_stage_all(E.git.root) : git_unstage(E.git.root, "."), h.id == 0 ? "stage all" : "unstage all");
+        break;
+    }
+    case H_GITMSG: E.mode = M_GITMSG; break;
+    case H_GITCOMMIT: E.mode = M_EDIT; if (h.id == 1) git_sync_flow(); else if (h.id == 2) git_push_flow(); else git_commit_now(); break;
+    case H_GITDD: git_commit_menu(E.mx - (float)S(150), E.my + (float)S(14)); break;
+    case H_GITMORE: git_more_menu(E.mx - (float)S(8), E.my + (float)S(14)); break;
+    case H_GITBRANCH: git_branch_picker(); break;
+    case H_GITDISC: if (h.id < 0) discard_all_changes(); else discard_files({h.id / 2}); break;
+    case H_GITDIR: if ((size_t)h.id < g_gitdirs.size()) { const std::string k = g_gitdirs[(size_t)h.id]; if (!E.g.collapsed.erase(k)) E.g.collapsed.insert(k); } break;
+    case H_GITLOG: {
+        GitUi &g = E.g;
+        if ((size_t)h.id >= g.log.size()) break;
+        const GitCommit &c = g.log[(size_t)h.id];
+        Uint16 mod = SDL_GetModState();
+        E.mode = M_EDIT;
+        if (mod & KMOD_CTRL) { g.mark_hash = c.hash; g.mark_label = c.hash.substr(0, 7); break; }
+        if ((mod & KMOD_SHIFT) && !g.mark_hash.empty() && g.mark_hash != c.hash) {   /* the marked commit is the left side, this one the right */
+            g.log_sel = h.id; g.cmp_a = g.mark_hash; g.cmp_b = c.hash;
+            g.sel_files = git_compare_files(E.git.root, g.cmp_a, g.cmp_b);
+            break;
+        }
+        if (g.log_sel == h.id) { g.log_sel = -1; g.sel_files.clear(); g.cmp_a.clear(); g.cmp_b.clear(); break; }
+        g.log_sel = h.id; g.cmp_a.clear(); g.cmp_b.clear();
+        g.sel_files = git_commit_files(E.git.root, c.hash);
+        break;
+    }
+    case H_GITCFILE: {
+        GitUi &g = E.g;
+        if (g.log_sel < 0 || (size_t)g.log_sel >= g.log.size() || (size_t)h.id >= g.sel_files.size()) break;
+        E.mode = M_EDIT;
+        if (!E.pinned) open_side(false);
+        const GitFile &f = g.sel_files[(size_t)h.id];
+        if (!g.cmp_a.empty()) open_compare_diff(f.path, g.cmp_a, g.cmp_b);
+        else open_commit_diff(g.log[(size_t)g.log_sel], f);
+        break;
+    }
+    case H_GITTL: {
+        GitUi &g = E.g;
+        if ((size_t)h.id >= g.tl.size()) break;
+        const GitCommit &c = g.tl[(size_t)h.id];
+        Uint16 mod = SDL_GetModState();
+        E.mode = M_EDIT;
+        if (mod & KMOD_CTRL) { g.mark_hash = c.hash; g.mark_label = c.hash.substr(0, 7); break; }
+        if (!E.pinned) open_side(false);
+        if ((mod & KMOD_SHIFT) && !g.mark_hash.empty() && g.mark_hash != c.hash) open_compare_diff(g.tl_path, g.mark_hash, c.hash);
+        else open_commit_diff(c, GitFile{'M', g.tl_path});
+        break;
+    }
+    case H_SIDEBOX: E.mode = M_SIDE; if (E.view == V_GIT) E.view = V_EXPLORER; if (E.view == V_EXPLORER && !E.side_q.empty()) side_filter_update(); break;
+    case H_SRES: open_hit(h.id); break;
+    case H_SIDEHIT:
+        if ((size_t)h.id < E.side_hits.size()) { std::string p = E.side_hits[(size_t)h.id]; E.mode = M_EDIT; E.side_q.clear(); if (!E.pinned) open_side(false); open_path(p); }
+        break;
+    case H_TERMTAB: if (h.id >= 0 && h.id < (int)E.terms.size()) { E.term_active = h.id; E.term_focus = true; } break;
+    case H_SPLIT: E.split_drag = true; break;
+    case H_TABSPACE: if (g_clicks >= 2) do_action(A_NEW); break;
+    case H_VSCROLL: E.sb_drag = true; sb_to_pointer(); break;
+    case H_FD_ITEM: {
+        std::vector<int> view = fd_view();
+        E.fd.sel = h.id;
+        E.fd.picked = true;
+        if (E.fd.kind == FD_SAVE && h.id < (int)view.size() && !E.fd.all[(size_t)view[(size_t)h.id]].dir) { E.fd.name = E.fd.all[(size_t)view[(size_t)h.id]].name; E.fd.overwrite_armed = false; }
+        if (g_clicks >= 2) fd_activate(h.id);
+        break;
+    }
+    case H_FD_OK: fd_accept(); break;
+    case H_FD_CANCEL: fd_cancel(); break;
+    case H_FD_HIDDEN: E.fd.hidden = !E.fd.hidden; fd_load(E.fd.dir); break;
+    case H_FD_PLACE: {
+        const char *home = getenv("HOME");
+        if (h.id == 0) fd_go(home ? home : "/");
+        else if (h.id == 1) fd_go(E.tree.root().empty() ? "/" : E.tree.root());
+        else if (h.id == 2) fd_go("/");
+        else if (h.id == 99) E.fd.name_focus = true;
+        break;
+    }
+    case H_RROW: remote_row_click(h.id); break;
+    case H_RNEW: remote_new_connection(); break;
+    case H_DLGBTN: dlg_finish(h.id); return;
+    case H_DLGBG: break;
+    case H_CTXITEM: ctx_click(h.id); break;
+    case H_CTXBG: E.mode = M_EDIT; E.ctx.items.clear(); E.ctx.open.clear(); break;
+    case H_SIDEBAR: break;
+    default: break;
+    }
+    touch();
+}
+
+void text_input(const char *s) {
+    if (E.mode == M_EDIT && E.term_open && E.term_focus && cur_term() && cur_term()->core) {
+        if (!(SDL_GetModState() & (KMOD_CTRL | KMOD_ALT))) { begin_op("terminal key"); tcore_text(cur_term()->core, s); touch(); }
+        return;
+    }
+    if (E.mode == M_DIALOG) { if (E.dlg.input) { if (E.dlg.fresh) { E.dlg.text.clear(); E.dlg.fresh = false; } E.dlg.text += s; touch(); } return; }
+    if (E.mode == M_CTX) return;
+    if (E.mode == M_EDIT && (D().dv || D().mv)) return;   /* diff and merge tabs are read only */
+    if (E.mode == M_EDIT) begin_op("keystroke");
+    else if (E.mode == M_QUICK) begin_op("quick-open filter", std::to_string(E.quick_files.size()) + " files");
+    else if (E.mode == M_SIDE && E.view == V_EXPLORER) begin_op("file filter", std::to_string(E.quick_files.size()) + " files");
+    if (E.mode == M_FIND) { if (E.repl_focus) { E.repl_q += s; touch(); return; } E.find_q += s; find_from(D().sel_lo()); touch(); return; }
+    if (E.mode == M_FILEDLG) {
+        if (E.fd.kind == FD_SAVE && E.fd.name_focus) { E.fd.name += s; E.fd.overwrite_armed = false; }
+        else {
+            E.fd.filter += s;
+            E.fd.sel = 0;
+            E.fd.picked = false;
+            if ((E.fd.filter[0] == '/' || E.fd.filter[0] == '~') && E.fd.filter.back() == '/') {   /* a typed path ending in "/" opens that folder */
+                std::string p = expand_path(E.fd.filter);
+                struct stat st;
+                if (stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) fd_go(p);
+            }
+        }
+        E.fd.msg.clear();
+        touch();
+        return;
+    }
+    if (E.mode == M_GITMSG) { E.g.msg += s; E.g.err.clear(); touch(); return; }
+    if (E.mode == M_PROMPT) { E.prompt_q += s; touch(); return; }
+    if (E.mode == M_PICK) { E.pick_filter += s; E.pick_sel = 0; touch(); return; }
+    if (E.mode == M_SETTINGS) { g_set.q += s; g_set.sel = 0; g_set.scroll = 0; set_rebuild(); touch(); return; }
+    if (E.mode == M_QUICK) { E.quick_q += s; E.quick_sel = 0; quick_update(); touch(); return; }
+    if (E.mode == M_SIDE) {
+        if (E.view == V_SEARCH) { E.sq += s; start_search(); }
+        else { E.side_q += s; E.side_scroll = 0; side_filter_update(); }
+        touch();
+        return;
+    }
+    if (E.mode == M_CONFIRM || E.mode == M_MENU) return;
+    if (SDL_GetModState() & KMOD_CTRL) return;
+    if (E.mode == M_EDIT && vim_active()) {
+        if (g_vim.cmd_kind) { g_vim.cmd_text(s); touch(); return; }
+        if (!(D().dv || D().mv)) {   /* one event can carry several characters (a paste, an input method): each goes to vim or into the text, in order */
+            std::string all = s;
+            for (size_t i = 0; i < all.size();) {
+                size_t n = 1;
+                while (i + n < all.size() && ((unsigned char)all[i + n] & 0xC0) == 0x80) n++;
+                std::string ch = all.substr(i, n);
+                if (g_vim.cmd_kind) g_vim.cmd_text(ch);
+                else if (!g_vim.typing()) g_vim.text(D(), ch);
+                else g_vim.type_char(D(), ch);
+                i += n;
+            }
+            E.status_msg.clear();
+            E.follow = true;
+            touch();
+            return;
+        }
+    }
+    D().insert_text(s, strlen(s));
+    E.status_msg.clear();
+    E.follow = true;
+    touch();
+}
+
+bool in_term(float x, float y) {
+    return E.term_open && cur_term() && cur_term()->core && x >= E.term_rx && x < E.term_rx + E.term_rw && y >= E.term_ry && y < E.term_ry + E.term_rh;
+}
+void term_cell(float x, float y, int *col, int *row) {
+    *col = (int)((x - E.term_rx - (float)TV_PAD) / (float)font_cell_w(E.font));
+    *row = (int)((y - E.term_ry - (float)TV_PAD) / (float)font_cell_h(E.font));
+}
+int term_mods() {
+    Uint16 m = (Uint16)SDL_GetModState();
+    return ((m & KMOD_SHIFT) ? TM_SHIFT : 0) | ((m & KMOD_ALT) ? TM_ALT : 0) | ((m & KMOD_CTRL) ? TM_CTRL : 0) | ((m & KMOD_GUI) ? TM_META : 0);
+}
+
+void update_hover() {
+    int kind = 0, id = -1;
+    for (size_t i = E.hits.size(); i-- > 0;) {
+        const Hit &h = E.hits[i];
+        if (E.mx >= h.x && E.mx < h.x + h.w && E.my >= h.y && E.my < h.y + h.h) { if (h.kind == H_SIDEBAR) break; kind = h.kind; id = h.id; break; }
+    }
+    if (kind != E.hover_kind || id != E.hover_id) { E.hover_kind = kind; E.hover_id = id; redraw(); }
+}
+
+void handle_motion() {
+    Layout L = layout();
+    if (!E.pinned) {
+        bool in_side = E.side_open && E.mx < (float)L.side_x1 && E.my >= (float)L.menu_h;
+        if (!E.side_open && E.mx >= 0 && E.mx <= (float)S(10) && E.my >= (float)L.menu_h && E.my < (float)L.bar_y) open_side(true);
+        else if (E.side_open) E.side_close_at = in_side ? 0 : (E.side_close_at ? E.side_close_at : E.now + 0.35);
+    }
+    update_hover();
+    ctx_hover();
+}
+
+void handle_event(const SDL_Event &e) {
+    if (e.type == SDL_KEYDOWN || e.type == SDL_TEXTINPUT || e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEWHEEL) E.ev_t0 = now_s();
+    switch (e.type) {
+    case SDL_QUIT: request_quit(); redraw(); break;
+    case SDL_KEYDOWN: key_down(e.key); break;
+    case SDL_TEXTINPUT: text_input(e.text.text); break;
+    case SDL_MOUSEWHEEL: {
+        Layout L = layout();
+        if (E.mode == M_EDIT && in_term(E.mx, E.my)) {
+            int col, row;
+            term_cell(E.mx, E.my, &col, &row);
+            tcore_wheel(cur_term()->core, e.wheel.preciseY, col, row, term_mods());
+            redraw();
+            break;
+        }
+        if (E.mode == M_FILEDLG) { E.fd.scroll = std::max(0, E.fd.scroll - e.wheel.y * 3); redraw(); break; }
+        if (E.mode == M_PICK) { E.pick_scroll = std::max(0, E.pick_scroll - e.wheel.y * 3); redraw(); break; }
+        if (E.mode == M_SETTINGS) { g_set.scroll -= (float)e.wheel.y * (float)S(48); redraw(); break; }
+        Doc &d = D();
+        bool split_preview = E.preview_open && E.preview_split && preview_format(d.path) != PreviewFormat::None && !d.dv && !d.mv;
+        if (E.mode == M_EDIT && E.preview_open && preview_format(d.path) != PreviewFormat::None && E.my >= (float)L.text_y && E.my < (float)L.ed_bottom &&
+            (E.mx >= (float)L.ed_x + (split_preview ? (float)(E.W - L.ed_x) / 2.f : 0.f))) {
+            preview_refresh(d);
+            float pane_w = split_preview ? (float)(E.W - L.split_x) : (float)(E.W - L.ed_x);
+            E.preview_scroll = std::max(0.f, std::min(preview_max_scroll(L, pane_w), E.preview_scroll - (float)e.wheel.y * (float)S(60)));
+            if (split_preview) d.top = std::min((size_t)(E.preview_scroll / (float)std::max(1, E.rowh)), d.buf.lines() - 1);
+            redraw();
+            break;
+        }
+        float tab_area = (float)(E.W - L.ed_x) - (preview_format(d.path) != PreviewFormat::None && !d.dv && !d.mv ? (float)S(260) : 0.f);
+        if (E.mx >= (float)L.ed_x && E.mx < (float)L.ed_x + tab_area && E.my >= (float)L.tab_y && E.my < (float)L.text_y && !splash()) {   /* over the tab strip: slide the tabs, keep the active one */
+            E.tab_scroll += (float)(e.wheel.x - e.wheel.y) * (float)S(70);
+            redraw();
+            break;
+        }
+        if (E.side_open && E.mx < (float)L.side_x1 && E.my >= (float)L.menu_h && E.my < (float)L.bar_y) {
+            E.side_scroll = std::max(0.f, E.side_scroll - (float)e.wheel.y * (float)S(66));
+            redraw();
+            break;
+        }
+        if (d.dv) {
+            d.dv->top -= (long)e.wheel.y * 3;
+            if (e.wheel.x) d.dv->left = std::max(0, d.dv->left + e.wheel.x * 4);
+            diff_clamp(*d.dv, L);
+            redraw();
+            break;
+        }
+        if (d.mv) {
+            Layout L2 = layout();
+            MergeGeom g2 = merge_geom(L2);
+            if (E.my >= g2.body_y + (float)g2.top_rows * (float)E.rowh) d.mv->rtop -= (long)e.wheel.y * 3; else d.mv->top -= (long)e.wheel.y * 3;
+            merge_clamp(*d.mv, g2);
+            redraw();
+            break;
+        }
+        long nt = (long)d.top - (long)e.wheel.y * 3;
+        d.top = nt < 0 ? 0 : std::min((size_t)nt, d.buf.lines() - 1);
+        if (split_preview) E.preview_scroll = std::min(preview_max_scroll(L, (float)(E.W - L.split_x)), (float)d.top * (float)E.rowh);
+        if (e.wheel.x) d.left = std::max(0, d.left + e.wheel.x * 4);
+        redraw();
+        break;
+    }
+    case SDL_MOUSEBUTTONDOWN:
+        g_clicks = e.button.clicks;
+        if (E.mode == M_EDIT && in_term((float)e.button.x * E.scale, (float)e.button.y * E.scale)) {
+            float mx = (float)e.button.x * E.scale, my = (float)e.button.y * E.scale;
+            E.mx = mx; E.my = my;
+            int col, row;
+            term_cell(mx, my, &col, &row);
+            int b = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_MIDDLE ? 2 : 3;
+            E.term_focus = true;
+            tcore_mouse_button(cur_term()->core, b, true, col, row, e.button.clicks, term_mods());
+            E.term_drag = true;
+            touch();
+            break;
+        }
+        if (e.button.button == SDL_BUTTON_RIGHT && (E.mode == M_EDIT || E.mode == M_CTX)) {
+            float mx = (float)e.button.x * E.scale, my = (float)e.button.y * E.scale;
+            E.mx = mx; E.my = my;
+            if (E.mode == M_CTX) { E.mode = M_EDIT; E.ctx.items.clear(); E.ctx.open.clear(); redraw(); break; }
+            for (size_t i = E.hits.size(); i-- > 0;) {
+                const Hit &h = E.hits[i];
+                if (mx >= h.x && mx < h.x + h.w && my >= h.y && my < h.y + h.h) { Hit c = h; context_menu_at(c, mx, my); break; }
+            }
+            touch();
+            break;
+        }
+        if (e.button.button == SDL_BUTTON_LEFT) {
+            float mx = (float)e.button.x * E.scale, my = (float)e.button.y * E.scale;
+            E.mx = mx; E.my = my;
+            for (size_t i = E.hits.size(); i-- > 0;) {
+                const Hit &h = E.hits[i];
+                if (mx >= h.x && mx < h.x + h.w && my >= h.y && my < h.y + h.h) {
+                    if (h.kind == H_SIDEBAR) return;   /* empty sidebar area: swallow the click */
+                    Hit c = h; click_hit(c); return;
+                }
+            }
+            bool was_overlay = E.mode == M_PICK || E.mode == M_FIND || E.mode == M_MENU || E.mode == M_QUICK || E.mode == M_SIDE || E.mode == M_GITMSG;
+            if (was_overlay) { E.mode = M_EDIT; E.menu_open = -1; }
+            if (E.mode != M_EDIT) return;
+            if (E.side_open && !E.pinned) open_side(false);
+            E.term_focus = false;
+            Layout L = layout();
+            if (splash() && g_clicks >= 2 && my >= (float)L.tab_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x) { do_action(A_NEW); return; }   /* double click on the start screen */
+            if (my >= (float)L.text_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x && mx < (float)L.split_x) {
+                Doc &d = D();
+                d.break_group();
+                d.move_to(pos_from_xy((int)mx, (int)my), (SDL_GetModState() & KMOD_SHIFT) != 0, false);
+                E.dragging = true;
+                touch();
+            } else redraw();
+        }
+        break;
+    case SDL_KEYUP:
+        if (e.key.keysym.sym == SDLK_LCTRL || e.key.keysym.sym == SDLK_RCTRL) mru_end();
+        break;
+    case SDL_MOUSEMOTION:
+        if (g_scripted && e.motion.which != SCRIPT_MOUSE) break;   /* --script drives the pointer; the real one (xvfb parks it mid-window) is ignored */
+        E.mx = (float)e.motion.x * E.scale; E.my = (float)e.motion.y * E.scale;
+        if (E.tip_on) { E.tip_on = false; redraw(); }
+        E.tip_at = now_s() + 0.5;
+        if (E.tab_press >= 0 && (e.motion.state & SDL_BUTTON_LMASK)) {
+            Layout L = layout();
+            if (!E.tab_dragging && std::fabs(E.mx - E.tab_press_x) > (float)S(6)) E.tab_dragging = true;
+            if (E.tab_dragging) {
+                if (E.mx < (float)L.ed_x + (float)S(30)) E.tab_scroll -= (float)S(16);   /* near an edge the strip follows the pointer */
+                else if (E.mx > (float)E.W - (float)S(30)) E.tab_scroll += (float)S(16);
+                float px = E.mx - (float)L.ed_x + E.tab_scroll;   /* pointer in strip coordinates */
+                int to = E.tab_press;
+                for (size_t i = 0; i < E.tab_x.size(); i++) if (px >= E.tab_x[i] && px < E.tab_x[i] + E.tab_w[i]) to = (int)i;
+                if (px < 0) to = 0;
+                if (!E.tab_x.empty() && px >= E.tab_x.back() + E.tab_w.back()) to = (int)E.tab_x.size() - 1;
+                if (to != E.tab_press && to >= 0 && to < (int)E.docs.size()) {
+                    auto &v = E.docs;
+                    if (to > E.tab_press) std::rotate(v.begin() + E.tab_press, v.begin() + E.tab_press + 1, v.begin() + to + 1);
+                    else std::rotate(v.begin() + to, v.begin() + E.tab_press, v.begin() + E.tab_press + 1);
+                    if (E.active == E.tab_press) E.active = to;
+                    else if (E.tab_press < E.active && to >= E.active) E.active--;
+                    else if (E.tab_press > E.active && to <= E.active) E.active++;
+                    if (E.confirm_idx == E.tab_press) E.confirm_idx = to;
+                    E.tab_press = to;
+                }
+                redraw();
+            }
+        } else if (E.sb_drag) sb_to_pointer();
+        else if (E.split_drag) {
+            Layout L = layout();
+            int maxl = (int)((float)(L.bar_y - L.text_y - S(100)) / E.scale);
+            E.panel_logical = std::max(80, std::min(maxl, (int)((float)L.bar_y - E.my) / (int)std::max(1.f, E.scale)));
+            redraw();
+        } else if (E.term_drag || (E.mode == M_EDIT && in_term(E.mx, E.my))) {
+            int col, row;
+            term_cell(E.mx, E.my, &col, &row);
+            tcore_mouse_move(cur_term()->core, col, row, term_mods());
+            if (E.term_drag) touch();
+        } else if (E.dragging && (e.motion.state & SDL_BUTTON_LMASK)) {
+            D().move_to(pos_from_xy((int)E.mx, (int)E.my), true, false);
+            E.follow = true;
+            touch();
+        } else handle_motion();
+        break;
+    case SDL_MOUSEBUTTONUP:
+        if (E.term_drag && cur_term() && cur_term()->core) {
+            int col, row;
+            term_cell((float)e.button.x * E.scale, (float)e.button.y * E.scale, &col, &row);
+            int b = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_MIDDLE ? 2 : 3;
+            tcore_mouse_button(cur_term()->core, b, false, col, row, 1, term_mods());
+            if (e.button.button == SDL_BUTTON_LEFT) E.term_drag = false;
+            redraw();
+        }
+        if (E.split_drag) { E.split_drag = false; settings_save(); }
+        E.sb_drag = false;
+        E.dragging = false;
+        E.tab_press = -1;
+        if (E.tab_dragging) { E.tab_dragging = false; redraw(); }
+        break;
+    case SDL_WINDOWEVENT:
+        if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESIZED) { SDL_GL_GetDrawableSize(E.win, &E.W, &E.H); redraw(); }
+        else if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+            E.focused = true;
+            static double last_git = 0;
+            if (E.git.repo && now_s() - last_git > 1.5) { last_git = now_s(); git_refresh(); }   /* the files may have changed in another program */
+            touch();
+        }
+        else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) { E.focused = false; E.blink_on = true; redraw(); }
+        else if (e.window.event == SDL_WINDOWEVENT_LEAVE) { E.mx = E.my = -1; if (!E.pinned && E.side_open) E.side_close_at = E.now + 0.35; update_hover(); }
+        else if (e.window.event == SDL_WINDOWEVENT_EXPOSED) redraw();
+        break;
+    default: break;
+    }
+}
+
+/* --script "ctrl+n;text:hello;act:pin;menu:3;mouse:20,300;click:20,300": drives the editor without a keyboard, for screenshots and tests */
+void run_script(const char *script) {
+    std::string s = script;
+    size_t p = 0;
+    while (p <= s.size()) {
+        size_t q = s.find(';', p);
+        if (q == std::string::npos) q = s.size();
+        std::string step = s.substr(p, q - p);
+        p = q + 1;
+        if (step.empty()) continue;
+        auto frame_if_timed = [&]() {
+            if (!g_timed) return;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                uint32_t gen0 = atlas_generation(E.atlas);
+                r_begin(E.r, E.W, E.H, C_EDITOR);
+                double b0 = now_s();
+                build_frame();
+                E.last_build_ms = (now_s() - b0) * 1000.0;
+                r_end(E.r);
+                if (atlas_generation(E.atlas) == gen0) break;
+            }
+            end_op_if_pending();
+            E.frames++;
+        };
+        if (step.compare(0, 4, "wait") == 0) {   /* wait:MS lets background work (a search) finish, then polls and draws */
+            double until = now_s() + atof(step.c_str() + (step[5] == '~' ? 6 : 5)) / 1000.0;
+            while (now_s() < until && (E.s_active && !E.sstat.done)) { search_poll(); SDL_Delay(1); }
+            while (now_s() < until && (g_job.running || g_rjob.running || step.compare(0, 6, "wait:~") == 0)) { E.now = now_s(); git_job_poll(); job_poll(g_rjob); askpass_poll(); tip_poll(); lint_tick(); fswatch_tick(); SDL_Delay(5); }   /* wait:~MS also keeps polling for password prompts */
+            search_poll(); E.now = now_s(); lint_tick(); fswatch_tick(); git_startup_poll(); git_job_poll(); job_poll(g_rjob); askpass_poll(); E.ev_t0 = 0; frame_if_timed();
+            continue;
+        }
+        E.ev_t0 = now_s();
+        if (step == "dump") {   /* prints the editor state, one "key: value" per line, for the UI tests */
+            auto esc = [](const std::string &t) { std::string o; for (char c : t) { if (c == '\n') o += "\\n"; else if (c == '\\') o += "\\\\"; else o += c; } return o; };
+            Doc &dd = D();
+            printf("active: %d\ntabs: %zu\n", E.active, E.docs.size());
+            for (size_t i = 0; i < E.docs.size(); i++) printf("tab %zu: %s preview=%d modified=%d\n", i, E.docs[i]->name().c_str(), E.docs[i]->preview ? 1 : 0, E.docs[i]->modified() ? 1 : 0);
+            std::string all;
+            dd.buf.copy(0, dd.buf.size(), all);
+            size_t cl = dd.buf.line_of(dd.cur);
+            printf("text: %s\ncursor: %zu,%zu\nselection: %zu\nstatus: %s\nvim: %s\nfind: %s\nmode: %d\nsidebar: %d view=%d\n", esc(all).c_str(), cl + 1, dd.cur - dd.buf.line_start(cl) + 1, dd.sel_hi() - dd.sel_lo(),
+                   E.status_msg.c_str(), vim_active() ? g_vim.label().c_str() : "off", E.find_q.c_str(), (int)E.mode, E.side_open ? 1 : 0, (int)E.view);
+            for (const Tree::Row &r : E.tree.rows()) { auto di = E.deco.find(r.path); printf("row: %s depth=%d dir=%d ghost=%d deco=%c\n", r.name.c_str(), r.depth, r.dir ? 1 : 0, r.ghost ? 1 : 0, di == E.deco.end() ? '-' : di->second); }
+            printf("sidebar: %d\n", E.side_open ? 1 : 0);
+            printf("settings: open=%d category=%d query=%s rows=%zu\n", g_set.open ? 1 : 0, g_set.cat, g_set.q.c_str(), g_set.rows.size());
+            if (E.preview_open) preview_refresh(dd);
+            preview_mode_init();
+            printf("preview: open=%d split=%d target=%s mode=%s format=%d blocks=%zu scroll=%.0f\n", E.preview_open ? 1 : 0,
+                   E.preview_split ? 1 : 0, E.preview_target ? "GitLab" : "GitHub", E.preview_light ? "Light" : "Dark",
+                   (int)preview_format(dd.path), E.preview_blocks.size(), E.preview_scroll);
+            printf("frame_ms: %.3f\n", E.last_build_ms);
+            lint_kick(dd, true);
+            if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());
+            if (E.outline_on && !dd.dv && !dd.mv) for (const OItem &o : outline_for(dd)) printf("outline: %s line=%zu depth=%d kind=%c\n", o.name.c_str(), o.line + 1, o.depth, o.kind);
+            fflush(stdout);
+            continue;
+        }
+        if (step.compare(0, 9, "hitcheck:") == 0) {   /* prints what a click at x,y would hit (test hook) */
+            int x = 0, y = 0;
+            sscanf(step.c_str() + 9, "%d,%d", &x, &y);
+            build_frame();
+            const Hit *found = nullptr;
+            for (size_t i = E.hits.size(); i-- > 0;) { const Hit &h = E.hits[i]; if ((float)x >= h.x && (float)x < h.x + h.w && (float)y >= h.y && (float)y < h.y + h.h) { found = &h; break; } }
+            printf("hitcheck %d,%d: %s kind=%d id=%d\n", x, y, found ? "hit" : "none", found ? found->kind : 0, found ? found->id : -1);
+            continue;
+        }
+        if (step == "frame") { begin_op("empty frame (nothing changed, full redraw)"); frame_if_timed(); continue; }
+        if (step.compare(0, 5, "open:") == 0) { open_path(step.substr(5)); frame_if_timed(); continue; }
+        if (step.compare(0, 5, "text:") == 0) { text_input(step.c_str() + 5); frame_if_timed(); continue; }
+        if (step.compare(0, 5, "menu:") == 0) { open_menu(atoi(step.c_str() + 5)); frame_if_timed(); continue; }
+        if (step.compare(0, 4, "mod:") == 0) {   /* mod:ctrl, mod:shift or mod:none holds a modifier for the following clicks (test hook) */
+            SDL_SetModState(step == "mod:ctrl" ? KMOD_LCTRL : step == "mod:shift" ? KMOD_LSHIFT : KMOD_NONE);
+            continue;
+        }
+        if (step.compare(0, 6, "wheel:") == 0) {   /* wheel:x,y,dy over a point (test hook) */
+            int x = 0, y = 0, dy = 0;
+            sscanf(step.c_str() + 6, "%d,%d,%d", &x, &y, &dy);
+            E.mx = (float)x; E.my = (float)y;
+            SDL_Event ev = {};
+            ev.type = SDL_MOUSEWHEEL; ev.wheel.y = dy;
+            handle_event(ev);
+            build_frame();
+            frame_if_timed();
+            continue;
+        }
+        if (step.compare(0, 5, "drag:") == 0) {   /* press at x0,y0, move to x1,y1 in steps with the button held, release */
+            int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+            sscanf(step.c_str() + 5, "%d,%d,%d,%d", &x0, &y0, &x1, &y1);
+            build_frame();   /* the hit boxes must be those of the current state */
+            SDL_Event dn = {};
+            dn.type = SDL_MOUSEBUTTONDOWN; dn.button.button = SDL_BUTTON_LEFT; dn.button.clicks = 1; dn.button.x = (int)((float)x0 / E.scale); dn.button.y = (int)((float)y0 / E.scale);
+            handle_event(dn);
+            build_frame();
+            for (int i = 1; i <= 8; i++) {
+                SDL_Event mv = {};
+                mv.type = SDL_MOUSEMOTION; mv.motion.which = SCRIPT_MOUSE; mv.motion.state = SDL_BUTTON_LMASK;
+                mv.motion.x = (int)((float)(x0 + (x1 - x0) * i / 8) / E.scale); mv.motion.y = (int)((float)(y0 + (y1 - y0) * i / 8) / E.scale);
+                handle_event(mv);
+                build_frame();
+            }
+            SDL_Event up = {};
+            up.type = SDL_MOUSEBUTTONUP;
+            handle_event(up);
+            build_frame();
+            frame_if_timed();
+            continue;
+        }
+        if (step.compare(0, 7, "rclick:") == 0) {
+            int x = 0, y = 0;
+            sscanf(step.c_str() + 7, "%d,%d", &x, &y);
+            SDL_Event ev = {};
+            ev.type = SDL_MOUSEBUTTONDOWN; ev.button.button = SDL_BUTTON_RIGHT; ev.button.clicks = 1; ev.button.x = (int)((float)x / E.scale); ev.button.y = (int)((float)y / E.scale);
+            handle_event(ev);
+            build_frame();
+            frame_if_timed();
+            continue;
+        }
+        if (step.compare(0, 6, "mouse:") == 0 || step.compare(0, 6, "click:") == 0 || step.compare(0, 7, "dclick:") == 0) {
+            int x = 0, y = 0;
+            bool dbl = step[0] == 'd';
+            sscanf(step.c_str() + (dbl ? 7 : 6), "%d,%d", &x, &y);
+            SDL_Event ev = {};
+            if (step[0] == 'm') { ev.type = SDL_MOUSEMOTION; ev.motion.which = SCRIPT_MOUSE; ev.motion.x = (int)((float)x / E.scale); ev.motion.y = (int)((float)y / E.scale); }
+            else { ev.type = SDL_MOUSEBUTTONDOWN; ev.button.button = SDL_BUTTON_LEFT; ev.button.clicks = dbl ? 2 : 1; ev.button.x = (int)((float)x / E.scale); ev.button.y = (int)((float)y / E.scale); }
+            handle_event(ev);
+            if (step[0] != 'm') { SDL_Event up = {}; up.type = SDL_MOUSEBUTTONUP; handle_event(up); }
+            build_frame();   /* refresh the hit boxes the way the real loop would before the next event */
+            frame_if_timed();
+            continue;
+        }
+        if (step.compare(0, 4, "act:") == 0) {
+            bool found = false;
+            for (int i = 1; i < A_COUNT; i++) if (step.compare(4, std::string::npos, ACT_NAMES[i]) == 0) { do_action(i); found = true; }
+            if (!found) fprintf(stderr, "hootedit: unknown action in --script: %s\n", step.c_str() + 4);
+            frame_if_timed();
+            if (!g_timed) build_frame();
+            continue;
+        }
+        SDL_KeyboardEvent k = {};
+        std::string rest = step;
+        for (;;) {
+            size_t plus = rest.find('+');
+            if (plus == std::string::npos || plus + 1 >= rest.size()) break;
+            std::string m = rest.substr(0, plus);
+            if (m == "ctrl") k.keysym.mod |= KMOD_LCTRL; else if (m == "shift") k.keysym.mod |= KMOD_LSHIFT; else if (m == "alt") k.keysym.mod |= KMOD_LALT;
+            rest = rest.substr(plus + 1);
+        }
+        k.keysym.sym = SDL_GetKeyFromName(rest.c_str());
+        if (k.keysym.sym == SDLK_UNKNOWN) { fprintf(stderr, "hootedit: unknown key in --script: %s\n", rest.c_str()); continue; }
+        key_down(k);
+        frame_if_timed();
+    }
+}
+
+}  // namespace
+
+/* vim mode: the engine lives in vim.cpp; this wires it to the clipboard, the find box, tabs and the ":" commands */
+bool vim_find(const std::string &pat, size_t from, bool fwd, size_t *pos) {   /* regex search with wrap-around; case-insensitive unless the pattern has a capital */
+    Doc &d = D();
+    Regex re;
+    bool icase = true;
+    for (unsigned char c : pat) if (c >= 'A' && c <= 'Z') icase = false;
+    std::string err;
+    if (!re.compile(pat, icase, &err) && !re.compile(Searcher::escape_literal(pat), icase, &err)) return false;
+    Matcher m(re);
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    from = std::min(from, fn);
+    size_t ms, me;
+    if (fwd) {
+        if (match_after(m, fb, d.buf, from, fn, &ms, &me)) { *pos = ms; return true; }
+        size_t l0 = d.buf.line_of(from);
+        size_t lim = l0 + 1 < d.buf.lines() ? d.buf.line_start(l0 + 1) : fn;
+        if (match_after(m, fb, d.buf, 0, lim, &ms, &me)) { *pos = ms; return true; }
+        return false;
+    }
+    if (match_last(m, fb, 0, fn, from, &ms, &me)) { *pos = ms; return true; }
+    size_t l0 = d.buf.line_of(from);
+    if (match_last(m, fb, d.buf.line_start(l0), fn, (size_t)-1, &ms, &me)) { *pos = ms; return true; }   /* wrapped: the last match of the file */
+    return false;
+}
+
+/* ":[range]s/pat/rep/flags": & in the replacement is the whole match (the engine has no capture groups yet) */
+void vim_substitute(size_t l0, size_t l1, const std::string &c) {
+    Doc &d = D();
+    char dl = c[1];
+    std::vector<std::string> parts(1);
+    for (size_t i = 2; i < c.size(); i++) {
+        if (c[i] == '\\' && i + 1 < c.size()) { if (c[i + 1] == dl) { parts.back() += dl; i++; } else { parts.back() += c[i]; parts.back() += c[++i]; } }
+        else if (c[i] == dl && parts.size() < 3) parts.emplace_back();
+        else parts.back() += c[i];
+    }
+    if (parts.size() < 2) { E.status_msg = "E35: no previous pattern"; return; }
+    std::string pat = parts[0], rep = parts[1], flags = parts.size() > 2 ? parts[2] : "";
+    bool global = flags.find('g') != std::string::npos, icase = flags.find('i') != std::string::npos;
+    if (flags.find('I') == std::string::npos && !icase) { icase = true; for (unsigned char ch : pat) if (ch >= 'A' && ch <= 'Z') icase = false; }
+    Regex re;
+    std::string err;
+    if (!re.compile(pat, icase, &err)) { E.status_msg = "E486: invalid pattern: " + err; return; }
+    Matcher m(re);
+    l1 = std::min(l1, d.buf.lines() - 1);
+    size_t fn;
+    const char *fb = d.buf.flat(&fn);
+    SubResult r;
+    subst_scan(m, fb, d.buf.line_start(l0), d.buf.line_start(l1) + d.buf.line_len(l1), global, [&](std::string &o, const char *t, size_t ms, size_t me) {
+        for (size_t i = 0; i < rep.size(); i++) {
+            if (rep[i] == '&') o.append(t + ms, me - ms);
+            else if (rep[i] == '\\' && i + 1 < rep.size()) { char n2 = rep[++i]; if (n2 == 'n') o += '\n'; else if (n2 == 't') o += '\t'; else o += n2; }
+            else o += rep[i];
+        }
+    }, r);
+    size_t count = r.count, lines_hit = r.lines;
+    if (!count) { E.status_msg = "E486: Pattern not found: " + pat; return; }
+    d.break_group();
+    d.replace(r.first, r.last - r.first, r.out.data(), r.out.size());
+    d.anchor = d.cur = d.buf.line_start(std::min(l1, d.buf.lines() - 1));
+    d.break_group();
+    E.status_msg = sfmt("%zu substitution%s on %zu line%s", count, count == 1 ? "" : "s", lines_hit, lines_hit == 1 ? "" : "s");
+}
+
+size_t real_lines(const Doc &d) {   /* a buffer that ends with a newline has one empty line after it that is not a line of text */
+    size_t n = d.buf.lines();
+    return n > 1 && d.buf.line_len(n - 1) == 0 ? n - 1 : n;
+}
+
+/* :normal: run the keys on every line of the range (a trailing insert is ended with Esc) */
+void vim_normal(size_t l0, size_t l1, const std::string &keys) {
+    Doc &d = D();
+    for (size_t l = std::min(l1, real_lines(d) - 1) + 1; l-- > l0;) {   /* bottom up, so line numbers above stay valid */
+        if (l >= d.buf.lines()) continue;
+        d.anchor = d.cur = d.buf.line_start(l);
+        g_vim.escape(d);
+        for (size_t i = 0; i < keys.size();) {
+            size_t n = 1;
+            while (i + n < keys.size() && ((unsigned char)keys[i + n] & 0xC0) == 0x80) n++;
+            std::string ch = keys.substr(i, n);
+            if (ch == "\x1b") g_vim.escape(d);
+            else if (g_vim.typing()) g_vim.type_char(d, ch);
+            else g_vim.text(d, ch);
+            i += n;
+        }
+        g_vim.escape(d);
+    }
+    E.follow = true;
+}
+
+/* :g/pat/cmd and :v/pat/cmd (also :g!): cmd runs on every matching line, bottom up; d, s///, normal and > < are supported */
+void vim_global(const std::string &c, size_t r0 = 0, size_t r1 = (size_t)-1) {
+    Doc &d = D();
+    bool inv = c[0] == 'v' || c[1] == '!';
+    size_t i = c[1] == '!' ? 3 : 2;
+    std::string pat;
+    for (; i < c.size() && c[i] != '/'; i++) { if (c[i] == '\\' && i + 1 < c.size() && c[i + 1] == '/') i++; pat += c[i]; }
+    std::string cmd = i < c.size() ? c.substr(i + 1) : std::string();
+    while (!cmd.empty() && cmd[0] == ' ') cmd.erase(0, 1);
+    if (pat.empty()) { E.status_msg = "E35: no previous regular expression"; return; }
+    if (cmd.empty()) cmd = "p";
+    bool icase = true;
+    for (unsigned char ch : pat) if (ch >= 'A' && ch <= 'Z') icase = false;
+    Regex re;
+    std::string err;
+    if (!re.compile(pat, icase, &err)) { E.status_msg = "E486: invalid pattern: " + err; return; }
+    Matcher m(re);
+    std::vector<size_t> hits;
+    size_t nl = real_lines(d);
+    {
+        size_t fn;
+        const char *fb = d.buf.flat(&fn);
+        size_t last = std::min(r1, nl - 1);
+        std::vector<size_t> matched;
+        if (r0 <= last) m.scan(fb + d.buf.line_start(r0), d.buf.line_start(last) + d.buf.line_len(last) - d.buf.line_start(r0), [&](size_t ls0, size_t) { matched.push_back(d.buf.line_of(d.buf.line_start(r0) + ls0)); return true; });
+        if (!inv) hits = matched;
+        else { size_t k = 0; for (size_t l = r0; l <= last && l < nl; l++) { if (k < matched.size() && matched[k] == l) k++; else hits.push_back(l); } }
+    }
+    if (hits.empty()) { E.status_msg = "E486: Pattern not found: " + pat; return; }
+    d.break_group();
+    for (size_t k = hits.size(); k-- > 0;) {
+        size_t l = hits[k];
+        if (l >= d.buf.lines()) continue;
+        if (cmd == "d" || cmd == "delete") {
+            size_t a = d.buf.line_start(l), b = l + 1 < d.buf.lines() ? d.buf.line_start(l + 1) : d.buf.size();
+            if (l + 1 >= d.buf.lines() && a > 0) a--;
+            d.replace(a, b - a, "", 0);
+        } else if (cmd.size() >= 2 && cmd[0] == 's' && !isalnum((unsigned char)cmd[1])) vim_substitute(l, l, cmd);
+        else if (cmd.compare(0, 6, "normal") == 0) { size_t sp = cmd.find(' '); if (sp != std::string::npos) vim_normal(l, l, cmd.substr(sp + 1)); }
+        else if (cmd == ">" || cmd == "<") { d.anchor = d.cur = d.buf.line_start(l); g_vim.text(d, std::string(1, cmd[0])); g_vim.text(d, std::string(1, cmd[0])); }
+        else if (cmd == "p" || cmd == "print") { d.anchor = d.cur = d.buf.line_start(l); }
+        else { E.status_msg = "E492: Not an editor command: " + cmd; break; }
+    }
+    d.break_group();
+    if (E.status_msg.empty() || E.status_msg.compare(0, 4, "E492") != 0) E.status_msg = sfmt("%zu line%s matched", hits.size(), hits.size() == 1 ? "" : "s");
+}
+
+void vim_exec(char kind, const std::string &raw) {
+    Doc &d = D();
+    std::string c = raw;
+    while (!c.empty() && c.back() == ' ') c.pop_back();
+    size_t b = c.find_first_not_of(' ');
+    c = b == std::string::npos ? std::string() : c.substr(b);
+    if (kind == '!') { E.status_msg = raw; return; }
+    if (c.empty()) return;
+    {   /* an optional range before the command: %  N  N,M  .  $  '<,'> */
+        size_t i = 0, nl = real_lines(d), cl = d.buf.line_of(d.cur), r0 = cl, r1 = cl;
+        bool ranged = false;
+        auto addr = [&](size_t &out) {
+            if (i >= c.size()) return false;
+            if (c[i] == '.') { out = cl; i++; return true; }
+            if (c[i] == '$') { out = nl - 1; i++; return true; }
+            if (c[i] == '\'' && i + 1 < c.size() && c[i + 1] == '<') { out = g_vim.vis_l0; i += 2; return true; }
+            if (c[i] == '\'' && i + 1 < c.size() && c[i + 1] == '>') { out = g_vim.vis_l1; i += 2; return true; }
+            if (isdigit((unsigned char)c[i])) { size_t n = 0; while (i < c.size() && isdigit((unsigned char)c[i])) n = n * 10 + (size_t)(c[i++] - '0'); out = n ? n - 1 : 0; return true; }
+            return false;
+        };
+        if (c[0] == '%') { r0 = 0; r1 = nl - 1; i = 1; ranged = true; }
+        else if (addr(r0)) { r1 = r0; ranged = true; if (i < c.size() && c[i] == ',') { i++; if (!addr(r1)) r1 = r0; } }
+        if (ranged) {
+            if (r1 < r0) std::swap(r0, r1);
+            std::string rest = c.substr(i);
+            while (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+            if (rest.empty()) { goto_line(std::to_string(std::min(r1, nl - 1) + 1)); return; }
+            if (rest.size() >= 2 && rest[0] == 's' && !isalnum((unsigned char)rest[1]) && rest[1] != ' ') { vim_substitute(r0, r1, rest); return; }
+            if (rest.compare(0, 6, "normal") == 0 && (rest.size() == 6 || rest[6] == ' ' || rest[6] == '!')) { size_t sp2 = rest.find(' '); if (sp2 != std::string::npos) vim_normal(r0, r1, rest.substr(sp2 + 1)); return; }
+            if (rest.size() >= 3 && (rest[0] == 'g' || rest[0] == 'v') && (rest[1] == '/' || rest[1] == '!')) { vim_global(rest, r0, r1); return; }
+            if (rest == "d" || rest == "delete") {
+                size_t a = d.buf.line_start(r0), b = r1 + 1 < nl ? d.buf.line_start(r1 + 1) : d.buf.size();
+                if (r1 + 1 >= nl && a > 0) a--;
+                d.break_group(); d.replace(a, b - a, "", 0); d.break_group();
+                d.anchor = d.cur = d.buf.line_start(std::min(r0, d.buf.lines() - 1));
+                return;
+            }
+            c = rest;
+        }
+    }
+    if (c.size() >= 2 && c[0] == 's' && !isalnum((unsigned char)c[1]) && c[1] != ' ') { size_t cl = d.buf.line_of(d.cur); vim_substitute(cl, cl, c); return; }
+    if (c.size() >= 3 && (c[0] == 'g' || c[0] == 'v') && (c[1] == '/' || (c[1] == '!' && c.size() > 3 && c[2] == '/'))) { vim_global(c); return; }
+    if (c.compare(0, 6, "normal") == 0 && (c.size() == 6 || c[6] == ' ' || c[6] == '!')) { size_t sp2 = c.find(' '); if (sp2 != std::string::npos) vim_normal(d.buf.line_of(d.cur), d.buf.line_of(d.cur), c.substr(sp2 + 1)); return; }
+    bool digits = c.find_first_not_of("0123456789") == std::string::npos;
+    if (digits) { goto_line(c); return; }
+    if (c == "$") { goto_line(std::to_string(d.buf.lines())); return; }
+    std::string cmd = c, arg;
+    size_t sp = c.find(' ');
+    if (sp != std::string::npos) { cmd = c.substr(0, sp); arg = c.substr(sp + 1); }
+    bool bang = !cmd.empty() && cmd.back() == '!';
+    if (bang) cmd.pop_back();
+    if (cmd == "w" || cmd == "write") { if (d.path.empty() && arg.empty()) do_action(A_SAVEAS); else if (!arg.empty()) { std::string p = arg[0] == '/' ? arg : (E.tree.root().empty() ? arg : E.tree.root() + "/" + arg); E.status_msg = d.save(p.c_str()) ? "saved " + p : "SAVE FAILED: " + p; } else save_active(); }
+    else if (cmd == "q" || cmd == "quit" || cmd == "close") { if (bang) { E.confirm_idx = E.active; remove_doc(E.active); } else close_tab(E.active); }
+    else if (cmd == "wq" || cmd == "x" || cmd == "xit" || cmd == "exit") { save_active(); if (!D().modified()) close_tab(E.active); }
+    else if (cmd == "wa" || cmd == "wall") { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); after_save(); E.status_msg = "saved all"; }
+    else if (cmd == "qa" || cmd == "qall" || cmd == "wqa" || cmd == "xa") { if (cmd == "wqa" || cmd == "xa") { for (auto &dp : E.docs) if (dp->modified() && !dp->path.empty()) dp->save(nullptr); } if (bang) E.running = false; else request_quit(); }
+    else if (cmd == "e" || cmd == "edit" || cmd == "o" || cmd == "open") { if (arg.empty()) do_action(A_OPEN_FILE); else open_path(arg[0] == '/' ? arg : (E.tree.root().empty() ? arg : E.tree.root() + "/" + arg)); }
+    else if (cmd == "bn" || cmd == "bnext" || cmd == "tabn") do_action(A_NEXT_TAB);
+    else if (cmd == "bp" || cmd == "bprev" || cmd == "tabp") do_action(A_PREV_TAB);
+    else if (cmd == "noh" || cmd == "nohlsearch" || cmd == "set" || cmd == "syntax") {}
+    else if (cmd == "help" || cmd == "h") show_shortcuts();
+    else E.status_msg = "E492: Not an editor command: " + c;
+}
+
+void vim_init() {
+    g_vim.set_clip = [](const std::string &t) { SDL_SetClipboardText(t.c_str()); };
+    g_vim.get_clip = []() { std::string r; char *c = SDL_GetClipboardText(); if (c) { r = c; SDL_free(c); } return r; };
+    g_vim.exec = vim_exec;
+    g_vim.find = vim_find;
+    g_vim.on_search = [](const std::string &pat) { E.find_q = pat; E.find_regex = true; };
+    g_vim.page_rows = []() { return std::max(2, layout().rows); };
+    vim_reset();
+}
+
+static double g_t_start = 0;
+static void startup_mark(const char *what) {   /* HOOTEDIT_TRACE=1 prints where start-up time goes */
+    static const bool on = getenv("HOOTEDIT_TRACE") != nullptr;
+    if (on) fprintf(stderr, "[start] %6.1f ms  %s\n", (now_s() - g_t_start) * 1000.0, what);
+}
+
+int main(int argc, char **argv) {
+    g_t_start = now_s();
+    if (argc >= 2 && !strcmp(argv[1], "--askpass")) return askpass_client(argc >= 3 ? argv[2] : "");   /* git and ssh start us as their password helper */
+    if (argc >= 3 && !strcmp(argv[1], "--bench-core")) return bench_core(argv[2], argc >= 4 ? std::max(1, atoi(argv[3])) : 3, argc >= 5 ? argv[4] : nullptr);
+    std::vector<const char *> args;
+    const char *shot = nullptr, *script = nullptr, *cli_theme = nullptr;
+    int bench = 0;
+    bool stats_at_exit = false;
+    double exit_after = 0, shot_after = 0.4;
+    int win_w = 1280, win_h = 720;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--cache-stats")) stats_at_exit = true;
+        else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shot = argv[++i];
+        else if (!strcmp(argv[i], "--exit-after") && i + 1 < argc) exit_after = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--shot-after") && i + 1 < argc) shot_after = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--script") && i + 1 < argc) script = argv[++i];
+        else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--timed")) g_timed = true;
+        else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &win_w, &win_h);
+        else if (!strcmp(argv[i], "--theme") && i + 1 < argc) cli_theme = argv[++i];
+        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.2.0"); return 0; }
+        else if (argv[i][0] != '-') args.push_back(argv[i]);
+        else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
+    }
+    startup_mark("args parsed");
+    settings_load();
+    vim_init();
+    std::string workspace;
+    for (const char *a : args) {
+        struct stat st;
+        if (stat(a, &st) == 0 && S_ISDIR(st.st_mode)) { if (workspace.empty()) workspace = a; continue; }
+        Doc &d = new_doc(false);
+        std::string abs_path = a;
+        if (abs_path[0] != '/') { char cwd[4096]; if (getcwd(cwd, sizeof cwd)) abs_path = std::string(cwd) + "/" + abs_path; }   /* absolute, so the file can be watched and matched with the tree */
+        if (!d.open(abs_path.c_str())) { fprintf(stderr, "hootedit: cannot open %s\n", a); return 1; }
+        if (workspace.empty()) {
+            std::string full = expand_path(a);
+            std::string dir = full.substr(0, full.rfind('/') == std::string::npos ? 0 : full.rfind('/'));
+            std::string up = dir, root;
+            for (int guard = 0; guard < 64 && !up.empty(); guard++) {   /* the repository root: the nearest folder above with a .git, found without starting git */
+                struct stat gs;
+                if (stat((up + "/.git").c_str(), &gs) == 0) { root = up; break; }
+                size_t sl = up.rfind('/');
+                if (sl == std::string::npos || sl == 0) break;
+                up.resize(sl);
+            }
+            workspace = !root.empty() ? root : dir;
+        }
+    }
+    if (E.docs.empty()) new_doc();
+    if (workspace.empty()) { char cwd[1024]; workspace = getcwd(cwd, sizeof cwd) ? cwd : "."; }
+    signal(SIGUSR1, on_usr1);
+    /* the window class is what a panel uses to match a window to its menu entry and icon; a terminal that exports its own SDL class (Lestrix does) would
+     * otherwise make every program started from it look like that terminal. Set ours explicitly before SDL_Init, which reads it once, then take it out of the environment again so the shells
+     * and external terminals we start do not inherit it. */
+    startup_mark("files opened, workspace found");
+    setenv("SDL_VIDEO_X11_WMCLASS", "hootedit", 1);
+    setenv("SDL_VIDEO_WAYLAND_WMCLASS", "hootedit", 1);
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) { fprintf(stderr, "hootedit: SDL: %s\n", SDL_GetError()); return 1; }
+    bool ok = false;
+    for (GlKind k : {GLK_CORE, GLK_ES3, GLK_ES2}) if ((ok = gl_init(k, win_w, win_h))) break;
+    startup_mark("SDL + window + GL context");
+    unsetenv("SDL_VIDEO_X11_WMCLASS");
+    unsetenv("SDL_VIDEO_WAYLAND_WMCLASS");
+    if (!ok) { fprintf(stderr, "hootedit: no usable OpenGL context\n"); return 1; }
+    E.font = font_open("monospace", 14.0 * E.scale, true);
+    E.ui = font_open("sans", 13.0 * E.scale, false);
+    E.big = font_open("sans", 34.0 * E.scale, false);
+    if (!E.font || !E.ui || !E.big) { fprintf(stderr, "hootedit: no font\n"); return 1; }
+    E.preview_heading[0] = E.big;
+    E.preview_heading[1] = font_open("sans", 27.0 * E.scale, false);
+    E.preview_heading[2] = font_open("sans", 23.0 * E.scale, false);
+    E.preview_heading[3] = font_open("sans", 19.0 * E.scale, false);
+    E.preview_heading[4] = font_open("sans", 16.0 * E.scale, false);
+    E.preview_heading[5] = E.ui;
+    startup_mark("fonts loaded");
+    E.cw = font_cell_w(E.font); E.ch = font_cell_h(E.font); E.asc = font_ascent(E.font);
+    E.rowh = std::max(E.ch, (int)lround(19.0 * E.scale));
+    E.rowasc = E.asc + (E.rowh - E.ch) / 2;
+    E.uh = font_cell_h(E.ui); E.uasc = font_ascent(E.ui);
+    g_ev_wake = SDL_RegisterEvents(1);
+    askpass_start();
+    tcore_set_history_defaults(10000, 64, 0, false);   /* scrollback of the terminal panel: 10,000 lines, up to 64 MB in memory, no disk spill */
+    wp_configure(1);
+    tcore_set_native_cat(true);                         /* the built-in fast cat of the engine: plain "cat file" and "producer | cat" at memory speed */
+    if (cli_theme) { E.theme = ui_theme_find(cli_theme); E.follow_fleet = false; }
+    if (!E.theme) E.theme = ui_theme_find("Xylonic Dark");
+    apply_theme(E.theme);
+    if (E.follow_fleet) follow_fleetwm();
+    startup_mark("terminal engine, theme");
+    SDL_StartTextInput();
+    set_workspace(workspace, !script);   /* git status on a thread, so the first frame does not wait for it (scripts want it done) */
+    startup_mark("workspace (tree + git)");
+    E.side_open = true;
+    set_active(0);
+
+    E.now = now_s();
+    double t0 = E.now;
+    E.last_active = E.last_blink = E.now;
+    r_begin(E.r, E.W, E.H, C_EDITOR);
+    build_frame();   /* the first frame: it also gives clicks and menus their hit boxes */
+    r_end(E.r);
+    SDL_GL_SwapWindow(E.win);
+    startup_mark("first frame drawn");
+    SDL_ShowWindow(E.win);   /* only now: the window appears with the editor in it */
+    startup_mark("window shown");
+    E.dirty = true;
+    if (script) { g_scripted = true; run_script(script); }
+    hud_tick();
+    if (bench > 0) {   /* scroll one line per frame through the file: CPU time to build a frame, and the same with every row already cached */
+        Doc &d = D();
+        size_t nl = d.buf.lines();
+        E.timing = true;
+        SDL_GL_SetSwapInterval(0);   /* with vsync on, the wait for the display lands in build_frame and hides the real cost */
+        for (int pass = 0; pass < 2; pass++) {
+            E.t_top = E.t_rows = E.t_gutter = E.t_status = E.t_flush = 0;
+            double sum_build = 0, sum_full = 0, worst = 0;
+            for (int i = 0; i < bench; i++) {
+                d.top = (size_t)i % (nl > 60 ? nl - 60 : 1);
+                double c0 = now_s();
+                r_begin(E.r, E.W, E.H, C_EDITOR);
+                build_frame();
+                double c1 = now_s();
+                r_end(E.r);
+                SDL_GL_SwapWindow(E.win);
+                uint8_t sync[4];
+                glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sync);   /* waits for the GPU, so the frame time is the time to finished pixels */
+                double c2 = now_s();
+                sum_build += c1 - c0; sum_full += c2 - c0;
+                if (c1 - c0 > worst) worst = c1 - c0;
+            }
+            printf("bench pass %d (%s): build_frame %.1f us avg, worst %.1f us; with GL submit+swap+finish %.1f us (%s)\n", pass + 1,
+                   pass == 0 ? "cold caches" : "warm row cache", sum_build / bench * 1e6, worst * 1e6, sum_full / bench * 1e6, E.gl_desc);
+            printf("  per frame: tab row %.1f us, text rows (hash+lookup+push, no GL) %.1f us, clip flush (GL) %.1f us, editor area incl. rows %.1f us, status bar %.1f us\n",
+                   E.t_top / bench * 1e6, E.t_rows / bench * 1e6, E.t_flush / bench * 1e6, E.t_gutter / bench * 1e6, E.t_status / bench * 1e6);
+        }
+        printf("%s\n", cache_stats_text().c_str());
+        if (g_job.th.joinable()) g_job.th.join();   /* a joinable thread at exit would abort and lose the numbers */
+        if (g_rjob.th.joinable()) g_rjob.th.join();
+        askpass_stop();
+        return 0;
+    }
+    SDL_Event ev;
+    while (E.running) {
+        double due = E.next_hud ? E.next_hud : E.now;
+        if (g_job.running || g_rjob.running) due = std::min(due, E.now + 0.2);
+        if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, E.last_blink + 0.53);
+        if (E.side_close_at > 0) due = std::min(due, E.side_close_at);
+        if (E.tip_at > 0) due = std::min(due, E.tip_at);
+        if (E.lint_at > 0) due = std::min(due, E.lint_at);
+        if (g_fw->tree_due > 0) due = std::min(due, g_fw->tree_due);
+        if (E.follow_fleet && !E.fleet_watch) due = std::min(due, E.next_fleet ? E.next_fleet : E.now + 1.0);
+        double left = due - E.now;
+        int wait = left < 0.001 ? 1 : left > 5.0 ? 5000 : (int)(left * 1000.0) + 1;
+        if (E.dirty) wait = 0;
+        if (SDL_WaitEventTimeout(&ev, wait)) { do handle_event(ev); while (SDL_PollEvent(&ev)); }
+        E.now = now_s();
+        if (g_print_stats) { g_print_stats = 0; fprintf(stderr, "%s\n", cache_stats_text().c_str()); }
+        g_wake_pending = 0;
+        search_poll();
+        if (g_set.open && E.mode == M_EDIT) { E.mode = M_SETTINGS; redraw(); }   /* a list or a dialog opened from the Settings page has closed: back to the page */
+        lint_tick();
+        fswatch_tick();
+        git_startup_poll();
+        if (g_async_ready.exchange(false)) redraw();
+        git_job_poll();
+        job_poll(g_rjob);
+        askpass_poll();
+        tip_poll();
+        terms_pump();
+        if (E.follow_fleet && !E.fleet_watch) E.fleet_watch = fleetwm_watch_start();
+        if (fleetwm_watch_take() || (E.follow_fleet && E.now >= E.next_fleet)) {
+            E.next_fleet = E.now + (E.fleet_watch ? 30.0 : 1.0);   /* with the watcher the timer only catches a missed event */
+            if (E.follow_fleet && fleetwm_stamp() != E.fleet.stamp) follow_fleetwm();
+        }
+        if (E.side_close_at > 0 && E.now >= E.side_close_at) { E.side_close_at = 0; if (!E.pinned && E.side_open) open_side(false); }
+        if (E.now >= E.next_hud) { E.next_hud = E.now + (!E.focused || E.now - E.last_active > BLINK_FOR ? 5 : E.now - E.last_active > 3.0 ? 3 : 1); hud_tick(); }
+        if (E.focused && E.now - E.last_active < BLINK_FOR && E.now - E.last_blink > 0.53) { E.last_blink = E.now; E.blink_on = !E.blink_on; redraw(); }
+        else if ((!E.focused || E.now - E.last_active >= BLINK_FOR) && !E.blink_on) { E.blink_on = true; redraw(); }
+        if (E.dirty) {
+            E.dirty = false;
+            double c0 = now_s();
+            for (int attempt = 0; attempt < 2; attempt++) {
+                uint32_t gen0 = atlas_generation(E.atlas);
+                r_begin(E.r, E.W, E.H, C_EDITOR);
+                double b0 = now_s();
+                build_frame();
+                E.last_build_ms = (now_s() - b0) * 1000.0;
+                r_end(E.r);
+                if (atlas_generation(E.atlas) == gen0) break;   /* atlas was cleared mid-frame: UVs built before are stale, draw again */
+            }
+            end_op_if_pending();
+            E.frames++;
+            if (shot && E.now - t0 > shot_after) { write_ppm(shot); E.running = false; }
+            SDL_GL_SwapWindow(E.win);
+            double cost = now_s() - c0;
+            E.frame_cost = E.frame_cost == 0 ? cost : E.frame_cost * 0.9 + cost * 0.1;
+        }
+        if (shot && !E.dirty && E.now - t0 > shot_after) redraw();
+        if (exit_after > 0 && E.now - t0 > exit_after) E.running = false;
+    }
+    if (stats_at_exit) printf("%s\n", cache_stats_text(true).c_str());
+    while (!E.terms.empty()) kill_terminal(0);
+    if (g_job.th.joinable()) g_job.th.join();
+    if (g_rjob.th.joinable()) g_rjob.th.join();
+    askpass_stop();
+    return 0;
+}

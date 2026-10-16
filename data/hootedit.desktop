@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Hootedit
+Comment=Fast native code editor
+Icon=hootedit
+Exec=hootedit %F
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=text/plain;text/x-c;text/x-c++src;text/x-python;application/json;text/markdown;
+StartupNotify=false
+StartupWMClass=hootedit
