@@ -43,6 +43,10 @@ mkdir -p "$T/ws/src/lib" "$T/ws/plain"
 printf 'one two three\nfour five\nsix\n' > "$T/ws/a.txt"
 printf '#include <x.h>\n\nstruct P {\n    int x;\n};\n\nstatic int add(int a, int b) {\n    return a + b;\n}\n' > "$T/ws/t.c"
 printf 'x\n' > "$T/ws/src/lib/deep.txt"
+printf '# Preview check\n\nA **bold** paragraph.\n\n```python\nprint("hello")\n```\n' > "$T/ws/preview.md"
+printf '= Guide\n\n[source,python]\n----\nprint("hello")\n----\n' > "$T/ws/preview.adoc"
+printf 'Guide\n=====\n\n.. code-block:: python\n\n   print("hello")\n' > "$T/ws/preview.rst"
+printf '# Broken preview\n\n![missing](assets/nope.png)\n\n<div>raw HTML</div>\n' > "$T/ws/preview-broken.md"
 
 # ---- typing and saving ----
 run "text:hello;ctrl+s;wait:200;dump" a.txt
@@ -214,6 +218,26 @@ run "act:settings;down;return;dump" typo.yaml
 has "Enter on a setting toggles it and the page stays" "settings: open=1"
 run "ctrl+,;dump" typo.yaml
 has "Ctrl+, opens the Settings page" "settings: open=1"
+
+# ---- documentation preview ----
+run "act:preview;dump" preview.md
+has "Markdown preview can be toggled from the action" "preview: open=1 split=0 target=GitHub format=1 blocks=3"
+run "click:875,45;dump" preview.md
+has "the tab-strip Preview button opens the rendered view" "preview: open=1 split=0 target=GitHub format=1 blocks=3"
+run "ctrl+shift+v;dump" preview.md
+has "Ctrl+Shift+V toggles source and preview" "preview: open=1 split=0 target=GitHub format=1 blocks=3"
+run "act:preview_split;dump" preview.md
+has "split preview opens source and rendered panes together" "preview: open=1 split=1 target=GitHub format=1 blocks=3"
+run "click:938,45;dump" preview.md
+has "the Split control opens synchronized source and preview panes" "preview: open=1 split=1 target=GitHub format=1 blocks=3"
+run "click:990,45;act:preview;dump" preview.md
+has "the preview toolbar selects a GitLab rendering profile" "preview: open=1 split=0 target=GitLab format=1 blocks=3"
+run "act:preview;dump" preview-broken.md
+has "preview lists missing images and raw HTML approximations" "preview: open=1 split=0 target=GitHub format=1 blocks=3 notes=2"
+run "act:preview;dump" preview.adoc
+has "AsciiDoc source blocks are previewable" "preview: open=1 split=0 target=GitHub format=2 blocks=2"
+run "act:preview;dump" preview.rst
+has "reStructuredText code directives are previewable" "preview: open=1 split=0 target=GitHub format=3 blocks=2"
 
 run "wait:200;mouse:5,5;click:14,725;mouse:5,5;dump" typo.yaml
 has "the cog at the foot of the sidebar rail opens Settings" "settings: open=1"

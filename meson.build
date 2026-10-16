@@ -22,7 +22,7 @@ lestrix = files('src/lestrix/vt.cpp', 'src/lestrix/lz.cpp', 'src/lestrix/pty.cpp
 inc = include_directories('src/engine')
 # Lestrix itself is built with exceptions on (fleetwm.cpp uses try/catch); Hootedit's own code is built without.
 lestrix_lib = static_library('lestrix_vendored', lestrix, include_directories: inc, cpp_args: ['-fexceptions'], dependencies: deps)
-hootedit_exe = executable('hootedit', files('src/main.cpp', 'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/icons.cpp', 'src/tree.cpp', 'src/git.cpp', 'src/askpass.cpp', 'src/remote.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/search.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/benchcore.cpp', 'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp') + engine,
+hootedit_exe = executable('hootedit', files('src/main.cpp', 'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/preview.cpp', 'src/icons.cpp', 'src/tree.cpp', 'src/git.cpp', 'src/askpass.cpp', 'src/remote.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/search.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/benchcore.cpp', 'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp') + engine,
            include_directories: inc, link_with: lestrix_lib, dependencies: deps + [cxx.find_library('util', required: false)], install: true)
 
 install_data('data/hootedit.png', install_dir: get_option('datadir') / 'icons' / 'hicolor' / '256x256' / 'apps')
@@ -34,16 +34,16 @@ san = ['b_sanitize=address,undefined', 'b_ndebug=false', 'buildtype=debug']
 
 unit_sources = files(
   'tests/test_buffer.cpp', 'tests/test_doc.cpp', 'tests/test_syntax.cpp', 'tests/test_fuzzy.cpp', 'tests/test_diff.cpp', 'tests/test_merge.cpp', 'tests/test_regex.cpp',
-  'tests/test_vim.cpp', 'tests/test_outline.cpp', 'tests/test_tree.cpp', 'tests/test_lint.cpp',
+  'tests/test_vim.cpp', 'tests/test_outline.cpp', 'tests/test_tree.cpp', 'tests/test_lint.cpp', 'tests/test_preview.cpp',
   'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/tree.cpp',
-  'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp')
+  'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp', 'src/preview.cpp')
 unit_tests = executable('hootedit-unit-tests', unit_sources, dependencies: [gtest_dep], cpp_args: ['-fexceptions'], override_options: san)
 test('hootedit-unit-tests', unit_tests, protocol: 'gtest', timeout: 300)
 
 # one meson test per area, so `meson test lint` runs just that slice (the same slices scripts/test.sh offers)
 test_areas = {
   'buffer': 'Buffer.*', 'doc': 'Doc.*', 'syntax': 'Syntax.*', 'fuzzy': 'Fuzzy.*', 'diff': 'Diff.*', 'merge': 'Merge.*', 'regex': 'Regex.*',
-  'vim': 'Vim.*', 'outline': 'Outline.*', 'tree': 'Tree.*', 'lint': 'Lint.*',
+  'vim': 'Vim.*', 'outline': 'Outline.*', 'tree': 'Tree.*', 'lint': 'Lint.*', 'preview': 'Preview.*',
 }
 foreach area, filter : test_areas
   test(area, unit_tests, args: ['--gtest_filter=' + filter], suite: 'areas', protocol: 'gtest', timeout: 300)
@@ -59,5 +59,4 @@ bash = find_program('bash', required: false)
 if bash.found()
   test('ui scenarios', bash, args: [files('tests/ui_test.sh'), hootedit_exe], suite: 'ui', timeout: 180)
 endif
-
 

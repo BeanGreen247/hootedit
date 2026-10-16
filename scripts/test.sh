@@ -23,12 +23,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build-test}"
 declare -A AREAS=(
   [buffer]='Buffer.*' [doc]='Doc.*' [syntax]='Syntax.*' [fuzzy]='Fuzzy.*' [diff]='Diff.*' [merge]='Merge.*' [regex]='Regex.*'
-  [vim]='Vim.*' [outline]='Outline.*' [tree]='Tree.*' [lint]='Lint.*'
+  [vim]='Vim.*' [outline]='Outline.*' [tree]='Tree.*' [lint]='Lint.*' [preview]='Preview.*'
 )
 declare -A WHAT=(
   [buffer]='piece table against std::string, hot-reload safety' [doc]='undo/redo, save tracking, reload from disk' [syntax]='lexer classes and language detection'
   [fuzzy]='fuzzy matcher ranking' [diff]='line diff: minimal and replayable' [merge]='three-way merge parsing' [regex]='own regex engine against std::regex'
-  [vim]='vim engine' [outline]='symbol outline scan' [tree]='Explorer tree, compact folders, ghosts' [lint]='live checks: Ansible, Kubernetes, shell, ...'
+  [vim]='vim engine' [outline]='symbol outline scan' [tree]='Explorer tree, compact folders, ghosts' [lint]='live checks: Ansible, Kubernetes, shell, ...' [preview]='documentation preview parsing'
 )
 BUILD=1; VERBOSE=0; LIST=0; REPEAT=1; SHUFFLE=0; XML=""; FILTER=""; GROUPS_WANTED=(); AREAS_WANTED=()
 while [ $# -gt 0 ]; do

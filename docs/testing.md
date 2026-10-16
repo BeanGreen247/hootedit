@@ -17,11 +17,11 @@ scripts/test.sh -r 20 --shuffle  repeat in random order    scripts/test.sh --xml
 
 | group | what it is | here |
 |---|---|---|
-| unit | GoogleTest, one binary built with AddressSanitizer and UBSan, sliced into areas with `--gtest_filter` | 106 tests in 11 areas: buffer, doc, syntax, fuzzy, diff, merge, regex, vim, outline, tree, lint |
+| unit | GoogleTest, one binary built with AddressSanitizer and UBSan, sliced into areas with `--gtest_filter` | 111 tests in 12 areas: buffer, doc, syntax, fuzzy, diff, merge, regex, vim, outline, tree, lint, preview |
 | differential | the code against a reference that is obviously right | the piece table against a `std::string` with random edits (`Buffer.RandomEditsAgreeWithAStdString`), the regex engine against `std::regex` on 30,000 random patterns, `scan()` against line-by-line `find()`, the line diff against an LCS table, undo/redo walks against a string model |
 | fuzz | seeded random input that must not crash or disagree | the same random edit and pattern generators, running under the sanitizers; the generators use fixed seeds so a failure repeats |
 | perf | a speed gate with loose limits (about 8x below a 2-core laptop) that catches a quadratic loop or an extra copy per line, not a 10% change | `hootedit-perf-gate`: lexer, fuzzy filter, regex scan of 32 MB, 20,000 edits on an open file, `flat()`, live checks on code and on manifests |
-| ui | the real window driven by `--script`, state read back with the `dump` step, under `xvfb-run` | `tests/ui_test.sh`: 69 scenarios (typing, vim, preview tabs, git markers, live checks, Kubernetes, hot reload, ...) |
+| ui | the real window driven by `--script`, state read back with the `dump` step, under `xvfb-run` | `tests/ui_test.sh`: 87 scenarios (typing, vim, document previews, git markers, live checks, Kubernetes, hot reload, ...) |
 | static | checks that need no build | `scripts/check-static.sh`: scripts parse, relative links in the docs resolve, source files have a header |
 
 ## Writing a test

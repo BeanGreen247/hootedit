@@ -56,6 +56,7 @@
 #include "lint.h"
 #include "lint_priv.h"
 #include "outline.h"
+#include "preview.h"
 
 static Uint32 g_ev_wake;
 static std::atomic<int> g_wake_pending;
@@ -188,14 +189,14 @@ std::string lower_ascii(std::string s) { for (char &c : s) if (c >= 'A' && c <= 
 
 enum Act {
     A_NONE, A_NEW, A_OPEN_FILE, A_OPEN_FOLDER, A_SAVE, A_SAVEAS, A_CLOSE, A_QUIT, A_UNDO, A_REDO, A_CUT, A_COPY, A_PASTE, A_SELALL, A_FIND, A_QUICK,
-    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S, A_K8S_CRD, A_SETTINGS, A_COUNT
+    A_TOGGLE_SIDEBAR, A_PIN, A_VIEW_EXPLORER, A_VIEW_GIT, A_LANG, A_STATS, A_NEXT_TAB, A_PREV_TAB, A_ABOUT, A_REFRESH, A_THEME, A_SEARCH, A_TOG_REGEX, A_TOG_CASE, A_TOG_WORD, A_TERM_TOGGLE, A_TERM_NEW, A_TERM_KILL, A_TERM_PICK, A_TERM_EXTERNAL, A_GOTO, A_REOPEN, A_CLOSE_ALL, A_PALETTE, A_REPLACE, A_OUTLINE, A_VIM, A_SHORTCUTS, A_PROBLEMS, A_NEXT_PROBLEM, A_PREV_PROBLEM, A_QUICKFIX, A_FIXALL, A_LINT, A_ANSIBLE, A_K8S,         A_K8S_CRD, A_SETTINGS, A_PREVIEW, A_PREVIEW_SPLIT, A_COUNT
 };
 const char *ACT_NAMES[A_COUNT] = {"none", "new", "open_file", "open_folder", "save", "saveas", "close", "quit", "undo", "redo", "cut", "copy", "paste", "selall", "find", "quick",
-                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes", "reload_crds", "settings"};
+                                  "toggle_sidebar", "pin", "view_explorer", "view_git", "lang", "stats", "next_tab", "prev_tab", "about", "refresh", "theme", "search", "tog_regex", "tog_case", "tog_word", "term_toggle", "term_new", "term_kill", "term_pick", "term_external", "goto", "reopen", "close_all", "palette", "replace", "outline", "vim", "shortcuts", "problems", "next_problem", "prev_problem", "quickfix", "fixall", "lint", "ansible", "kubernetes", "reload_crds", "settings", "preview", "preview_split"};
 
 const char *ACT_LABEL[A_COUNT] = {"", "new tab", "open-file dialog", "open-folder dialog", "save", "save-as dialog", "close tab", "quit", "undo", "redo", "cut", "copy", "paste", "select all",
                                   "find box", "quick open", "toggle sidebar", "pin sidebar", "files tab", "git tab", "language picker", "stats panel", "next tab", "previous tab",
-                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems", "toggle live checks", "insert ansible task", "insert kubernetes resource", "reload crds", "settings page"};
+                                  "about", "refresh", "theme picker", "search tab", "toggle regex", "toggle case", "toggle word", "terminal panel", "new terminal", "kill terminal", "terminal picker", "external terminal", "go to line", "reopen closed tab", "close all tabs", "command palette", "replace", "toggle outline", "toggle vim keys", "keyboard shortcuts", "problems list", "next problem", "previous problem", "quick fix", "fix all problems",                                   "toggle live checks", "insert ansible task", "insert kubernetes resource", "reload crds", "settings page", "toggle document preview", "toggle split document preview"};
 
 struct MenuItem { const char *label, *keys; int act; };   /* act A_NONE with a label = disabled, empty label = separator */
 struct Menu { const char *name; std::vector<MenuItem> items; };
@@ -206,14 +207,14 @@ const std::vector<Menu> MENUS = {
               {"Select All", "Ctrl+A", A_SELALL}, {"", "", A_NONE}, {"Go to Line...", "Ctrl+G", A_GOTO}, {"Find", "Ctrl+F", A_FIND}, {"Replace", "Ctrl+H", A_REPLACE}, {"Find in Files", "Ctrl+Shift+F", A_SEARCH}}},
     {"View", {{"Files", "Ctrl+Shift+E", A_VIEW_EXPLORER}, {"Search", "Ctrl+Shift+F", A_SEARCH}, {"Git", "Ctrl+Shift+G", A_VIEW_GIT}, {"", "", A_NONE}, {"Toggle Sidebar", "Ctrl+B", A_TOGGLE_SIDEBAR},
               {"Pin / Unpin Sidebar", "", A_PIN}, {"", "", A_NONE}, {"Next Tab", "Ctrl+PgDn", A_NEXT_TAB}, {"Previous Tab", "Ctrl+PgUp", A_PREV_TAB}, {"", "", A_NONE},
-              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"Reload Kubernetes CRDs", "", A_K8S_CRD}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
+              {"Command Palette...", "Ctrl+Shift+P", A_PALETTE}, {"Document Preview", "Ctrl+Shift+V", A_PREVIEW}, {"Split Document Preview", "", A_PREVIEW_SPLIT}, {"", "", A_NONE}, {"Language Mode...", "Ctrl+K M", A_LANG}, {"Color Theme...", "Ctrl+K Ctrl+T", A_THEME}, {"", "", A_NONE}, {"Problems...", "Ctrl+Shift+M", A_PROBLEMS}, {"Next Problem", "F8", A_NEXT_PROBLEM}, {"Previous Problem", "Shift+F8", A_PREV_PROBLEM}, {"Quick Fix", "Ctrl+.", A_QUICKFIX}, {"Fix All Problems", "", A_FIXALL}, {"Insert Ansible Task...", "", A_ANSIBLE}, {"Insert Kubernetes Resource...", "", A_K8S}, {"Reload Kubernetes CRDs", "", A_K8S_CRD}, {"", "", A_NONE}, {"Cache Statistics", "Ctrl+Shift+I", A_STATS}}},
     {"Terminal", {{"New Terminal", "Ctrl+Shift+`", A_TERM_NEW}, {"Toggle Terminal", "Ctrl+`", A_TERM_TOGGLE}, {"Kill Terminal", "", A_TERM_KILL}, {"", "", A_NONE},
                   {"Choose Terminal...", "", A_TERM_PICK}, {"Open External Terminal Here", "", A_TERM_EXTERNAL}}},
     {"Help", {{"Keyboard Shortcuts", "Ctrl+K Ctrl+H", A_SHORTCUTS}, {"", "", A_NONE}, {"About Hootedit", "", A_ABOUT}}},
 };
 
 struct Hit { float x, y, w, h; int kind, id; };
-enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL, H_SETCOG, H_SIDETOG };
+enum HitKind { H_TAB = 1, H_TABCLOSE, H_BOX, H_ACT, H_MENU, H_MENUITEM, H_PICKITEM, H_QUICKITEM, H_BTN_SAVE, H_BTN_DISCARD, H_BTN_CANCEL, H_TREE, H_ROOT, H_ACTIVITY, H_PIN, H_GITROW, H_SIDEBAR, H_SIDEBOX, H_SIDEHIT, H_SRES, H_TERMTAB, H_SPLIT, H_VSCROLL, H_FD_ITEM, H_FD_OK, H_FD_CANCEL, H_FD_PLACE, H_FD_HIDDEN, H_TABSPACE, H_GITSEC, H_GITSTG, H_GITOPEN, H_GITMSG, H_GITCOMMIT, H_GITLOG, H_GITCFILE, H_GITTL, H_GITREFRESH, H_GITALL, H_DIFFBTN, H_DIFFFOLD, H_GUTTER, H_BLAME, H_DLGBTN, H_DLGBG, H_DLGINPUT, H_CTXITEM, H_CTXBG, H_GITMORE, H_GITBRANCH, H_GITDD, H_GITDISC, H_GITDIR, H_DIFFHUNK, H_RROW, H_RNEW, H_PEEK, H_GITOP, H_CONFLICT, H_MERGE, H_REPL, H_SECT, H_OPENED, H_OUTLINE, H_SETCAT, H_SETROW, H_SETCTL, H_SETCOG, H_SIDETOG, H_PREVIEW };
 enum Mode { M_EDIT, M_FIND, M_PICK, M_CONFIRM, M_PROMPT, M_MENU, M_QUICK, M_SIDE, M_FILEDLG, M_GITMSG, M_DIALOG, M_CTX, M_SETTINGS };
 enum FdKind { FD_OPEN_FILE, FD_OPEN_FOLDER, FD_SAVE };
 enum PickKind { PICK_LANG, PICK_THEME, PICK_TERMINAL, PICK_CUSTOM };
@@ -364,6 +365,16 @@ struct Ed {
     bool blank_tab = false;                          /* the placeholder document has been turned into a real empty tab (double click or Ctrl+N) */
     float hit_floor = 1e9f;                          /* hit boxes are cut off at this y: nothing behind the status bar can be clicked */
     std::string git_for;                             /* the folder the Git tab was last computed for */
+    bool preview_open = false;
+    bool preview_split = false;
+    int preview_target = 0;                         /* 0 = GitHub, 1 = GitLab */
+    float preview_scroll = 0;
+    uint64_t preview_revision = ~0ull;
+    const Doc *preview_doc = nullptr;
+    std::string preview_path;
+    PreviewFormat preview_cached_format = PreviewFormat::None;
+    std::vector<PreviewBlock> preview_blocks;
+    std::vector<PreviewDiagnostic> preview_diagnostics;
 
     /* workspace and sidebar */
     Tree tree;
@@ -1386,6 +1397,176 @@ std::vector<std::string> wrap_lines(const std::string &t, float w, int style = F
         pos = e + 1;
     }
     return out;
+}
+
+struct PreviewSpan { std::string text; int style = FS_REGULAR; uint32_t color = 0; };
+
+uint32_t preview_link_color() { return E.preview_target ? RGBA(31, 117, 203, 255) : RGBA(9, 105, 218, 255); }
+
+void preview_span(std::vector<PreviewSpan> &out, const std::string &text, int style, uint32_t color = 0) {
+    if (text.empty()) return;
+    if (!out.empty() && out.back().style == style && out.back().color == color) out.back().text += text;
+    else out.push_back({text, style, color});
+}
+
+std::vector<PreviewSpan> preview_inline(const std::string &s) {
+    std::vector<PreviewSpan> out;
+    size_t i = 0, plain = 0;
+    auto close_at = [&](const char *mark, size_t from) {
+        size_t p = s.find(mark, from);
+        return p;
+    };
+    while (i < s.size()) {
+        if (s[i] == '!' && i + 1 < s.size() && s[i + 1] == '[') {
+            size_t mid = s.find("](", i + 2), end = mid == std::string::npos ? mid : s.find(')', mid + 2);
+            if (mid != std::string::npos && end != std::string::npos) {
+                preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+                preview_span(out, "[Image: " + s.substr(i + 2, mid - i - 2) + "]", FS_REGULAR, preview_link_color());
+                i = end + 1; plain = i; continue;
+            }
+        }
+        if (s[i] == '[') {
+            size_t mid = s.find("](", i + 1), end = mid == std::string::npos ? mid : s.find(')', mid + 2);
+            if (mid != std::string::npos && end != std::string::npos) {
+                preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+                preview_span(out, s.substr(i + 1, mid - i - 1), FS_REGULAR, preview_link_color());
+                i = end + 1; plain = i; continue;
+            }
+        }
+        if (s.compare(i, 5, "link:") == 0) {
+            size_t l = s.find('[', i + 5), r = l == std::string::npos ? l : s.find(']', l + 1);
+            if (l != std::string::npos && r != std::string::npos) {
+                preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+                preview_span(out, s.substr(l + 1, r - l - 1), FS_REGULAR, preview_link_color());
+                i = r + 1; plain = i; continue;
+            }
+        }
+        const char *marks[] = {"**", "__", "``", "''", "*", "_", "`"};
+        bool parsed = false;
+        for (const char *m : marks) {
+            size_t n = strlen(m);
+            if (s.compare(i, n, m) != 0) continue;
+            size_t end = close_at(m, i + n);
+            if (end == std::string::npos || end == i + n) continue;
+            preview_span(out, s.substr(plain, i - plain), FS_REGULAR);
+            int style = (n == 2 && (m[0] == '*' || m[0] == '_')) ? FS_BOLD : n == 1 && (m[0] == '*' || m[0] == '_') ? FS_ITALIC : FS_REGULAR;
+            uint32_t color = (m[0] == '`' || m[0] == '\'') ? TOKCOL[T_STRING] : 0;
+            preview_span(out, s.substr(i + n, end - i - n), style, color);
+            i = end + n; plain = i; parsed = true; break;
+        }
+        if (!parsed) {
+            size_t adv = 1;
+            u8_decode(s.data() + i, s.size() - i, &adv);
+            i += adv;
+        }
+    }
+    preview_span(out, s.substr(plain), FS_REGULAR);
+    return out;
+}
+
+const Lang *preview_code_lang(const std::string &name) {
+    std::string n = lower_ascii(name);
+    if (n == "py" || n == "python") return lang_detect("preview.py", nullptr, 0);
+    if (n == "js" || n == "javascript" || n == "jsx") return lang_detect("preview.js", nullptr, 0);
+    if (n == "ts" || n == "typescript" || n == "tsx") return lang_detect("preview.ts", nullptr, 0);
+    if (n == "sh" || n == "shell" || n == "bash" || n == "console") return lang_detect("preview.sh", nullptr, 0);
+    if (n == "json") return lang_detect("preview.json", nullptr, 0);
+    if (n == "yaml" || n == "yml") return lang_detect("preview.yaml", nullptr, 0);
+    if (n == "toml") return lang_detect("preview.toml", nullptr, 0);
+    if (n == "c") return lang_detect("preview.c", nullptr, 0);
+    if (n == "cpp" || n == "c++") return lang_detect("preview.cpp", nullptr, 0);
+    if (n == "rust" || n == "rs") return lang_detect("preview.rs", nullptr, 0);
+    if (n == "go") return lang_detect("preview.go", nullptr, 0);
+    if (n == "html" || n == "xml") return lang_detect("preview.html", nullptr, 0);
+    if (n == "css") return lang_detect("preview.css", nullptr, 0);
+    if (n == "sql") return lang_detect("preview.sql", nullptr, 0);
+    return lang_plain();
+}
+
+float preview_draw_inline(const std::string &text, float x, float y, float width, float line_h, Font *font, int base_style,
+                          uint32_t base_color, bool draw) {
+    std::vector<PreviewSpan> spans = preview_inline(text);
+    float start_x = x, pen = x;
+    for (const PreviewSpan &span : spans) {
+        int style = span.style == FS_REGULAR ? base_style : (span.style == FS_BOLD ? FS_BOLD : span.style == FS_ITALIC ? FS_ITALIC : FS_BOLD_ITALIC);
+        for (size_t i = 0; i < span.text.size();) {
+            size_t adv = 1;
+            uint32_t cp = u8_decode(span.text.data() + i, span.text.size() - i, &adv);
+            const AtlasGlyph *g = atlas_glyph(E.atlas, font, cp, style);
+            float gw = g ? g->adv : (float)font_cell_w(font);
+            if (pen > start_x && pen + gw > start_x + width) { pen = start_x; y += line_h; }
+            if (draw && g && !g->blank) {
+                RInst inst;
+                r_make_glyph(E.r, &inst, g, pen, y + (float)font_ascent(font), span.color ? span.color : base_color);
+                r_push(E.r, &inst, 1);
+            }
+            pen += gw;
+            i += adv;
+        }
+    }
+    return y + line_h;
+}
+
+size_t preview_code_rows(const PreviewBlock &block, float width) {
+    int cols = std::max(1, (int)(width / (float)std::max(1, E.cw)));
+    size_t rows = 0;
+    for (const std::string &line : block.lines) {
+        size_t chars = 0;
+        for (size_t p = 0; p < line.size();) { size_t n = 1; u8_decode(line.data() + p, line.size() - p, &n); p += n; chars++; }
+        rows += std::max<size_t>(1, (chars + (size_t)cols - 1) / (size_t)cols);
+    }
+    return rows;
+}
+
+float preview_draw_code(const PreviewBlock &block, float x, float y, float width, bool draw) {
+    const Lang *lang = preview_code_lang(block.language);
+    int cw = std::max(1, E.cw);
+    int cols = std::max(1, (int)(width / (float)cw));
+    uint8_t state = 0;
+    float line_h = (float)E.rowh;
+    for (const std::string &line : block.lines) {
+        std::vector<uint8_t> tok(line.size(), T_PLAIN);
+        if (lang != lang_plain()) state = lex_line(lang, line.data(), line.size(), state, tok.data());
+        else state = 0;
+        size_t pos = 0;
+        while (pos < line.size() || (line.empty() && pos == 0)) {
+            size_t end = pos;
+            for (int col = 0; col < cols && end < line.size(); col++) {
+                size_t adv = 1;
+                u8_decode(line.data() + end, line.size() - end, &adv);
+                end += adv;
+            }
+            if (draw) {
+                float pen = x;
+                for (size_t i = pos; i < end;) {
+                    size_t adv = 1;
+                    uint32_t cp = u8_decode(line.data() + i, end - i, &adv);
+                    const AtlasGlyph *g = atlas_glyph(E.atlas, E.font, cp, FS_REGULAR);
+                    if (g && !g->blank) { RInst inst; r_make_glyph(E.r, &inst, g, pen, y + (float)E.rowasc, TOKCOL[tok[i]]); r_push(E.r, &inst, 1); }
+                    pen += g ? g->adv : (float)cw;
+                    i += adv;
+                }
+            }
+            y += line_h;
+            if (end >= line.size()) break;
+            pos = end;
+        }
+    }
+    return y;
+}
+
+void preview_refresh(Doc &d) {
+    PreviewFormat f = preview_format(d.path);
+    if (E.preview_doc == &d && E.preview_revision == d.buf.revision() && E.preview_path == d.path && E.preview_cached_format == f) return;
+    std::string source;
+    d.buf.copy(0, d.buf.size(), source);
+    E.preview_blocks = preview_parse(source, f);
+    E.preview_diagnostics = preview_diagnose(source, f, d.path);
+    E.preview_doc = &d;
+    E.preview_revision = d.buf.revision();
+    E.preview_path = d.path;
+    E.preview_cached_format = f;
+    E.preview_scroll = 0;
 }
 
 void dlg_show(const std::string &title, const std::string &detail, std::vector<std::string> btns, std::function<void(int, const std::string &)> done,
@@ -2544,7 +2725,7 @@ void open_blame_commit(const GitBlame &b, const std::string &path) {
 struct Layout {
     int menu_h, tab_h, status_h, side_w, side_x1;   /* side_w: width the docked sidebar takes from the editor; side_x1: right edge when drawn (docked or floating) */
     bool docked, floating;
-    int ed_x, tab_y, text_y, bar_y, ed_bottom, panel_y, panel_h, gutter, text_x, rows, cols;
+    int ed_x, split_x, tab_y, text_y, bar_y, ed_bottom, panel_y, panel_h, gutter, text_x, rows, cols;
 };
 
 Layout layout() {
@@ -2556,6 +2737,8 @@ Layout layout() {
     l.side_w = l.docked ? sw : 0;
     l.side_x1 = E.side_open ? sw : 0;
     l.ed_x = l.side_w;
+    bool split = E.preview_open && E.preview_split && preview_format(D().path) != PreviewFormat::None && !D().dv && !D().mv;
+    l.split_x = split ? l.ed_x + (E.W - l.ed_x) / 2 : E.W;
     l.tab_y = l.menu_h;
     l.text_y = l.menu_h + l.tab_h;
     l.bar_y = E.H - l.status_h;
@@ -2567,8 +2750,120 @@ Layout layout() {
     l.gutter = S(79) + (digits - 3) * E.cw;
     l.text_x = l.ed_x + l.gutter;
     l.rows = std::max(0, (l.ed_bottom - l.text_y) / E.rowh);
-    l.cols = std::max(0, (E.W - l.text_x) / E.cw);
+    l.cols = std::max(0, (l.split_x - l.text_x) / E.cw);
     return l;
+}
+
+void draw_preview(const Layout &L, float x, float width) {
+    Doc &d = D();
+    preview_refresh(d);
+    float top = (float)L.text_y + (float)S(16);
+    float left = x + (float)S(24);
+    float content_w = std::max((float)S(80), width - (float)S(48));
+    float bottom = (float)L.ed_bottom;
+    uint32_t preview_bg = ui_mix(C_EDITOR, C_UI, E.preview_target ? 0.018f : 0.010f);
+    r_rect(E.r, x, (float)L.text_y, width, (float)(L.ed_bottom - L.text_y), preview_bg);
+    size_t warning_count = std::min<size_t>(3, E.preview_diagnostics.size());
+    for (size_t i = 0; i < warning_count; i++) {
+        const PreviewDiagnostic &diag = E.preview_diagnostics[i];
+        std::string label = "Preview note (line " + std::to_string(diag.line) + "): " + diag.message;
+        draw_text(E.ui, left, ui_base(top, (float)S(20)), label.c_str(), C_ORANGE, content_w);
+        top += (float)S(22);
+    }
+    if (E.preview_diagnostics.size() > warning_count) {
+        std::string more = std::to_string(E.preview_diagnostics.size() - warning_count) + " more preview notes";
+        draw_text(E.ui, left, ui_base(top, (float)S(20)), more.c_str(), C_ORANGE, content_w);
+        top += (float)S(22);
+    }
+    if (E.preview_blocks.empty()) {
+        draw_text(E.ui, left, ui_base(top, (float)S(24)), "Nothing to preview", C_UI_FAINT, content_w);
+        return;
+    }
+    r_clip(E.r, (int)x, L.text_y, (int)width, L.ed_bottom - L.text_y);
+    float y = top - E.preview_scroll;
+    int ordered_index = 0;
+    bool was_ordered = false;
+    for (const PreviewBlock &b : E.preview_blocks) {
+        if (y > bottom) break;
+        if (b.kind != PreviewBlockKind::List || !b.ordered) { ordered_index = 0; was_ordered = false; }
+        if (b.kind == PreviewBlockKind::Rule) {
+            if (y + (float)S(10) >= (float)L.text_y && y < bottom) r_rect(E.r, left, y + (float)S(5), content_w, (float)S(1), C_BORDER);
+            y += (float)S(18);
+        } else if (b.kind == PreviewBlockKind::Heading) {
+            Font *font = b.level <= 1 ? E.big : E.ui;
+            float lh = b.level <= 1 ? (float)S(34) : (float)S(27);
+            uint32_t color = C_UI;
+            y += b.level <= 1 ? (float)S(8) : (float)S(4);
+            if (y + lh >= (float)L.text_y && y < bottom) y = preview_draw_inline(b.text, left, y, content_w, lh, font, FS_BOLD, color, true);
+            else y += lh;
+            y += (float)S(6);
+        } else if (b.kind == PreviewBlockKind::Code) {
+            float pad = (float)S(12);
+            float code_y = y + pad;
+            float code_x = left + pad;
+            float code_h = (float)(preview_code_rows(b, content_w - 2 * pad) + 1) * (float)E.rowh + pad * 2;
+            if (y < bottom && y + code_h >= (float)L.text_y) r_rect(E.r, left, y, content_w, code_h, ui_mix(C_BOX, preview_bg, E.preview_target ? 0.05f : 0.02f));
+            code_y = preview_draw_code(b, code_x, code_y, content_w - 2 * pad, true);
+            y = std::max(code_y, y + code_h) + (float)S(10);
+        } else if (b.kind == PreviewBlockKind::Quote) {
+            float lh = (float)S(22);
+            if (y + lh >= (float)L.text_y && y < bottom) r_rect(E.r, left, y, (float)S(3), lh, C_ACCENT);
+            y = preview_draw_inline(b.text, left + (float)S(12), y, content_w - (float)S(12), lh, E.ui, FS_ITALIC, C_UI_DIM,
+                                   y + lh >= (float)L.text_y && y < bottom);
+            y += (float)S(4);
+        } else if (b.kind == PreviewBlockKind::List) {
+            float lh = (float)S(22);
+            float indent = std::min((float)S(72), (float)b.level * (float)S(18));
+            if (b.ordered) {
+                if (!was_ordered) ordered_index = 0;
+                std::string prefix = std::to_string(++ordered_index) + ".";
+                draw_text(E.ui, left + indent, ui_base(y, lh), prefix.c_str(), preview_link_color(), (float)S(24));
+                was_ordered = true;
+            } else draw_text(E.ui, left + indent, ui_base(y, lh), "\xE2\x80\xA2", preview_link_color(), (float)S(14));
+            y = preview_draw_inline(b.text, left + indent + (float)S(22), y, content_w - indent - (float)S(22), lh, E.ui, FS_REGULAR, C_UI,
+                                   y + lh >= (float)L.text_y && y < bottom);
+        } else if (b.kind == PreviewBlockKind::Table) {
+            float lh = (float)S(24);
+            for (size_t i = 0; i < b.lines.size(); i++) {
+                std::string row;
+                bool in_cell = false;
+                for (char c : b.lines[i]) {
+                    if (c == '|') { if (in_cell) row += "   |   "; in_cell = !in_cell; }
+                    else if (in_cell) row += c;
+                }
+                size_t first = row.find_first_not_of(" \t");
+                if (first != std::string::npos) row.erase(0, first);
+                size_t last = row.find_last_not_of(" \t");
+                if (last != std::string::npos) row.erase(last + 1);
+                if (!row.empty() && row.find_first_not_of("|:- ") == std::string::npos) continue;
+                y = preview_draw_inline(row, left, y, content_w, lh, E.ui, i == 0 ? FS_BOLD : FS_REGULAR,
+                                        i == 0 ? C_ACCENT : C_UI, y + lh >= (float)L.text_y && y < bottom);
+            }
+            y += (float)S(8);
+        } else {
+            float lh = (float)S(22);
+            y = preview_draw_inline(b.text, left, y, content_w, lh, E.ui, FS_REGULAR, C_UI, y + lh >= (float)L.text_y && y < bottom);
+            y += (float)S(6);
+        }
+    }
+    r_clip_off(E.r);
+}
+
+float preview_max_scroll(const Layout &L, float width) {
+    float content_w = std::max((float)S(80), width - (float)S(48));
+    float height = (float)S(16) + (float)std::min<size_t>(4, E.preview_diagnostics.size()) * (float)S(22);
+    for (const PreviewBlock &b : E.preview_blocks) {
+        if (b.kind == PreviewBlockKind::Rule) height += (float)S(18);
+        else if (b.kind == PreviewBlockKind::Heading) height += (b.level <= 1 ? (float)S(48) : (float)S(37));
+        else if (b.kind == PreviewBlockKind::Code) {
+            height += (float)preview_code_rows(b, content_w - (float)S(24)) * (float)E.rowh;
+            height += (float)S(34);
+        } else {
+            size_t rows = wrap_lines(b.text, content_w).size();
+            height += (float)std::max<size_t>(1, rows) * (float)S(22) + (b.kind == PreviewBlockKind::Paragraph ? (float)S(6) : (float)S(4));
+        }
+    }
+    return std::max(0.f, height - (float)(L.ed_bottom - L.text_y) + (float)S(16));
 }
 
 void ensure_visible(const Layout &L) {
@@ -4997,11 +5292,18 @@ void build_frame() {
 
     /* ---- editor column: tab row ---- */
     float ex = (float)L.ed_x, ew = (float)(E.W - L.ed_x);
+    bool can_preview = !d.dv && !d.mv && preview_format(d.path) != PreviewFormat::None;
+    float preview_w = can_preview ? (float)S(188) : 0.f;
+    float tab_ew = std::max(0.f, ew - preview_w);
+    if (can_preview && E.preview_open && E.preview_split) {
+        preview_refresh(d);
+        E.preview_scroll = std::min(preview_max_scroll(L, (float)(E.W - L.split_x)), (float)d.top * (float)E.rowh);
+    }
     r_rect(E.r, ex, (float)L.tab_y, ew, (float)L.tab_h, C_CHROME);
     r_rect(E.r, ex, (float)(L.tab_y + L.tab_h - 1), ew, 1, C_BORDER);
     {
         float tx = ex, ty = (float)L.tab_y, th = (float)L.tab_h;
-        if (splash()) hit(tx, ty, ew, th, H_TABSPACE, 0);   /* no tabs yet: a double click anywhere on the strip opens an empty one */
+        if (splash()) hit(tx, ty, tab_ew, th, H_TABSPACE, 0);   /* no tabs yet: a double click anywhere on the strip opens an empty one */
         const size_t nt = splash() ? 0 : E.docs.size();
         std::vector<float> tw(nt);
         float total = 0;
@@ -5014,16 +5316,16 @@ void build_frame() {
         if (E.tab_reveal && E.active >= 0 && (size_t)E.active < nt) {   /* a switch by keyboard or click scrolls the strip just enough to show the tab */
             float l = E.tab_x[(size_t)E.active], r = l + tw[(size_t)E.active];
             if (l < E.tab_scroll) E.tab_scroll = l;
-            else if (r > E.tab_scroll + ew) E.tab_scroll = r - ew;
+            else if (r > E.tab_scroll + tab_ew) E.tab_scroll = r - tab_ew;
         }
         E.tab_reveal = false;
-        E.tab_scroll = std::max(0.f, std::min(E.tab_scroll, total - ew));
-        r_clip(E.r, (int)ex, (int)ty, (int)ew, (int)th);
+        E.tab_scroll = std::max(0.f, std::min(E.tab_scroll, total - tab_ew));
+        r_clip(E.r, (int)ex, (int)ty, (int)tab_ew, (int)th);
         tx = ex - E.tab_scroll;
         for (size_t i = 0; i < nt; i++) {
             bool act = (int)i == E.active;
             bool lift = E.tab_dragging && E.tab_press == (int)i;
-            if (tx + tw[i] < ex || tx > ex + ew) { tx += tw[i]; continue; }   /* scrolled out of the strip */
+            if (tx + tw[i] < ex || tx > ex + tab_ew) { tx += tw[i]; continue; }   /* scrolled out of the strip */
             r_rect(E.r, tx, ty, tw[i], th, act || lift ? C_EDITOR : C_CHROME);
             if (act) r_rect(E.r, tx, ty + th - (float)S(2), tw[i], (float)S(2), C_ACCENT);
             if (lift) r_rect(E.r, tx, ty, tw[i], (float)S(2), C_ACCENT);
@@ -5038,7 +5340,7 @@ void build_frame() {
             if (mod && !hovered(H_TABCLOSE, (int)i)) draw_icon(IC_DOT, cx, cy, S(16), C_UI);
             else if (act || hv) draw_icon(IC_CLOSE, cx, cy, S(16), hovered(H_TABCLOSE, (int)i) ? C_UI : C_UI_DIM);
             auto clipped_hit = [&](float x0, float w0, int kind) {   /* a tab half under the sidebar must not take its clicks */
-                float x1 = std::max(x0, ex), x2 = std::min(x0 + w0, ex + ew);
+                float x1 = std::max(x0, ex), x2 = std::min(x0 + w0, ex + tab_ew);
                 if (x2 > x1) hit(x1, ty, x2 - x1, th, kind, (int)i);
             };
             clipped_hit(tx, tw[i] - (float)S(30), H_TAB);
@@ -5046,7 +5348,22 @@ void build_frame() {
             tx += tw[i];
         }
         r_clip_off(E.r);
-        if (nt && tx < ex + ew) hit(tx, ty, ex + ew - tx, th, H_TABSPACE, 0);   /* the empty part of the strip: a double click opens a new empty tab */
+        if (nt && tx < ex + tab_ew) hit(tx, ty, ex + tab_ew - tx, th, H_TABSPACE, 0);   /* the empty part of the strip: a double click opens a new empty tab */
+        if (can_preview) {
+            float bx = ex + tab_ew, by = ty + (float)S(4), bh = th - (float)S(8);
+            float widths[3] = {(float)S(78), (float)S(48), preview_w - (float)S(126)};
+            const char *labels[3] = {E.preview_open ? "Source" : "Preview", "Split", E.preview_target ? "GitLab" : "GitHub"};
+            for (int i = 0; i < 3; i++) {
+                bool selected = i == 0 ? E.preview_open : i == 1 ? E.preview_split : false;
+                uint32_t bg = selected ? C_SELROW : hovered(H_PREVIEW, i) ? C_HOVER : C_CHROME;
+                r_rect(E.r, bx, by, widths[i], bh, bg);
+                if (selected) r_rect(E.r, bx, by + bh - (float)S(2), widths[i], (float)S(2), C_ACCENT);
+                draw_text(E.ui, bx + (widths[i] - text_width(E.ui, labels[i])) / 2, ui_base(by, bh), labels[i],
+                          selected ? C_ACCENT : C_UI_DIM, widths[i]);
+                hit(bx, ty, widths[i], th, H_PREVIEW, i);
+                bx += widths[i];
+            }
+        }
     }
     double tm1 = E.timing ? now_s() : 0;
 
@@ -5070,10 +5387,12 @@ void build_frame() {
         draw_diff(L, ex, ew);
     } else if (d.mv) {
         draw_merge(L, ex, ew);
+    } else if (E.preview_open && !E.preview_split && preview_format(d.path) != PreviewFormat::None) {
+        draw_preview(L, ex, ew);
     } else {
         /* the faint band behind the cursor line also covers the gutter */
         if (cl >= d.top && cl < d.top + (size_t)L.rows) r_rect(E.r, (float)L.ed_x, (float)(L.text_y + (long)(cl - d.top) * E.rowh), (float)(L.text_x - L.ed_x), (float)E.rowh, C_CURLINE);
-        r_clip(E.r, L.text_x, L.text_y, E.W - L.text_x, L.ed_bottom - L.text_y);
+        r_clip(E.r, L.text_x, L.text_y, L.split_x - L.text_x, L.ed_bottom - L.text_y);
         /* pass 1: the visible lines, their indentation (blank lines borrow from their neighbours) and the active indent guide */
         int nrows = (int)std::min<size_t>((size_t)L.rows, d.buf.lines() > d.top ? d.buf.lines() - d.top : 0);
         std::vector<std::string> texts((size_t)nrows);
@@ -5129,10 +5448,10 @@ void build_frame() {
                 int ck = conflict_kind(*cfl, (long)line, &ci_);
                 if (ck) {
                     uint32_t bg = ck == 1 ? ui_mix(C_EDITOR, C_GIT_ADD, 0.34) : ck == 2 ? ui_mix(C_EDITOR, C_GIT_ADD, 0.14) : ck == 7 ? ui_mix(C_EDITOR, C_ACCENT, 0.36) : ck == 6 ? ui_mix(C_EDITOR, C_ACCENT, 0.16) : ui_mix(C_EDITOR, C_FG, 0.10);
-                    r_rect(E.r, (float)L.text_x, ry, (float)(E.W - L.text_x), (float)E.rowh, bg);
+                    r_rect(E.r, (float)L.text_x, ry, (float)(L.split_x - L.text_x), (float)E.rowh, bg);
                 }
             }
-            if (line == cl) r_rect(E.r, (float)L.text_x, ry, (float)(E.W - L.text_x), (float)E.rowh, C_CURLINE);
+            if (line == cl) r_rect(E.r, (float)L.text_x, ry, (float)(L.split_x - L.text_x), (float)E.rowh, C_CURLINE);
             auto mark = [&](size_t b0, size_t b1, uint32_t col) {
                 int c0 = col_of(tt, b0) - d.left, c1 = col_of(tt, b1) - d.left;
                 c0 = std::max(c0, 0); c1 = std::min(c1, L.cols);
@@ -5191,11 +5510,11 @@ void build_frame() {
         {   /* a thin scrollbar on the right edge of the text; the thumb is the visible part of the file */
             float sty, sth, sy0, sh;
             if (sb_geom(L, d, &sty, &sth, &sy0, &sh)) {
-                float sx = (float)(E.W - S(10));
+                float sx = (float)(L.split_x - S(10));
                 bool hot = E.sb_drag || (E.mx >= sx - (float)S(2) && E.my >= sty && E.my < sty + sth);
                 r_rect(E.r, sx + (float)S(2), sy0, (float)S(6), sh, hot ? C_SB_HOT : C_SB_THUMB);
                 if (cl >= 0) { float cy = sty + ((float)cl / (float)std::max<size_t>(1, d.buf.lines() - 1)) * sth; r_rect(E.r, sx + (float)S(2), cy, (float)S(6), std::max(1.f, E.scale), C_ACCENT); }
-                hit((float)(E.W - S(14)), sty, (float)S(14), sth, H_VSCROLL, 0);
+                hit((float)(L.split_x - S(14)), sty, (float)S(14), sth, H_VSCROLL, 0);
             }
         }
         for (int row = 0; row < L.rows; row++) {
@@ -5265,6 +5584,10 @@ void build_frame() {
         draw_peek(L, d);
         draw_conflict_actions(L, d);
         draw_blame_tip(L, d);
+    }
+    if (E.preview_open && E.preview_split && can_preview) {
+        r_rect(E.r, (float)L.split_x - (float)S(1), (float)L.text_y, (float)S(1), (float)(L.ed_bottom - L.text_y), C_BORDER);
+        draw_preview(L, (float)L.split_x, (float)(E.W - L.split_x));
     }
     double tm3 = E.timing ? now_s() : 0;
 
@@ -5444,7 +5767,8 @@ void build_frame() {
             const MenuItem &it = m.items[i];
             if (!it.label[0]) { r_rect(E.r, x + (float)S(8), y + sep / 2, iw - (float)S(16), 1, C_MENU_BORDER); y += sep; continue; }
             bool enabled = it.act != A_NONE;
-            if (enabled && (int)i == E.menu_sel) r_rect(E.r, x + (float)S(3), y, iw - (float)S(6), ih, C_MENU_SEL);
+            bool mouse_over = hovered(H_MENUITEM, (int)i);
+            if (enabled && (mouse_over || (E.hover_kind != H_MENUITEM && (int)i == E.menu_sel))) r_rect(E.r, x + (float)S(3), y, iw - (float)S(6), ih, C_MENU_SEL);
             uint32_t col = enabled ? C_UI : C_UI_FAINT;
             draw_text(E.ui, x + (float)S(26), ui_base(y, ih), ((it.act == A_VIM && E.vim_on) || (it.act == A_OUTLINE && E.outline_on) || (it.act == A_LINT && E.lint_on) ? std::string("\xE2\x9C\x93 ") + it.label : std::string(it.label)).c_str(), col, iw);
             float kw = text_width(E.ui, it.keys);
@@ -6475,6 +6799,14 @@ void do_action(int act) {
     case A_VIEW_EXPLORER: show_view(V_EXPLORER); break;
     case A_VIEW_GIT: show_view(V_GIT); break;
     case A_LANG: open_picker(PICK_LANG); break;
+    case A_PREVIEW:
+        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc and reStructuredText files";
+        else { E.preview_open = !E.preview_open; E.preview_split = false; E.preview_scroll = 0; E.status_msg.clear(); }
+        break;
+    case A_PREVIEW_SPLIT:
+        if (preview_format(d.path) == PreviewFormat::None) E.status_msg = "preview supports Markdown, AsciiDoc and reStructuredText files";
+        else { E.preview_open = true; E.preview_split = !E.preview_split; E.preview_scroll = (float)d.top * (float)E.rowh; E.status_msg.clear(); }
+        break;
     case A_THEME: open_picker(PICK_THEME); break;
     case A_SEARCH: show_view(V_SEARCH); E.mode = M_SIDE; if (E.s_active && E.srows.empty()) start_search(); break;
     case A_TOG_REGEX: case A_TOG_CASE: case A_TOG_WORD: toggle_search_option(act); break;
@@ -6666,6 +6998,7 @@ void key_down(const SDL_KeyboardEvent &k) {
         touch();
         return;
     }
+    if (E.mode == M_EDIT && ctrl && shift && sym == SDLK_v) { do_action(A_PREVIEW); touch(); return; }
     if (E.mode == M_SETTINGS) {
         if (sym == SDLK_ESCAPE) { if (!g_set.q.empty()) { g_set.q.clear(); g_set.sel = 0; } else set_close(); }
         else if (sym == SDLK_UP) set_move(-1);
@@ -7057,6 +7390,11 @@ void click_hit(const Hit &h) {
         break;
     }
     case H_SIDETOG: do_action(A_TOGGLE_SIDEBAR); break;
+    case H_PREVIEW:
+        if (h.id == 0) do_action(A_PREVIEW);
+        else if (h.id == 1) do_action(A_PREVIEW_SPLIT);
+        else if (h.id == 2) { E.preview_target = 1 - E.preview_target; }
+        break;
     case H_SETCOG: if (E.mode == M_SETTINGS) set_close(); else set_open(); break;
     case H_ACTIVITY: set_close(); show_view((View)h.id); break;
     case H_PIN: do_action(A_PIN); break;
@@ -7348,7 +7686,19 @@ void handle_event(const SDL_Event &e) {
         if (E.mode == M_FILEDLG) { E.fd.scroll = std::max(0, E.fd.scroll - e.wheel.y * 3); redraw(); break; }
         if (E.mode == M_PICK) { E.pick_scroll = std::max(0, E.pick_scroll - e.wheel.y * 3); redraw(); break; }
         if (E.mode == M_SETTINGS) { g_set.scroll -= (float)e.wheel.y * (float)S(48); redraw(); break; }
-        if (E.mx >= (float)L.ed_x && E.my >= (float)L.tab_y && E.my < (float)L.text_y && !splash()) {   /* over the tab strip: slide the tabs, keep the active one */
+        Doc &d = D();
+        bool split_preview = E.preview_open && E.preview_split && preview_format(d.path) != PreviewFormat::None && !d.dv && !d.mv;
+        if (E.mode == M_EDIT && E.preview_open && preview_format(d.path) != PreviewFormat::None && E.my >= (float)L.text_y && E.my < (float)L.ed_bottom &&
+            (E.mx >= (float)L.ed_x + (split_preview ? (float)(E.W - L.ed_x) / 2.f : 0.f))) {
+            preview_refresh(d);
+            float pane_w = split_preview ? (float)(E.W - L.split_x) : (float)(E.W - L.ed_x);
+            E.preview_scroll = std::max(0.f, std::min(preview_max_scroll(L, pane_w), E.preview_scroll - (float)e.wheel.y * (float)S(60)));
+            if (split_preview) d.top = std::min((size_t)(E.preview_scroll / (float)std::max(1, E.rowh)), d.buf.lines() - 1);
+            redraw();
+            break;
+        }
+        float tab_area = (float)(E.W - L.ed_x) - (preview_format(d.path) != PreviewFormat::None && !d.dv && !d.mv ? (float)S(188) : 0.f);
+        if (E.mx >= (float)L.ed_x && E.mx < (float)L.ed_x + tab_area && E.my >= (float)L.tab_y && E.my < (float)L.text_y && !splash()) {   /* over the tab strip: slide the tabs, keep the active one */
             E.tab_scroll += (float)(e.wheel.x - e.wheel.y) * (float)S(70);
             redraw();
             break;
@@ -7358,7 +7708,6 @@ void handle_event(const SDL_Event &e) {
             redraw();
             break;
         }
-        Doc &d = D();
         if (d.dv) {
             d.dv->top -= (long)e.wheel.y * 3;
             if (e.wheel.x) d.dv->left = std::max(0, d.dv->left + e.wheel.x * 4);
@@ -7376,6 +7725,7 @@ void handle_event(const SDL_Event &e) {
         }
         long nt = (long)d.top - (long)e.wheel.y * 3;
         d.top = nt < 0 ? 0 : std::min((size_t)nt, d.buf.lines() - 1);
+        if (split_preview) E.preview_scroll = std::min(preview_max_scroll(L, (float)(E.W - L.split_x)), (float)d.top * (float)E.rowh);
         if (e.wheel.x) d.left = std::max(0, d.left + e.wheel.x * 4);
         redraw();
         break;
@@ -7422,7 +7772,7 @@ void handle_event(const SDL_Event &e) {
             E.term_focus = false;
             Layout L = layout();
             if (splash() && g_clicks >= 2 && my >= (float)L.tab_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x) { do_action(A_NEW); return; }   /* double click on the start screen */
-            if (my >= (float)L.text_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x) {
+            if (my >= (float)L.text_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x && mx < (float)L.split_x) {
                 Doc &d = D();
                 d.break_group();
                 d.move_to(pos_from_xy((int)mx, (int)my), (SDL_GetModState() & KMOD_SHIFT) != 0, false);
@@ -7555,6 +7905,10 @@ void run_script(const char *script) {
             for (const Tree::Row &r : E.tree.rows()) { auto di = E.deco.find(r.path); printf("row: %s depth=%d dir=%d ghost=%d deco=%c\n", r.name.c_str(), r.depth, r.dir ? 1 : 0, r.ghost ? 1 : 0, di == E.deco.end() ? '-' : di->second); }
             printf("sidebar: %d\n", E.side_open ? 1 : 0);
             printf("settings: open=%d category=%d query=%s rows=%zu\n", g_set.open ? 1 : 0, g_set.cat, g_set.q.c_str(), g_set.rows.size());
+            if (E.preview_open) preview_refresh(dd);
+            printf("preview: open=%d split=%d target=%s format=%d blocks=%zu notes=%zu scroll=%.0f\n", E.preview_open ? 1 : 0,
+                   E.preview_split ? 1 : 0, E.preview_target ? "GitLab" : "GitHub", (int)preview_format(dd.path), E.preview_blocks.size(),
+                   E.preview_diagnostics.size(), E.preview_scroll);
             printf("frame_ms: %.3f\n", E.last_build_ms);
             lint_kick(dd, true);
             if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());
