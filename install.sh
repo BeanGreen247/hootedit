@@ -43,6 +43,8 @@ if [ "${EUID}" -eq 0 ]; then
   exit 1
 fi
 run() { if [ "$DRY" = 1 ]; then echo "[dry run] $*"; else "$@"; fi; }
+# keep meson/ninja quiet, but print their output when they fail (meson writes its errors to stdout)
+quiet() { local out; out=$("$@" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }; }
 
 if [ "$UNINSTALL" = 1 ]; then
   a=(); [ -n "$PREFIX" ] && a=(--prefix "$PREFIX"); [ "$DRY" = 1 ] && a+=(--dry-run)
@@ -65,7 +67,7 @@ echo "Installing to $PREFIX"
 # sudo is needed for packages, or when the prefix is not writable
 probe="$PREFIX"; while [ ! -e "$probe" ] && [ "$probe" != / ]; do probe=$(dirname "$probe"); done
 need_deps() { command -v meson >/dev/null && command -v ninja >/dev/null && command -v g++ >/dev/null && command -v pkg-config >/dev/null \
-  && pkg-config --exists sdl2 freetype2 fontconfig; }
+  && pkg-config --exists sdl2 freetype2 fontconfig && { [ "$TESTS" = 0 ] || pkg-config --exists gtest; }; }
 NEED_SUDO=0
 [ ! -w "$probe" ] && NEED_SUDO=1
 [ "$DEPS" = yes ] && ! need_deps && NEED_SUDO=1
@@ -85,10 +87,10 @@ elif need_deps && [ "$DRY" = 0 ]; then echo "  everything needed is already inst
 else
   if command -v apt-get >/dev/null; then
     run sudo apt-get update -qq
-    run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y meson ninja-build g++ pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libgl-dev fontconfig fonts-dejavu-core
-  elif command -v dnf >/dev/null; then run sudo dnf install -y meson ninja-build gcc-c++ pkgconf-pkg-config SDL2-devel freetype-devel fontconfig-devel mesa-libGL-devel dejavu-sans-mono-fonts
-  elif command -v pacman >/dev/null; then run sudo pacman -S --needed --noconfirm meson ninja gcc pkgconf sdl2 freetype2 fontconfig mesa ttf-dejavu
-  elif command -v zypper >/dev/null; then run sudo zypper --non-interactive install meson ninja gcc-c++ pkg-config libSDL2-devel freetype2-devel fontconfig-devel Mesa-libGL-devel dejavu-fonts
+    run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y meson ninja-build g++ pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libgl-dev fontconfig fonts-dejavu-core $([ "$TESTS" = 1 ] && echo libgtest-dev)
+  elif command -v dnf >/dev/null; then run sudo dnf install -y meson ninja-build gcc-c++ pkgconf-pkg-config SDL2-devel freetype-devel fontconfig-devel mesa-libGL-devel dejavu-sans-mono-fonts $([ "$TESTS" = 1 ] && echo gtest-devel)
+  elif command -v pacman >/dev/null; then run sudo pacman -S --needed --noconfirm meson ninja gcc pkgconf sdl2 freetype2 fontconfig mesa ttf-dejavu $([ "$TESTS" = 1 ] && echo gtest)
+  elif command -v zypper >/dev/null; then run sudo zypper --non-interactive install meson ninja gcc-c++ pkg-config libSDL2-devel freetype2-devel fontconfig-devel Mesa-libGL-devel dejavu-fonts $([ "$TESTS" = 1 ] && echo gtest)
   else echo "warning: no supported package manager; install meson, ninja, g++, pkg-config and the SDL2, FreeType and fontconfig development files yourself." >&2; fi
   [ "$DRY" = 1 ] || need_deps || { echo "error: build requirements are still missing (see above)." >&2; exit 1; }
 fi
@@ -100,7 +102,7 @@ if [ "$DRY" = 1 ]; then
   [ "$PGO" != no ] && echo "[dry run] then scripts/build-pgo.sh --prefix $PREFIX (instrumented build, training run, optimised build)"
 else
   if [ "$TESTS" = 1 ] || [ "$PGO" = no ] || { [ -z "${DISPLAY:-}" ] && ! command -v xvfb-run >/dev/null 2>&1; }; then
-    meson setup build --prefix "$PREFIX" --buildtype release --reconfigure >/dev/null 2>&1 || meson setup build --prefix "$PREFIX" --buildtype release >/dev/null
+    meson setup build --prefix "$PREFIX" --buildtype release --reconfigure >/dev/null 2>&1 || quiet meson setup build --prefix "$PREFIX" --buildtype release
     ninja -C build
     if [ "$TESTS" = 1 ]; then meson test -C build; fi
   fi
@@ -113,7 +115,7 @@ else
     else
       echo "  warning: the profile-guided build failed; falling back to the normal build" >&2
       [ "$PGO" = yes ] && exit 1
-      meson setup build --prefix "$PREFIX" --buildtype release --reconfigure >/dev/null 2>&1 || meson setup build --prefix "$PREFIX" --buildtype release >/dev/null
+      meson setup build --prefix "$PREFIX" --buildtype release --reconfigure >/dev/null 2>&1 || quiet meson setup build --prefix "$PREFIX" --buildtype release
       ninja -C build
     fi
   fi
