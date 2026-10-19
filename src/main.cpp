@@ -385,7 +385,7 @@ struct Ed {
     bool pinned = true, side_open = true, root_open = true, opened_open = true, outline_open = true;
     std::unordered_map<std::string, char> deco;        /* absolute path -> git status letter, for file and folder rows in the Explorer */
     bool outline_on = false;
-    bool preview_tabs = true, hot_reload = true, compact_folders = true, show_hud = true;   /* Settings page */
+    bool preview_tabs = true, hot_reload = true, compact_folders = true, show_hud = true, show_sys = true;   /* Settings page */
     std::string lint_ignore;                           /* check codes left out of the live checks, space separated */
     bool lint_on = true;                               /* live checks (src/lint.cpp), View > Live Checks */
     double lint_at = 0;                                /* when a pending re-check is due */                           /* Explorer shows the symbols of the active file (View > Outline, off by default) */
@@ -564,6 +564,7 @@ void settings_load() {
         else if (!strcmp(line, "preview_tabs")) E.preview_tabs = atoi(v) != 0;
         else if (!strcmp(line, "hot_reload")) E.hot_reload = atoi(v) != 0;
         else if (!strcmp(line, "show_hud")) E.show_hud = atoi(v) != 0;
+        else if (!strcmp(line, "show_sys")) E.show_sys = atoi(v) != 0;
         else if (!strcmp(line, "compact_folders")) { E.compact_folders = atoi(v) != 0; Tree::set_compact(E.compact_folders); }
         else if (!strcmp(line, "vim_keys")) E.vim_on = atoi(v) != 0;
         else if (!strcmp(line, "git_tree")) E.g.tree_view = atoi(v) != 0;
@@ -581,7 +582,7 @@ void settings_save() {
     FILE *f = fopen(p.c_str(), "w");
     if (!f) return;
     fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : E.view == V_REMOTE ? "remote" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
-    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\nlint_ignore=%s\npreview_tabs=%d\nhot_reload=%d\ncompact_folders=%d\nshow_hud=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0, E.lint_ignore.c_str(), E.preview_tabs ? 1 : 0, E.hot_reload ? 1 : 0, E.compact_folders ? 1 : 0, E.show_hud ? 1 : 0);
+    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\nlint_ignore=%s\npreview_tabs=%d\nhot_reload=%d\ncompact_folders=%d\nshow_hud=%d\nshow_sys=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0, E.lint_ignore.c_str(), E.preview_tabs ? 1 : 0, E.hot_reload ? 1 : 0, E.compact_folders ? 1 : 0, E.show_hud ? 1 : 0, E.show_sys ? 1 : 0);
     fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0);
     fclose(f);
 }
@@ -5438,7 +5439,8 @@ std::vector<SetItem> &set_items() {
     choice("Appearance", "Color theme", "The colours of the editor and its chrome. Follow fleetwm takes them from the fleetwm theme.", [] { return E.follow_fleet ? std::string("Follow fleetwm") : std::string(E.theme ? E.theme->name : ""); }, [] { open_picker(PICK_THEME); });
     toggle("Appearance", "Follow the fleetwm theme", "Take the colours from the fleetwm compositor's theme file and follow it when it changes.", [] { return E.follow_fleet; },
            [] { if (E.follow_fleet) { E.follow_fleet = false; } else if (E.fleet.found || (fleetwm_read(&E.fleet), E.fleet.found)) { E.follow_fleet = true; follow_fleetwm(); } else E.status_msg = "fleetwm theme file not found"; settings_save(); });
-    toggle("Appearance", "Timing and memory in the status bar", "How long the last operation took, frames per second, CPU and memory, at the left of the status bar.", [] { return E.show_hud; }, [] { E.show_hud = !E.show_hud; settings_save(); });
+    toggle("Appearance", "Timing in the status bar", "How long the last operation took, at the left of the status bar.", [] { return E.show_hud; }, [] { E.show_hud = !E.show_hud; settings_save(); });
+    toggle("Appearance", "CPU, memory and cache statistics in the status bar", "Frames per second, CPU use, memory, and row and glyph cache hit rates, the same numbers as the Lestrix bar. Ctrl+Shift+I lists them in full.", [] { return E.show_sys; }, [] { E.show_sys = !E.show_sys; settings_save(); });
     toggle("Editor", "Vim keys", "Modal editing: normal, insert, visual and block modes, operators, text objects, macros, :s, :g and a command line at the bottom.", [] { return E.vim_on; }, [] { do_action(A_VIM); });
     toggle("Editor", "Live checks", "Look for common mistakes while you type: Ansible, Kubernetes, YAML, JSON, shell, Python, C and more. Underlines, the problem list (Ctrl+Shift+M), F8, quick fixes (Ctrl+.).", [] { return E.lint_on; }, [] { do_action(A_LINT); });
     text("Editor", "Ignored check codes", "Codes of live checks to leave out, separated by spaces, for example: trailing-whitespace name[casing] shell-no-set-e.", [] { return E.lint_ignore.empty() ? std::string("none") : E.lint_ignore; },
@@ -5459,7 +5461,7 @@ std::vector<SetItem> &set_items() {
         dlg_show("Reset all settings?", "Every setting on this page goes back to its default. Your files and connections are not touched.", {"Reset", "Cancel"}, [](int b, const std::string &) {
             if (b != 0) return;
             E.vim_on = false; E.lint_on = true; E.lint_ignore.clear(); E.preview_tabs = true; E.hot_reload = true; E.outline_on = false; E.compact_folders = true; Tree::set_compact(true); E.tree.refresh();
-            E.show_hud = true; E.g.smart_commit = 0; E.g.sync_confirm = true; E.g.tree_view = false; E.term_choice = "builtin"; E.pinned = true; vim_reset(); for (auto &kv : g_lint) kv.second.rev = ~0ull;
+            E.show_hud = true; E.show_sys = true; E.g.smart_commit = 0; E.g.sync_confirm = true; E.g.tree_view = false; E.term_choice = "builtin"; E.pinned = true; vim_reset(); for (auto &kv : g_lint) kv.second.rev = ~0ull;
             settings_save(); E.status_msg = "settings reset";
         });
     });
@@ -5979,7 +5981,8 @@ void build_frame() {
             }
         }
         std::string last = E.ops.empty() ? std::string() : (E.ops.back().brief.empty() ? E.ops.back().name : E.ops.back().brief) + "  " + fmt_ms(E.ops.back().ms);
-        std::string left = E.status_msg.empty() ? (!E.show_hud ? std::string() : last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
+        std::string tm = E.show_hud ? last : std::string(), sys = E.show_sys ? std::string(E.hud) : std::string();
+        std::string left = E.status_msg.empty() ? (tm.empty() ? sys : sys.empty() ? tm : tm + "   |   " + sys) : E.status_msg;
         if (vim_active() && !d.dv && !d.mv) {
             std::string vl = g_vim.label();
             float vw = draw_text(E.ui, lx, sy, vl.c_str(), g_vim.typing() ? C_GREEN : C_ACCENT, std::max(0.f, rx - lx), FS_BOLD);
@@ -6309,7 +6312,7 @@ void hud_tick() {
     fmt_count((double)(d.row_recycle + d.glyph_recycle), rc, sizeof rc);
     snprintf(E.hud, sizeof E.hud, "fps %.0f  cpu %.0f%% (%ld)  mem %s  cache rows %s glyphs %s recyc %s", fps, cpu,
              sysconf(_SC_NPROCESSORS_ONLN), fmt_mb((double)proc_rss_kb() * 1024).c_str(), rp, gp, rc);
-    if (strcmp(E.hud, E.hud_last) != 0) { memcpy(E.hud_last, E.hud, sizeof E.hud); redraw(); }
+    if (strcmp(E.hud, E.hud_last) != 0) { memcpy(E.hud_last, E.hud, sizeof E.hud); if (E.show_sys) redraw(); }
 }
 
 /* ---- window ---- */
