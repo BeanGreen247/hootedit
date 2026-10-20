@@ -325,7 +325,7 @@ struct Ed {
         FdKind kind = FD_OPEN_FILE;
         std::string dir, filter, name, msg;
         std::vector<FdEntry> all;
-        int sel = 0, scroll = 0;
+        int sel = 0, scroll = 0, sel_seen = -1;   /* sel_seen: the selection the view last followed, so the mouse wheel can scroll away from it */
         bool hidden = false, name_focus = false, overwrite_armed = false, picked = false;   /* picked: the user chose a row (arrow keys or click), not just the default */
     } fd;
     const UiTheme *theme = nullptr;
@@ -439,7 +439,7 @@ Doc &D() { return *E.docs[(size_t)E.active]; }
 /* what is known about one open file's relation to git: the HEAD text and the changed line ranges (gutter bars), and blame */
 struct GutterCache {
     uint64_t rev = ~0ull;                          /* buffer revision the hunks were computed for */
-    bool base_stale = true, computed = false, tracked_ok = false;
+    bool base_stale = true, computed = false, tracked_ok = false, ignored = false;   /* ignored: matched by .gitignore and not tracked, so no change bars (as in VS Code) */
     std::vector<std::string> base_lines;
     std::unordered_map<std::string, int> ids;      /* line text -> id, over the HEAD text */
     std::vector<DiffHunk> hunks;                   /* HEAD lines against the buffer's lines */
@@ -756,12 +756,26 @@ void open_path(const std::string &path, bool preview = false) {   /* preview: a 
     set_active((int)E.docs.size() - 1);
 }
 
+double g_t_start = 0;                 /* when the process began */
+double g_startup_s = 0, g_open_s = 0;   /* seconds until the first frame was drawn; seconds the last folder open took (tree and git), shown on the start screen */
+
+std::string fmt_duration(double s) {
+    char b[32];
+    if (s < 0.001) snprintf(b, sizeof b, "%.0f \xC2\xB5s", s * 1e6);
+    else if (s < 1.0) snprintf(b, sizeof b, "%.1f ms", s * 1e3);
+    else snprintf(b, sizeof b, "%.2f s", s);
+    return b;
+}
+
 void set_workspace(const std::string &dir, bool async_git = false) {
+    double t_open = now_s();
     char real[4096];
     std::string d = realpath(dir.c_str(), real) ? real : dir;
     E.tree.set_root(d);
     E.side_scroll = 0;
+    if (E.pinned) E.side_open = true;   /* a bare launch starts with the sidebar hidden; opening a folder brings it in */
     if (async_git) git_refresh_async(); else git_refresh();
+    g_open_s = now_s() - t_open;
 }
 
 /* ---- diff tabs: both sides come from git (a revision, the index) or from the file on disk ---- */
@@ -2861,13 +2875,16 @@ GutterCache *gutter_for(Doc &d) {
     if (rel.empty()) return nullptr;
     GutterCache &c = g_gutter[&d];
     if (c.base_stale) {
-        std::string base = git_show(E.git.root, "HEAD", rel);
+        std::string unused;
+        c.ignored = git_exec(E.git.root, "check-ignore -q -- " + git_quote(rel), &unused) == 0;   /* 0: ignored; tracked files are never reported */
+        std::string base = c.ignored ? std::string() : git_show(E.git.root, "HEAD", rel);
         diff_split_lines(base, c.base_lines);
         c.ids.clear();
         for (const std::string &l : c.base_lines) c.ids.emplace(l, (int)c.ids.size());
         c.base_stale = false;
         c.computed = false;
     }
+    if (c.ignored) return nullptr;
     if (!c.computed || c.rev != d.buf.revision()) {
         size_t nl = d.buf.lines();
         if (nl > 1 && d.buf.line_len(nl - 1) == 0) nl--;   /* the empty line after the final newline is not a line of text */
@@ -5710,7 +5727,10 @@ void build_frame() {
         float cxm = ex + ew / 2, areah = (float)(L.ed_bottom - L.text_y);
         int ls = (int)std::max((float)S(96), std::min((float)S(200), std::min(ew, areah) * 0.34f)) / 16 * 16;   /* multiples of 16 px: a resize makes a few sizes, not hundreds */
         float gap1 = (float)S(24), gap2 = (float)S(16), nameh = (float)S(36), hinth = (float)S(18);
-        float total = (float)ls + gap1 + nameh + gap2 + hinth;
+        std::string timing = g_startup_s > 0 ? "started in " + fmt_duration(g_startup_s) : std::string();
+        if (g_open_s > 0) timing += (timing.empty() ? "" : "   ") + std::string("folder opened in ") + fmt_duration(g_open_s);
+        float gap3 = (float)S(10), timh = timing.empty() ? 0.f : (float)S(18) + gap3;
+        float total = (float)ls + gap1 + nameh + gap2 + hinth + timh;
         float y0 = (float)L.text_y + std::max(0.f, (areah - total) / 2) - (float)S(10);
         uint32_t wm = ui_mix(C_EDITOR, C_UI, 0.09f), wm_eyes = ui_mix(C_EDITOR, C_ACCENT, 0.34f);
         draw_icon(IC_LOGO_BODY, cxm - (float)ls / 2, y0, ls, wm);
@@ -5718,6 +5738,7 @@ void build_frame() {
         float w = text_width(E.big, name);
         draw_text(E.big, cxm - w / 2, y0 + (float)ls + gap1 + nameh - (float)S(8), name, wm, (float)E.W);
         draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, y0 + (float)ls + gap1 + nameh + gap2 + (float)S(13), hint, C_UI_FAINT, ew);
+        if (!timing.empty()) draw_text(E.ui, cxm - text_width(E.ui, timing.c_str()) / 2, y0 + (float)ls + gap1 + nameh + gap2 + hinth + gap3 + (float)S(13), timing.c_str(), C_UI_FAINT, ew);
     } else if (d.dv) {
         draw_diff(L, ex, ew);
     } else if (d.mv) {
@@ -6235,8 +6256,11 @@ void build_frame() {
         std::vector<int> view = fd_view();
         int n = (int)view.size(), maxrows = std::max(1, (int)(lh / rowh2));
         E.fd.sel = std::max(0, std::min(E.fd.sel, std::max(0, n - 1)));
-        if (E.fd.sel < E.fd.scroll) E.fd.scroll = E.fd.sel;
-        if (E.fd.sel >= E.fd.scroll + maxrows) E.fd.scroll = E.fd.sel - maxrows + 1;
+        if (E.fd.sel != E.fd.sel_seen) {
+            if (E.fd.sel < E.fd.scroll) E.fd.scroll = E.fd.sel;
+            if (E.fd.sel >= E.fd.scroll + maxrows) E.fd.scroll = E.fd.sel - maxrows + 1;
+            E.fd.sel_seen = E.fd.sel;
+        }
         E.fd.scroll = std::max(0, std::min(E.fd.scroll, std::max(0, n - maxrows)));
         r_rect(E.r, ix, y, iw, lh, C_EDITOR);
         r_clip(E.r, (int)ix, (int)y, (int)iw, (int)lh);
@@ -6894,6 +6918,7 @@ void fd_load(const std::string &dir0) {
     E.fd.dir = dir;
     E.fd.all.clear();
     E.fd.sel = E.fd.scroll = 0;
+    E.fd.sel_seen = -1;
     E.fd.picked = false;
     if (dir != "/") E.fd.all.push_back({"..", true});
     std::vector<Ed::FdEntry> v;
@@ -8564,7 +8589,6 @@ void vim_init() {
     vim_reset();
 }
 
-static double g_t_start = 0;
 static void startup_mark(const char *what) {   /* HOOTEDIT_TRACE=1 prints where start-up time goes */
     static const bool on = getenv("HOOTEDIT_TRACE") != nullptr;
     if (on) fprintf(stderr, "[start] %6.1f ms  %s\n", (now_s() - g_t_start) * 1000.0, what);
@@ -8620,6 +8644,7 @@ int main(int argc, char **argv) {
         }
     }
     if (E.docs.empty()) new_doc();
+    bool bare_launch = workspace.empty() && args.empty();   /* nothing to open: no folder is read until the user opens one */
     if (workspace.empty()) { char cwd[1024]; workspace = getcwd(cwd, sizeof cwd) ? cwd : "."; }
     signal(SIGUSR1, on_usr1);
     /* the window class is what a panel uses to match a window to its menu entry and icon; a terminal that exports its own SDL class (Lestrix does) would
@@ -8661,9 +8686,9 @@ int main(int argc, char **argv) {
     if (E.follow_fleet) follow_fleetwm();
     startup_mark("terminal engine, theme");
     SDL_StartTextInput();
-    set_workspace(workspace, !script);   /* git status on a thread, so the first frame does not wait for it (scripts want it done) */
+    if (!bare_launch) set_workspace(workspace, !script);   /* git status on a thread, so the first frame does not wait for it (scripts want it done) */
     startup_mark("workspace (tree + git)");
-    E.side_open = true;
+    E.side_open = !bare_launch;
     set_active(0);
 
     E.now = now_s();
@@ -8673,6 +8698,7 @@ int main(int argc, char **argv) {
     build_frame();   /* the first frame: it also gives clicks and menus their hit boxes */
     r_end(E.r);
     SDL_GL_SwapWindow(E.win);
+    g_startup_s = now_s() - g_t_start;
     startup_mark("first frame drawn");
     SDL_ShowWindow(E.win);   /* only now: the window appears with the editor in it */
     startup_mark("window shown");
