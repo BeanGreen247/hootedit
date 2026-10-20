@@ -76,6 +76,40 @@ TEST(Doc, RandomEditsAndFullUndoRedoWalkAgainstAStringModel) {
     }
 }
 
+/* the column of a byte in a line (tabs to a multiple of 4, one column per UTF-8 character) against a plain reference, on lines of many sizes
+ * (short ones and ones past the 256-byte stack buffer), in a document that has been edited so its text spans several pieces */
+TEST(Doc, ColumnOfByteAgainstAReference) {
+    Doc x;
+    std::string model;
+    const char *bits[] = {"a", "b", "\t", "\xC3\xA9", "\xE2\x82\xAC", "\xF0\x9F\x98\x80", " ", "\n"};
+    for (int i = 0; i < 400; i++) {
+        std::string ins;
+        for (unsigned k = 0, n = 1 + rnd() % 80; k < n; k++) ins += bits[rnd() % (rnd() % 9 == 0 ? 8 : 7)];   /* mostly no newline, so some lines pass 256 bytes */
+        size_t pos = model.empty() ? 0 : rnd() % (model.size() + 1);
+        while (pos < model.size() && ((unsigned char)model[pos] & 0xC0) == 0x80) pos++;   /* keep the UTF-8 characters whole */
+        x.break_group();
+        x.replace(pos, 0, ins.data(), ins.size());
+        model.insert(pos, ins);
+    }
+    ASSERT_EQ(all(x), model);
+    size_t ls = 0, line = 0;
+    while (ls <= model.size()) {
+        size_t nl = model.find('\n', ls), le = nl == std::string::npos ? model.size() : nl;
+        for (size_t byte : {(size_t)0, (size_t)1, (size_t)(le - ls) / 2, (size_t)(le - ls), (size_t)(le - ls) + 5}) {
+            int col = 0;
+            for (size_t i = 0; i < le - ls && i < byte;) {
+                unsigned char c = (unsigned char)model[ls + i];
+                col = c == '\t' ? (col / 4 + 1) * 4 : col + 1;
+                i += c < 0x80 ? 1 : c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1;
+            }
+            ASSERT_EQ(x.col_of_byte(line, byte), col) << "line " << line << " byte " << byte;
+        }
+        if (nl == std::string::npos) break;
+        ls = nl + 1;
+        line++;
+    }
+}
+
 TEST(Doc, ReloadFromDiskReplacesOnlyWhatDiffers) {
     char path[] = "/tmp/hootedit-reload-XXXXXX";
     int fd = mkstemp(path);

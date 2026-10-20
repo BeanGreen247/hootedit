@@ -257,10 +257,18 @@ size_t Doc::next_char(size_t pos) const {
 }
 
 int Doc::col_of_byte(size_t line, size_t byte) const {
-    std::string t;
-    buf.line_text(line, t);
+    size_t n = std::min(byte, buf.line_len(line));   /* only the bytes before `byte` matter: a character that starts earlier is read from its first byte */
+    char stack[256];
+    std::string big;
+    const char *t = stack;
+    if (n <= sizeof stack) {
+        if (n) buf.copy_to(buf.line_start(line), n, stack);
+    } else {
+        buf.copy(buf.line_start(line), n, big);
+        t = big.data();
+    }
     int col = 0;
-    for (size_t i = 0; i < t.size() && i < byte;) {
+    for (size_t i = 0; i < n;) {
         unsigned char c = (unsigned char)t[i];
         size_t a = c < 0x80 ? 1 : c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1;
         col = c == '\t' ? (col / 4 + 1) * 4 : col + 1;
