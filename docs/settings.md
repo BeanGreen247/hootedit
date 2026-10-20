@@ -4,7 +4,7 @@ The cog at the top right (always there) or at the foot of the sidebar rail, File
 
 | category | settings |
 |---|---|
-| Appearance | colour theme, follow the fleetwm theme, timing and memory in the status bar |
+| Appearance | colour theme, follow the fleetwm theme, timing in the status bar, CPU, memory and cache statistics in the status bar |
 | Editor | vim keys, live checks, ignored check codes, preview tabs, reload files changed on disk |
 | Explorer | outline, pin the sidebar, compact folders |
 | Source Control | what to do when committing with nothing staged, ask before Sync Changes, show changes as a tree |

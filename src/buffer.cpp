@@ -86,7 +86,7 @@ bool Buffer::open(const char *path) {
             register_map(orig_, orig_len_);
         }
         flat_rev_ = ~0ull;
-        pieces_.push_back({0, 0, orig_len_});
+        pieces_.insert(pieces_.end(), Piece(false, 0, orig_len_));
         size_ = orig_len_;
         std::vector<size_t> starts = {0};
         starts.reserve(orig_len_ / 40 + 16);
@@ -105,7 +105,8 @@ bool Buffer::save(const char *path) {
     struct stat old;
     if (stat(path, &old) == 0) fchmod(fd, old.st_mode & 07777);
     bool ok = true;
-    for (const Piece &p : pieces_) {
+    for (PieceList::Cur it = pieces_.begin(); !pieces_.at_end(it); it = pieces_.next(it)) {
+        const Piece &p = pieces_.get(it);
         const char *d = base(p);
         size_t left = p.len;
         while (left && ok) {
@@ -131,24 +132,26 @@ size_t Buffer::line_of(size_t pos) const {
     return idx_.line_of(pos);
 }
 
-size_t Buffer::find(size_t pos, size_t *within) const {
-    size_t i = 0;
-    for (; i < pieces_.size(); i++) {
-        if (pos < pieces_[i].len) break;
-        pos -= pieces_[i].len;
-    }
-    *within = pos;
-    return i;
-}
-
 void Buffer::copy(size_t pos, size_t len, std::string &out) const {
     out.clear();
     if (pos >= size_) return;
     if (len > size_ - pos) len = size_ - pos;
     size_t in;
-    for (size_t i = find(pos, &in); i < pieces_.size() && len; i++, in = 0) {
-        size_t n = std::min(len, pieces_[i].len - in);
-        out.append(base(pieces_[i]) + in, n);
+    for (PieceList::Cur it = pieces_.locate(pos, &in); !pieces_.at_end(it) && len; it = pieces_.next(it), in = 0) {
+        const Piece &p = pieces_.get(it);
+        size_t n = std::min(len, p.len - in);
+        out.append(base(p) + in, n);
+        len -= n;
+    }
+}
+
+void Buffer::copy_to(size_t pos, size_t len, char *out) const {
+    size_t in;
+    for (PieceList::Cur it = pieces_.locate(pos, &in); !pieces_.at_end(it) && len; it = pieces_.next(it), in = 0) {
+        const Piece &p = pieces_.get(it);
+        size_t n = std::min(len, p.len - in);
+        memcpy(out, base(p) + in, n);
+        out += n;
         len -= n;
     }
 }
@@ -156,7 +159,8 @@ void Buffer::copy(size_t pos, size_t len, std::string &out) const {
 const char *Buffer::flat(size_t *n) const {
     *n = size_;
     if (size_ == 0) return "";
-    if (pieces_.size() == 1 && !pieces_[0].add && pieces_[0].off == 0 && pieces_[0].len == size_) return orig_;
+    Piece only;
+    if (pieces_.only(&only) && !only.add() && only.off() == 0 && only.len == size_) return orig_;
     if (flat_rev_ != rev_) { copy(0, size_, flat_); flat_rev_ = rev_; }
     return flat_.data();
 }
@@ -166,18 +170,20 @@ void Buffer::insert(size_t pos, const char *s, size_t n) {
     if (pos > size_) pos = size_;
     size_t at = add_.size();
     add_.append(s, n);
-    size_t in, i = find(pos, &in);
-    Piece np = {1, at, n};
-    if (i == pieces_.size()) {
-        if (!pieces_.empty() && pieces_.back().add && pieces_.back().off + pieces_.back().len == at) pieces_.back().len += n;
-        else pieces_.push_back(np);
+    size_t in;
+    PieceList::Cur cur = pieces_.locate(pos, &in), prev;
+    Piece np(true, at, n);
+    if (pieces_.at_end(cur)) {
+        if (pieces_.prev(cur, &prev) && pieces_.get(prev).add() && pieces_.get(prev).off() + pieces_.get(prev).len == at) pieces_.set_len(prev, pieces_.get(prev).len + n);
+        else pieces_.insert(cur, np);
     } else if (in == 0) {
-        if (i > 0 && pieces_[i - 1].add && pieces_[i - 1].off + pieces_[i - 1].len == at) pieces_[i - 1].len += n;
-        else pieces_.insert(pieces_.begin() + (long)i, np);
+        if (pieces_.prev(cur, &prev) && pieces_.get(prev).add() && pieces_.get(prev).off() + pieces_.get(prev).len == at) pieces_.set_len(prev, pieces_.get(prev).len + n);
+        else pieces_.insert(cur, np);
     } else {
-        Piece right = {pieces_[i].add, pieces_[i].off + in, pieces_[i].len - in};
-        pieces_[i].len = in;
-        pieces_.insert(pieces_.begin() + (long)i + 1, {np, right});
+        Piece right(pieces_.get(cur).add(), pieces_.get(cur).off() + in, pieces_.get(cur).len - in);
+        pieces_.set_len(cur, in);
+        PieceList::Cur at_right = pieces_.insert(pieces_.next(cur), right);
+        pieces_.insert(at_right, np);   /* before the right half */
     }
     /* line index: starts after pos shift by n, plus one start per newline inside the new text */
     size_t first = line_of(pos) + 1;
@@ -198,18 +204,24 @@ void Buffer::erase(size_t pos, size_t n) {
     if (gone_to > gone_from) idx_.erase(gone_from, gone_to);
     idx_.shift_from(gone_from, (size_t)0 - n);
 
-    size_t in, i = find(pos, &in);
-    size_t left = n, k = i, skip = in;
+    size_t in;
+    PieceList::Cur first = pieces_.locate(pos, &in), it = first;
+    size_t left = n, skip = in, touched = 0;
     Piece keep[2];                                              /* what is left of the first and the last piece touched */
     int nk = 0;
-    if (in > 0) { keep[nk] = pieces_[i]; keep[nk++].len = in; }
-    while (k < pieces_.size() && left) {
-        size_t avail = pieces_[k].len - skip;
-        if (avail > left) { keep[nk++] = {pieces_[k].add, pieces_[k].off + skip + left, avail - left}; left = 0; k++; break; }
-        left -= avail; skip = 0; k++;
+    if (in > 0) keep[nk++] = Piece(pieces_.get(first).add(), pieces_.get(first).off(), in);
+    while (!pieces_.at_end(it) && left) {
+        const Piece &p = pieces_.get(it);
+        size_t avail = p.len - skip;
+        touched++;
+        if (avail > left) { keep[nk++] = Piece(p.add(), p.off() + skip + left, avail - left); left = 0; break; }
+        left -= avail; skip = 0; it = pieces_.next(it);
     }
-    pieces_.erase(pieces_.begin() + (long)i, pieces_.begin() + (long)k);   /* in place: no copy of the whole piece list per backspace */
-    if (nk) pieces_.insert(pieces_.begin() + (long)i, keep, keep + nk);
+    pieces_.erase(first, touched);   /* the pieces after the cut slide into place, one chunk at most */
+    if (nk) {
+        PieceList::Cur at = pieces_.insert(first, keep[0]);
+        if (nk == 2) pieces_.insert(pieces_.next(at), keep[1]);
+    }
     size_ -= n;
     rev_++;
 }

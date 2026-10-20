@@ -1,6 +1,7 @@
 /* The built-in checks: Ansible rules, YAML, JSON, shell, Python, C, JavaScript, Dockerfile, Makefile, generic ones, fixes, noqa. */
 #include <stdio.h>
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <string.h>
 #include <string>
@@ -284,6 +285,7 @@ TEST(Lint, KubernetesEveryFieldIsCheckedAgainstTheApiST) {
 TEST(Lint, CustomResourcesAgainstTheirCrd) {
    // custom resources against their CRD
         const char *crd = "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n  versions:\n    - name: v1\n      served: true\n      storage: true\n      schema:\n        openAPIV3Schema:\n          type: object\n          properties:\n            spec:\n              type: object\n              required: [size]\n              properties:\n                size:\n                  type: integer\n                color:\n                  type: string\n                  enum: [red, blue]\n                tags:\n                  type: array\n                  items:\n                    type: string\n";
+        mkdir("/tmp/hootedit_lint_test", 0755);   /* the test writes its CRD here and must not depend on an earlier test or run having made the folder */
         std::string path = "/tmp/hootedit_lint_test/widget_crd.yaml";
         FILE *f = fopen(path.c_str(), "w");
         if (f) { fputs(crd, f); fclose(f); }

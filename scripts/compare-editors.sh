@@ -31,7 +31,7 @@ T="$(mktemp -d /tmp/hootedit_cmp_XXXXXX)"
 XPIDS=()
 cleanup() { for p in "${XPIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; rm -rf "$T"; }
 trap cleanup EXIT
-gcc -O2 "$SRC/tools/xlatency.c" -o "$T/xlatency" $(pkg-config --cflags --libs x11 xtst xext) || exit 1
+gcc -O3 "$SRC/tools/xlatency.c" -o "$T/xlatency" $(pkg-config --cflags --libs x11 xtst xext) || exit 1
 : > "$T/empty.txt"
 mkdir -p "$T/ans/roles/web/tasks"
 PLAY="$T/ans/roles/web/tasks/main.yml"   # a realistic role: named and unnamed tasks, short module names, quoted and unquoted modes

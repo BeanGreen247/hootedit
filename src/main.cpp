@@ -325,7 +325,7 @@ struct Ed {
         FdKind kind = FD_OPEN_FILE;
         std::string dir, filter, name, msg;
         std::vector<FdEntry> all;
-        int sel = 0, scroll = 0;
+        int sel = 0, scroll = 0, sel_seen = -1;   /* sel_seen: the selection the view last followed, so the mouse wheel can scroll away from it */
         bool hidden = false, name_focus = false, overwrite_armed = false, picked = false;   /* picked: the user chose a row (arrow keys or click), not just the default */
     } fd;
     const UiTheme *theme = nullptr;
@@ -385,7 +385,7 @@ struct Ed {
     bool pinned = true, side_open = true, root_open = true, opened_open = true, outline_open = true;
     std::unordered_map<std::string, char> deco;        /* absolute path -> git status letter, for file and folder rows in the Explorer */
     bool outline_on = false;
-    bool preview_tabs = true, hot_reload = true, compact_folders = true, show_hud = true;   /* Settings page */
+    bool preview_tabs = true, hot_reload = true, compact_folders = true, show_hud = true, show_sys = true;   /* Settings page */
     std::string lint_ignore;                           /* check codes left out of the live checks, space separated */
     bool lint_on = true;                               /* live checks (src/lint.cpp), View > Live Checks */
     double lint_at = 0;                                /* when a pending re-check is due */                           /* Explorer shows the symbols of the active file (View > Outline, off by default) */
@@ -439,7 +439,7 @@ Doc &D() { return *E.docs[(size_t)E.active]; }
 /* what is known about one open file's relation to git: the HEAD text and the changed line ranges (gutter bars), and blame */
 struct GutterCache {
     uint64_t rev = ~0ull;                          /* buffer revision the hunks were computed for */
-    bool base_stale = true, computed = false, tracked_ok = false;
+    bool base_stale = true, computed = false, tracked_ok = false, ignored = false;   /* ignored: matched by .gitignore and not tracked, so no change bars (as in VS Code) */
     std::vector<std::string> base_lines;
     std::unordered_map<std::string, int> ids;      /* line text -> id, over the HEAD text */
     std::vector<DiffHunk> hunks;                   /* HEAD lines against the buffer's lines */
@@ -564,6 +564,7 @@ void settings_load() {
         else if (!strcmp(line, "preview_tabs")) E.preview_tabs = atoi(v) != 0;
         else if (!strcmp(line, "hot_reload")) E.hot_reload = atoi(v) != 0;
         else if (!strcmp(line, "show_hud")) E.show_hud = atoi(v) != 0;
+        else if (!strcmp(line, "show_sys")) E.show_sys = atoi(v) != 0;
         else if (!strcmp(line, "compact_folders")) { E.compact_folders = atoi(v) != 0; Tree::set_compact(E.compact_folders); }
         else if (!strcmp(line, "vim_keys")) E.vim_on = atoi(v) != 0;
         else if (!strcmp(line, "git_tree")) E.g.tree_view = atoi(v) != 0;
@@ -581,7 +582,7 @@ void settings_save() {
     FILE *f = fopen(p.c_str(), "w");
     if (!f) return;
     fprintf(f, "sidebar_pinned=%d\nsidebar_view=%s\ntheme=%s\nfollow_fleetwm=%d\nterminal=%s\npanel_height=%d\n", E.pinned ? 1 : 0, E.view == V_GIT ? "git" : E.view == V_SEARCH ? "search" : E.view == V_REMOTE ? "remote" : "explorer", E.theme ? E.theme->name : "Xylonic Dark", E.follow_fleet ? 1 : 0, E.term_choice.c_str(), E.panel_logical);
-    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\nlint_ignore=%s\npreview_tabs=%d\nhot_reload=%d\ncompact_folders=%d\nshow_hud=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0, E.lint_ignore.c_str(), E.preview_tabs ? 1 : 0, E.hot_reload ? 1 : 0, E.compact_folders ? 1 : 0, E.show_hud ? 1 : 0);
+    fprintf(f, "outline=%d\nvim_keys=%d\nlint=%d\nlint_ignore=%s\npreview_tabs=%d\nhot_reload=%d\ncompact_folders=%d\nshow_hud=%d\nshow_sys=%d\n", E.outline_on ? 1 : 0, E.vim_on ? 1 : 0, E.lint_on ? 1 : 0, E.lint_ignore.c_str(), E.preview_tabs ? 1 : 0, E.hot_reload ? 1 : 0, E.compact_folders ? 1 : 0, E.show_hud ? 1 : 0, E.show_sys ? 1 : 0);
     fprintf(f, "git_smart_commit=%d\ngit_sync_confirm=%d\ngit_tree=%d\n", E.g.smart_commit, E.g.sync_confirm ? 1 : 0, E.g.tree_view ? 1 : 0);
     fclose(f);
 }
@@ -755,12 +756,26 @@ void open_path(const std::string &path, bool preview = false) {   /* preview: a 
     set_active((int)E.docs.size() - 1);
 }
 
+double g_t_start = 0;                 /* when the process began */
+double g_startup_s = 0, g_open_s = 0;   /* seconds until the first frame was drawn; seconds the last folder open took (tree and git), shown on the start screen */
+
+std::string fmt_duration(double s) {
+    char b[32];
+    if (s < 0.001) snprintf(b, sizeof b, "%.0f \xC2\xB5s", s * 1e6);
+    else if (s < 1.0) snprintf(b, sizeof b, "%.1f ms", s * 1e3);
+    else snprintf(b, sizeof b, "%.2f s", s);
+    return b;
+}
+
 void set_workspace(const std::string &dir, bool async_git = false) {
+    double t_open = now_s();
     char real[4096];
     std::string d = realpath(dir.c_str(), real) ? real : dir;
     E.tree.set_root(d);
     E.side_scroll = 0;
+    if (E.pinned) E.side_open = true;   /* a bare launch starts with the sidebar hidden; opening a folder brings it in */
     if (async_git) git_refresh_async(); else git_refresh();
+    g_open_s = now_s() - t_open;
 }
 
 /* ---- diff tabs: both sides come from git (a revision, the index) or from the file on disk ---- */
@@ -2860,13 +2875,16 @@ GutterCache *gutter_for(Doc &d) {
     if (rel.empty()) return nullptr;
     GutterCache &c = g_gutter[&d];
     if (c.base_stale) {
-        std::string base = git_show(E.git.root, "HEAD", rel);
+        std::string unused;
+        c.ignored = git_exec(E.git.root, "check-ignore -q -- " + git_quote(rel), &unused) == 0;   /* 0: ignored; tracked files are never reported */
+        std::string base = c.ignored ? std::string() : git_show(E.git.root, "HEAD", rel);
         diff_split_lines(base, c.base_lines);
         c.ids.clear();
         for (const std::string &l : c.base_lines) c.ids.emplace(l, (int)c.ids.size());
         c.base_stale = false;
         c.computed = false;
     }
+    if (c.ignored) return nullptr;
     if (!c.computed || c.rev != d.buf.revision()) {
         size_t nl = d.buf.lines();
         if (nl > 1 && d.buf.line_len(nl - 1) == 0) nl--;   /* the empty line after the final newline is not a line of text */
@@ -5438,7 +5456,8 @@ std::vector<SetItem> &set_items() {
     choice("Appearance", "Color theme", "The colours of the editor and its chrome. Follow fleetwm takes them from the fleetwm theme.", [] { return E.follow_fleet ? std::string("Follow fleetwm") : std::string(E.theme ? E.theme->name : ""); }, [] { open_picker(PICK_THEME); });
     toggle("Appearance", "Follow the fleetwm theme", "Take the colours from the fleetwm compositor's theme file and follow it when it changes.", [] { return E.follow_fleet; },
            [] { if (E.follow_fleet) { E.follow_fleet = false; } else if (E.fleet.found || (fleetwm_read(&E.fleet), E.fleet.found)) { E.follow_fleet = true; follow_fleetwm(); } else E.status_msg = "fleetwm theme file not found"; settings_save(); });
-    toggle("Appearance", "Timing and memory in the status bar", "How long the last operation took, frames per second, CPU and memory, at the left of the status bar.", [] { return E.show_hud; }, [] { E.show_hud = !E.show_hud; settings_save(); });
+    toggle("Appearance", "Timing in the status bar", "How long the last operation took, at the left of the status bar.", [] { return E.show_hud; }, [] { E.show_hud = !E.show_hud; settings_save(); });
+    toggle("Appearance", "CPU, memory and cache statistics in the status bar", "Frames per second, CPU use, memory, and row and glyph cache hit rates, the same numbers as the Lestrix bar. Ctrl+Shift+I lists them in full.", [] { return E.show_sys; }, [] { E.show_sys = !E.show_sys; settings_save(); });
     toggle("Editor", "Vim keys", "Modal editing: normal, insert, visual and block modes, operators, text objects, macros, :s, :g and a command line at the bottom.", [] { return E.vim_on; }, [] { do_action(A_VIM); });
     toggle("Editor", "Live checks", "Look for common mistakes while you type: Ansible, Kubernetes, YAML, JSON, shell, Python, C and more. Underlines, the problem list (Ctrl+Shift+M), F8, quick fixes (Ctrl+.).", [] { return E.lint_on; }, [] { do_action(A_LINT); });
     text("Editor", "Ignored check codes", "Codes of live checks to leave out, separated by spaces, for example: trailing-whitespace name[casing] shell-no-set-e.", [] { return E.lint_ignore.empty() ? std::string("none") : E.lint_ignore; },
@@ -5459,7 +5478,7 @@ std::vector<SetItem> &set_items() {
         dlg_show("Reset all settings?", "Every setting on this page goes back to its default. Your files and connections are not touched.", {"Reset", "Cancel"}, [](int b, const std::string &) {
             if (b != 0) return;
             E.vim_on = false; E.lint_on = true; E.lint_ignore.clear(); E.preview_tabs = true; E.hot_reload = true; E.outline_on = false; E.compact_folders = true; Tree::set_compact(true); E.tree.refresh();
-            E.show_hud = true; E.g.smart_commit = 0; E.g.sync_confirm = true; E.g.tree_view = false; E.term_choice = "builtin"; E.pinned = true; vim_reset(); for (auto &kv : g_lint) kv.second.rev = ~0ull;
+            E.show_hud = true; E.show_sys = true; E.g.smart_commit = 0; E.g.sync_confirm = true; E.g.tree_view = false; E.term_choice = "builtin"; E.pinned = true; vim_reset(); for (auto &kv : g_lint) kv.second.rev = ~0ull;
             settings_save(); E.status_msg = "settings reset";
         });
     });
@@ -5708,7 +5727,10 @@ void build_frame() {
         float cxm = ex + ew / 2, areah = (float)(L.ed_bottom - L.text_y);
         int ls = (int)std::max((float)S(96), std::min((float)S(200), std::min(ew, areah) * 0.34f)) / 16 * 16;   /* multiples of 16 px: a resize makes a few sizes, not hundreds */
         float gap1 = (float)S(24), gap2 = (float)S(16), nameh = (float)S(36), hinth = (float)S(18);
-        float total = (float)ls + gap1 + nameh + gap2 + hinth;
+        std::string timing = g_startup_s > 0 ? "started in " + fmt_duration(g_startup_s) : std::string();
+        if (g_open_s > 0) timing += (timing.empty() ? "" : "   ") + std::string("folder opened in ") + fmt_duration(g_open_s);
+        float gap3 = (float)S(10), timh = timing.empty() ? 0.f : (float)S(18) + gap3;
+        float total = (float)ls + gap1 + nameh + gap2 + hinth + timh;
         float y0 = (float)L.text_y + std::max(0.f, (areah - total) / 2) - (float)S(10);
         uint32_t wm = ui_mix(C_EDITOR, C_UI, 0.09f), wm_eyes = ui_mix(C_EDITOR, C_ACCENT, 0.34f);
         draw_icon(IC_LOGO_BODY, cxm - (float)ls / 2, y0, ls, wm);
@@ -5716,6 +5738,7 @@ void build_frame() {
         float w = text_width(E.big, name);
         draw_text(E.big, cxm - w / 2, y0 + (float)ls + gap1 + nameh - (float)S(8), name, wm, (float)E.W);
         draw_text(E.ui, cxm - text_width(E.ui, hint) / 2, y0 + (float)ls + gap1 + nameh + gap2 + (float)S(13), hint, C_UI_FAINT, ew);
+        if (!timing.empty()) draw_text(E.ui, cxm - text_width(E.ui, timing.c_str()) / 2, y0 + (float)ls + gap1 + nameh + gap2 + hinth + gap3 + (float)S(13), timing.c_str(), C_UI_FAINT, ew);
     } else if (d.dv) {
         draw_diff(L, ex, ew);
     } else if (d.mv) {
@@ -5979,7 +6002,8 @@ void build_frame() {
             }
         }
         std::string last = E.ops.empty() ? std::string() : (E.ops.back().brief.empty() ? E.ops.back().name : E.ops.back().brief) + "  " + fmt_ms(E.ops.back().ms);
-        std::string left = E.status_msg.empty() ? (!E.show_hud ? std::string() : last.empty() ? std::string(E.hud) : last + "   |   " + E.hud) : E.status_msg;
+        std::string tm = E.show_hud ? last : std::string(), sys = E.show_sys ? std::string(E.hud) : std::string();
+        std::string left = E.status_msg.empty() ? (tm.empty() ? sys : sys.empty() ? tm : tm + "   |   " + sys) : E.status_msg;
         if (vim_active() && !d.dv && !d.mv) {
             std::string vl = g_vim.label();
             float vw = draw_text(E.ui, lx, sy, vl.c_str(), g_vim.typing() ? C_GREEN : C_ACCENT, std::max(0.f, rx - lx), FS_BOLD);
@@ -6232,8 +6256,11 @@ void build_frame() {
         std::vector<int> view = fd_view();
         int n = (int)view.size(), maxrows = std::max(1, (int)(lh / rowh2));
         E.fd.sel = std::max(0, std::min(E.fd.sel, std::max(0, n - 1)));
-        if (E.fd.sel < E.fd.scroll) E.fd.scroll = E.fd.sel;
-        if (E.fd.sel >= E.fd.scroll + maxrows) E.fd.scroll = E.fd.sel - maxrows + 1;
+        if (E.fd.sel != E.fd.sel_seen) {
+            if (E.fd.sel < E.fd.scroll) E.fd.scroll = E.fd.sel;
+            if (E.fd.sel >= E.fd.scroll + maxrows) E.fd.scroll = E.fd.sel - maxrows + 1;
+            E.fd.sel_seen = E.fd.sel;
+        }
         E.fd.scroll = std::max(0, std::min(E.fd.scroll, std::max(0, n - maxrows)));
         r_rect(E.r, ix, y, iw, lh, C_EDITOR);
         r_clip(E.r, (int)ix, (int)y, (int)iw, (int)lh);
@@ -6309,7 +6336,7 @@ void hud_tick() {
     fmt_count((double)(d.row_recycle + d.glyph_recycle), rc, sizeof rc);
     snprintf(E.hud, sizeof E.hud, "fps %.0f  cpu %.0f%% (%ld)  mem %s  cache rows %s glyphs %s recyc %s", fps, cpu,
              sysconf(_SC_NPROCESSORS_ONLN), fmt_mb((double)proc_rss_kb() * 1024).c_str(), rp, gp, rc);
-    if (strcmp(E.hud, E.hud_last) != 0) { memcpy(E.hud_last, E.hud, sizeof E.hud); redraw(); }
+    if (strcmp(E.hud, E.hud_last) != 0) { memcpy(E.hud_last, E.hud, sizeof E.hud); if (E.show_sys) redraw(); }
 }
 
 /* ---- window ---- */
@@ -6891,6 +6918,7 @@ void fd_load(const std::string &dir0) {
     E.fd.dir = dir;
     E.fd.all.clear();
     E.fd.sel = E.fd.scroll = 0;
+    E.fd.sel_seen = -1;
     E.fd.picked = false;
     if (dir != "/") E.fd.all.push_back({"..", true});
     std::vector<Ed::FdEntry> v;
@@ -7176,7 +7204,7 @@ void do_action(int act) {
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
     case A_REOPEN: reopen_closed_tab(); break;
     case A_CLOSE_ALL: close_all_tabs(); break;
-    case A_ABOUT: E.status_msg = "Hootedit 0.2.0 - BeanGreen247 - fast native editor"; break;
+    case A_ABOUT: E.status_msg = "Hootedit 0.3.0 - BeanGreen247 - fast native editor"; break;
     case A_REFRESH: E.tree.refresh(); git_refresh(); break;
     default: return;
     }
@@ -8561,7 +8589,6 @@ void vim_init() {
     vim_reset();
 }
 
-static double g_t_start = 0;
 static void startup_mark(const char *what) {   /* HOOTEDIT_TRACE=1 prints where start-up time goes */
     static const bool on = getenv("HOOTEDIT_TRACE") != nullptr;
     if (on) fprintf(stderr, "[start] %6.1f ms  %s\n", (now_s() - g_t_start) * 1000.0, what);
@@ -8587,7 +8614,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--timed")) g_timed = true;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &win_w, &win_h);
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) cli_theme = argv[++i];
-        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.2.0"); return 0; }
+        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.3.0"); return 0; }
         else if (argv[i][0] != '-') args.push_back(argv[i]);
         else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
     }
@@ -8617,6 +8644,7 @@ int main(int argc, char **argv) {
         }
     }
     if (E.docs.empty()) new_doc();
+    bool bare_launch = workspace.empty() && args.empty();   /* nothing to open: no folder is read until the user opens one */
     if (workspace.empty()) { char cwd[1024]; workspace = getcwd(cwd, sizeof cwd) ? cwd : "."; }
     signal(SIGUSR1, on_usr1);
     /* the window class is what a panel uses to match a window to its menu entry and icon; a terminal that exports its own SDL class (Lestrix does) would
@@ -8658,9 +8686,9 @@ int main(int argc, char **argv) {
     if (E.follow_fleet) follow_fleetwm();
     startup_mark("terminal engine, theme");
     SDL_StartTextInput();
-    set_workspace(workspace, !script);   /* git status on a thread, so the first frame does not wait for it (scripts want it done) */
+    if (!bare_launch) set_workspace(workspace, !script);   /* git status on a thread, so the first frame does not wait for it (scripts want it done) */
     startup_mark("workspace (tree + git)");
-    E.side_open = true;
+    E.side_open = !bare_launch;
     set_active(0);
 
     E.now = now_s();
@@ -8670,6 +8698,7 @@ int main(int argc, char **argv) {
     build_frame();   /* the first frame: it also gives clicks and menus their hit boxes */
     r_end(E.r);
     SDL_GL_SwapWindow(E.win);
+    g_startup_s = now_s() - g_t_start;
     startup_mark("first frame drawn");
     SDL_ShowWindow(E.win);   /* only now: the window appears with the editor in it */
     startup_mark("window shown");

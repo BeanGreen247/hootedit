@@ -20,20 +20,22 @@ while [ $# -gt 0 ]; do
   shift
 done
 B=build-pgo
+# keep meson/ninja quiet, but print their output when they fail (meson writes its errors to stdout)
+quiet() { local out; out=$("$@" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }; }
 if [ "$KEEP" = 0 ]; then rm -rf "$B"; fi
 if [ ! -d "$B" ]; then
-  meson setup "$B" --prefix "$PREFIX" --buildtype release -Db_pgo=generate -Dcpp_args="-fprofile-update=prefer-atomic" >/dev/null
+  quiet meson setup "$B" --prefix "$PREFIX" --buildtype release -Db_pgo=generate -Dcpp_args="-fprofile-update=prefer-atomic"
 else
-  meson configure "$B" --prefix "$PREFIX" >/dev/null
+  quiet meson configure "$B" --prefix "$PREFIX"
 fi
 if [ "$KEEP" = 0 ]; then
   echo "  pgo 1/3: instrumented build"
-  ninja -C "$B" hootedit >/dev/null
+  quiet ninja -C "$B" hootedit
   echo "  pgo 2/3: training run"
   "$SRC/scripts/pgo-train.sh" "$B/hootedit"
 fi
 find "$B" -name '*.gcda' | grep -q . || { echo "error: no profile data was written; the training run did not complete." >&2; exit 1; }
 echo "  pgo 3/3: optimised build"
-meson configure "$B" -Db_pgo=use -Dcpp_args="-fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch" >/dev/null
-ninja -C "$B" hootedit >/dev/null
+quiet meson configure "$B" -Db_pgo=use -Dcpp_args="-fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch"
+quiet ninja -C "$B" hootedit
 echo "  built $B/hootedit"
