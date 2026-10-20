@@ -1,5 +1,5 @@
 project('hootedit', 'cpp',
-  version: '0.2.0',
+  version: '0.3.0',
   license: 'MIT',
   default_options: ['cpp_std=gnu++20', 'buildtype=release', 'optimization=3', 'b_ndebug=true', 'warning_level=2'])
 

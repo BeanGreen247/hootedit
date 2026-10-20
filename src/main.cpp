@@ -7204,7 +7204,7 @@ void do_action(int act) {
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
     case A_REOPEN: reopen_closed_tab(); break;
     case A_CLOSE_ALL: close_all_tabs(); break;
-    case A_ABOUT: E.status_msg = "Hootedit 0.2.0 - BeanGreen247 - fast native editor"; break;
+    case A_ABOUT: E.status_msg = "Hootedit 0.3.0 - BeanGreen247 - fast native editor"; break;
     case A_REFRESH: E.tree.refresh(); git_refresh(); break;
     default: return;
     }
@@ -8614,7 +8614,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--timed")) g_timed = true;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &win_w, &win_h);
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) cli_theme = argv[++i];
-        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.2.0"); return 0; }
+        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.3.0"); return 0; }
         else if (argv[i][0] != '-') args.push_back(argv[i]);
         else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
     }

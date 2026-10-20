@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-10-20)
+- Documentation preview for Markdown, AsciiDoc and reStructuredText (`.md`, `.adoc`, `.rst` and more): Preview and Split controls in the tab strip, GitHub and GitLab rendering profiles, light or dark preview palette, drawn natively with no scripts or remote content (`docs/document-preview.md`).
+- Settings: separate toggles for the timing and for the CPU, memory and cache statistics in the status bar.
+- `install.sh` builds on a fresh clone without GoogleTest, and shows the meson and ninja errors when a build fails.
 - Piece table in chunks (`src/piecelist.h`, pieces 16 bytes instead of 24): 20,000 scattered edits in a 16 MB file 390 ms -> 33 ms, undo and redo of them 1,060 ms -> 60 ms (`--bench-core`, total 1,655 ms -> about 300 ms).
 - Column lookup (`Doc::col_of_byte`) copies only the bytes before the cursor, into a stack buffer; the line index sizes its chunks to the square root of the line count and keeps its per-chunk offsets and first-line numbers in flat arrays. Together about 12% less time for scattered edits and undo (edits 34 -> 30 ms, undo 63 -> 53 ms on the 16 MB benchmark; on a 190 MB, 4.9M-line file open 174 -> 135 ms and the whole benchmark 7% faster).
 - `-fno-plt` and lighter link flags: about 4% less time on `--bench-core`, binary 3% smaller; `-O3` is set explicitly for every build, test binaries included.
