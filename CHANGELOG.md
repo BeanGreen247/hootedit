@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.1 (2026-10-27)
+- The syntax-token scratch buffer is released after 10 s without input once it has grown past 1 MB (a 16 MB single-line file: 198 MB -> 149 MB resident when idle; massif and numbers in `docs/performance.md`).
+- Fix: the Markdown preview stopped scrolling long before the end of a document. The scroll range came from a separate height estimate that ignored tables and mis-sized code blocks, quotes and lists; it is now the height measured by the drawing code itself (`preview_layout`), cached per document, width and font. Scroll range before -> after (1024x768, 400-block test files; `tests/ui_test.sh` `preview-long.md` also covers it): tables 1,996 -> 13,004 px (85% of the document was unreachable), code blocks 8,496 -> 10,404, quotes 4,596 -> 4,604, lists 11,096 -> 9,304 (scrolled past the end), paragraphs 19,396 -> 10,604 (blank space past the end), diagrams 4,996 -> 3,804. Cost of the scroll-range calculation per wheel event (400-block files, one run each, in-process timer): paragraphs 6.8 ms -> 0.00005 ms, quotes 2.4 ms -> 0.00006 ms (the old estimate re-wrapped every block on each event; the new one is cached); the first measuring pass after an edit or a resize costs 0.03-1.8 ms.
 ## 0.3.0 (2026-10-20)
 - Documentation preview for Markdown, AsciiDoc and reStructuredText (`.md`, `.adoc`, `.rst` and more): Preview and Split controls in the tab strip, GitHub and GitLab rendering profiles, light or dark preview palette, drawn natively with no scripts or remote content (`docs/document-preview.md`).
 - Settings: separate toggles for the timing and for the CPU, memory and cache statistics in the status bar.
