@@ -50,6 +50,8 @@ printf '# Broken preview\n\n![missing](assets/nope.png)\n\n<div>raw HTML</div>\n
 printf 'flowchart TD\n  A[Start] --> B{Ready?}\n  B -->|yes| C[Done]\n' > "$T/ws/preview.mmd"
 printf '# Workflow\n\n```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```\n' > "$T/ws/preview-diagram.md"
 printf '# P and p\n\n## P and p\n\n### P and p\n\n#### P and p\n\n##### P and p\n\n###### P and p\n\nSetext P and p\n===============\n\nSetext P and p\n---------------\n' > "$T/ws/preview-headings.md"
+# long document with tables, code, quotes and lists: the scroll range has to reach the last block (it used to stop near the first 15%)
+{ printf '# Long\n\n'; for i in $(seq 1 60); do printf '## Part %s\n\n| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n| 4 | 5 | 6 |\n\n```python\nprint(%s)\nprint(2)\n```\n\n> a quote\n\n- item one\n- item two\n\nA paragraph of text.\n\n' "$i" "$i"; done; printf 'THE LAST LINE\n'; } > "$T/ws/preview-long.md"
 
 # ---- typing and saving ----
 run "text:hello;ctrl+s;wait:200;dump" a.txt
@@ -256,6 +258,13 @@ run "act:preview;dump" preview-diagram.md
 has "fenced Mermaid diagrams render in Markdown preview" "preview: open=1 split=0 target=GitHub mode="
 run "act:preview;dump" preview-headings.md
 has "all six Markdown heading levels and Setext headings are previewed" "format=1 blocks=8"
+run "act:preview;wheel:600,400,-5000;dump" preview-long.md
+has "scrolling a long preview to the end shows the last block" "end_visible=1"
+total=$((total + 1))
+read -r ph pm pv < <(printf '%s\n' "$OUT" | sed -n 's/^preview_h: height=\([0-9]*\) max_scroll=\([0-9]*\) view=\([0-9]*\).*/\1 \2 \3/p' | head -1)
+if [ -z "${ph:-}" ] || [ $((pm + pv)) -lt "$ph" ] || [ $((pm + pv)) -gt $((ph + 16)) ]; then
+  fails=$((fails + 1)); echo "FAIL: the preview scroll range is the measured document height (height=${ph:-?} max_scroll=${pm:-?} view=${pv:-?})"
+fi
 
 run "wait:200;mouse:5,5;click:14,725;mouse:5,5;dump" typo.yaml
 has "the cog at the foot of the sidebar rail opens Settings" "settings: open=1"

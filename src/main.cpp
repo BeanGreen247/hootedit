@@ -83,6 +83,7 @@ uint32_t C_CHROME, C_MENUBAR, C_EDITOR, C_BORDER, C_SELROW, C_HOVER, C_ACCENT, C
          C_DIFF_ADD, C_DIFF_ADD_TXT, C_DIFF_DEL, C_DIFF_DEL_TXT, C_DIFF_FILL, C_DIFF_FOLD;   /* diff editor line and word backgrounds */
 const uint32_t C_SHADE = RGBA(0, 0, 0, 120);
 uint32_t TOKCOL[T_COUNT];   /* indexed by Tok */
+const size_t TOK_KEEP = 1u << 20;   /* token scratch bigger than this is released when the editor goes idle */
 const double BLINK_FOR = 10.0;   /* the cursor stops blinking this long after the last input: an idle editor draws nothing */
 const int TAB_W = 4;
 
@@ -372,6 +373,10 @@ struct Ed {
     bool preview_light = false;
     bool preview_mode_initialized = false;
     float preview_scroll = 0;
+    uint64_t preview_gen = 0;                       /* bumped each time preview_blocks is rebuilt */
+    uint64_t preview_height_key = 0;
+    float preview_height = 0;                       /* measured height of the whole document, see preview_content_height */
+    bool preview_end_visible = false;               /* the last draw reached the end of the document */
     uint64_t preview_revision = ~0ull;
     const Doc *preview_doc = nullptr;
     std::string preview_path;
@@ -1783,6 +1788,7 @@ void preview_refresh(Doc &d) {
     std::string source;
     d.buf.copy(0, d.buf.size(), source);
     E.preview_blocks = preview_parse(source, f);
+    E.preview_gen++;
     E.preview_doc = &d;
     E.preview_revision = d.buf.revision();
     E.preview_path = d.path;
@@ -2978,19 +2984,23 @@ Layout layout() {
     return l;
 }
 
-float draw_mermaid(const PreviewBlock &block, float x, float y, float width, float line_h, const PreviewPalette &palette) {
+float draw_mermaid(const PreviewBlock &block, float x, float y, float width, float line_h, const PreviewPalette &palette, bool draw = true) {
     MermaidGraph graph = preview_mermaid(block.lines);
     float left = x + (float)S(10), available = std::max((float)S(100), width - (float)S(20));
     if (!graph.known || graph.nodes.empty()) {
         for (const std::string &line : block.lines) {
             std::string text = line.empty() ? " " : line;
-            y = preview_draw_inline(text, left, y, available, line_h, E.font, FS_REGULAR, palette.muted, true);
+            y = preview_draw_inline(text, left, y, available, line_h, E.font, FS_REGULAR, palette.muted, draw);
         }
         return y + (float)S(8);
     }
     float node_w = std::min((float)S(190), std::max((float)S(112), available * (graph.left_right ? 0.24f : 0.62f)));
     float node_h = (float)S(46), gap_x = (float)S(42), gap_y = (float)S(44);
     size_t per_row = graph.left_right ? std::max<size_t>(1, (size_t)((available + gap_x) / (node_w + gap_x))) : 1;
+    if (!draw) {   /* measuring: the same heights the drawing code returns below */
+        if (graph.sequence) return y + (float)S(50) + (float)graph.edges.size() * (float)S(42) + (float)S(12);
+        return y + (float)((graph.left_right ? (graph.nodes.size() + per_row - 1) / per_row : graph.nodes.size()) * (size_t)(node_h + gap_y));
+    }
     std::vector<float> nx(graph.nodes.size()), ny(graph.nodes.size());
     for (size_t i = 0; i < graph.nodes.size(); i++) {
         size_t row = graph.left_right ? i / per_row : i;
@@ -3069,25 +3079,20 @@ float draw_mermaid(const PreviewBlock &block, float x, float y, float width, flo
     return y + (float)((graph.left_right ? (graph.nodes.size() + per_row - 1) / per_row : graph.nodes.size()) * (size_t)(node_h + gap_y));
 }
 
-void draw_preview(const Layout &L, float x, float width) {
-    Doc &d = D();
-    preview_refresh(d);
+/* One pass over the blocks for both jobs, so the scroll range can never disagree with what is drawn: draw=true paints the visible part and stops below the pane,
+   draw=false only measures and returns the height of the whole document (the scroll range comes from it, see preview_content_height). */
+float preview_layout(const Layout &L, float x, float width, bool draw) {
     PreviewPalette palette = preview_palette();
     float top = (float)L.text_y + (float)S(16);
     float left = x + (float)S(24);
     float content_w = std::max((float)S(80), width - (float)S(48));
-    float bottom = (float)L.ed_bottom;
-    r_rect(E.r, x, (float)L.text_y, width, (float)(L.ed_bottom - L.text_y), palette.bg);
-    if (E.preview_blocks.empty()) {
-        draw_text(E.ui, left, ui_base(top, (float)S(24)), "Nothing to preview", C_UI_FAINT, content_w);
-        return;
-    }
-    r_clip(E.r, (int)x, L.text_y, (int)width, L.ed_bottom - L.text_y);
-    float y = top - E.preview_scroll;
+    float bottom = draw ? (float)L.ed_bottom : -1e9f;   /* nothing counts as visible while measuring */
+    float scroll = draw ? E.preview_scroll : 0.f;
+    float y = top - scroll;
     int ordered_index = 0;
     bool was_ordered = false;
     for (const PreviewBlock &b : E.preview_blocks) {
-        if (y > bottom) break;
+        if (draw && y > bottom) break;
         if (b.kind != PreviewBlockKind::List || !b.ordered) { ordered_index = 0; was_ordered = false; }
         if (b.kind == PreviewBlockKind::Rule) {
             if (y + (float)S(10) >= (float)L.text_y && y < bottom) r_rect(E.r, left, y + (float)S(5), content_w, (float)S(1), C_BORDER);
@@ -3104,14 +3109,14 @@ void draw_preview(const Layout &L, float x, float width) {
             if (y + lh >= (float)L.text_y && y < bottom)
                 y = preview_draw_inline(b.text, left + (E.preview_target ? (float)S(10) : 0.f), y, content_w, lh, font, FS_BOLD, color, true);
             else y += lh;
-            if (E.preview_target == 0 && level <= 2 && y < bottom) {
+            if (E.preview_target == 0 && level <= 2) {
                 y += (float)S(4);
-                r_rect(E.r, left, y, content_w, (float)S(1), palette.border);
+                if (y < bottom) r_rect(E.r, left, y, content_w, (float)S(1), palette.border);
             }
             y += level <= 2 ? (float)S(9) : (float)S(6);
         } else if (b.kind == PreviewBlockKind::Diagram) {
             float diagram_y = y + (float)S(8);
-            float end_y = draw_mermaid(b, left, diagram_y, content_w, (float)E.rowh, palette);
+            float end_y = draw_mermaid(b, left, diagram_y, content_w, (float)E.rowh, palette, draw && y < bottom);
             y = std::max(end_y, diagram_y + (float)S(50)) + (float)S(12);
         } else if (b.kind == PreviewBlockKind::Code) {
             float pad = (float)S(12);
@@ -3119,7 +3124,7 @@ void draw_preview(const Layout &L, float x, float width) {
             float code_x = left + pad;
             float code_h = (float)(preview_code_rows(b, content_w - 2 * pad) + 1) * (float)E.rowh + pad * 2;
             if (y < bottom && y + code_h >= (float)L.text_y) r_rect(E.r, left, y, content_w, code_h, palette.panel);
-            code_y = preview_draw_code(b, code_x, code_y, content_w - 2 * pad, true);
+            code_y = preview_draw_code(b, code_x, code_y, content_w - 2 * pad, draw && y < bottom && y + code_h >= (float)L.text_y);
             y = std::max(code_y, y + code_h) + (float)S(10);
         } else if (b.kind == PreviewBlockKind::Quote) {
             float lh = (float)S(22);
@@ -3130,19 +3135,25 @@ void draw_preview(const Layout &L, float x, float width) {
         } else if (b.kind == PreviewBlockKind::List) {
             float lh = (float)S(22);
             float indent = std::min((float)S(72), (float)b.level * (float)S(18));
+            bool vis = y + lh >= (float)L.text_y && y < bottom;
             if (b.ordered) {
                 if (!was_ordered) ordered_index = 0;
-                std::string prefix = std::to_string(++ordered_index) + ".";
-                draw_text(E.ui, left + indent, ui_base(y, lh), prefix.c_str(), palette.accent, (float)S(24));
+                ++ordered_index;
+                if (vis) {
+                    std::string prefix = std::to_string(ordered_index) + ".";
+                    draw_text(E.ui, left + indent, ui_base(y, lh), prefix.c_str(), palette.accent, (float)S(24));
+                }
                 was_ordered = true;
             } else if (b.task) {
                 float size = (float)S(14), bx = left + indent;
-                r_rrect(E.r, bx, y + (lh - size) / 2, size, size, palette.bg, S(2), 1);
-                if (b.checked) draw_icon(IC_CHECK, bx, y + (lh - size) / 2, S(14), palette.accent);
-            } else draw_text(E.ui, left + indent, ui_base(y, lh), "\xE2\x80\xA2", palette.accent, (float)S(14));
+                if (vis) {
+                    r_rrect(E.r, bx, y + (lh - size) / 2, size, size, palette.bg, S(2), 1);
+                    if (b.checked) draw_icon(IC_CHECK, bx, y + (lh - size) / 2, S(14), palette.accent);
+                }
+            } else if (vis) draw_text(E.ui, left + indent, ui_base(y, lh), "\xE2\x80\xA2", palette.accent, (float)S(14));
             float text_indent = b.task ? (float)S(22) : (float)S(22);
             y = preview_draw_inline(b.text, left + indent + text_indent, y, content_w - indent - text_indent, lh, E.ui, FS_REGULAR, palette.text,
-                                   y + lh >= (float)L.text_y && y < bottom);
+                                   vis);
         } else if (b.kind == PreviewBlockKind::Table) {
             bool markdown_table = b.level == 2;
             bool has_header = b.level != 0;
@@ -3194,26 +3205,38 @@ void draw_preview(const Layout &L, float x, float width) {
             y += (float)S(6);
         }
     }
+    E.preview_end_visible = draw && y <= bottom;
+    return y + scroll - top;
+}
+
+void draw_preview(const Layout &L, float x, float width) {
+    preview_refresh(D());
+    PreviewPalette palette = preview_palette();
+    r_rect(E.r, x, (float)L.text_y, width, (float)(L.ed_bottom - L.text_y), palette.bg);
+    if (E.preview_blocks.empty()) {
+        draw_text(E.ui, x + (float)S(24), ui_base((float)L.text_y + (float)S(16), (float)S(24)), "Nothing to preview", C_UI_FAINT, std::max((float)S(80), width - (float)S(48)));
+        return;
+    }
+    r_clip(E.r, (int)x, L.text_y, (int)width, L.ed_bottom - L.text_y);
+    preview_layout(L, x, width, true);
     r_clip_off(E.r);
 }
 
-float preview_max_scroll(const Layout &L, float width) {
-    float content_w = std::max((float)S(80), width - (float)S(48));
-    float height = (float)S(16);
-    for (const PreviewBlock &b : E.preview_blocks) {
-        if (b.kind == PreviewBlockKind::Rule) height += (float)S(18);
-        else if (b.kind == PreviewBlockKind::Heading) height += (b.level <= 1 ? (float)S(48) : (float)S(37));
-        else if (b.kind == PreviewBlockKind::Code) {
-            height += (float)preview_code_rows(b, content_w - (float)S(24)) * (float)E.rowh;
-            height += (float)S(34);
-        } else if (b.kind == PreviewBlockKind::Diagram) {
-            height += (float)std::max<size_t>(1, b.lines.size()) * (float)S(70);
-        } else {
-            size_t rows = wrap_lines(b.text, content_w).size();
-            height += (float)std::max<size_t>(1, rows) * (float)S(22) + (b.kind == PreviewBlockKind::Paragraph ? (float)S(6) : (float)S(4));
-        }
+/* Height of the whole document at this width, measured by the drawing code itself and kept until the blocks, the width, the fonts or the scale change. */
+float preview_content_height(const Layout &L, float width) {
+    uint64_t key = fnv1a(&E.preview_gen, sizeof E.preview_gen, 1469598103934665603ull);
+    int w = (int)width, ints[] = {w, E.rowh, E.cw, E.preview_target, S(100), (int)font_id(E.ui), (int)font_id(E.font), (int)font_id(E.big)};
+    key = fnv1a(ints, sizeof ints, key);
+    for (Font *f : E.preview_heading) { int id = f ? (int)font_id(f) : -1; key = fnv1a(&id, sizeof id, key); }
+    if (key != E.preview_height_key) {
+        E.preview_height = preview_layout(L, 0, width, false);
+        E.preview_height_key = key;
     }
-    return std::max(0.f, height - (float)(L.ed_bottom - L.text_y) + (float)S(16));
+    return E.preview_height;
+}
+
+float preview_max_scroll(const Layout &L, float width) {
+    return std::max(0.f, preview_content_height(L, width) - (float)(L.ed_bottom - L.text_y) + (float)S(16));
 }
 
 void ensure_visible(const Layout &L) {
@@ -7204,7 +7227,7 @@ void do_action(int act) {
     case A_GOTO: E.mode = M_QUICK; E.quick_q = ":"; E.quick_sel = 0; quick_update(); break;
     case A_REOPEN: reopen_closed_tab(); break;
     case A_CLOSE_ALL: close_all_tabs(); break;
-    case A_ABOUT: E.status_msg = "Hootedit 0.3.0 - BeanGreen247 - fast native editor"; break;
+    case A_ABOUT: E.status_msg = "Hootedit 0.3.1 - BeanGreen247 - fast native editor"; break;
     case A_REFRESH: E.tree.refresh(); git_refresh(); break;
     default: return;
     }
@@ -8272,6 +8295,7 @@ void run_script(const char *script) {
             printf("preview: open=%d split=%d target=%s mode=%s format=%d blocks=%zu scroll=%.0f\n", E.preview_open ? 1 : 0,
                    E.preview_split ? 1 : 0, E.preview_target ? "GitLab" : "GitHub", E.preview_light ? "Light" : "Dark",
                    (int)preview_format(dd.path), E.preview_blocks.size(), E.preview_scroll);
+            if (E.preview_open) { Layout L_ = layout(); printf("preview_h: height=%.0f max_scroll=%.0f view=%d end_visible=%d\n", preview_content_height(L_, (float)(E.W - L_.ed_x)), preview_max_scroll(L_, (float)(E.W - L_.ed_x)), L_.ed_bottom - L_.text_y, E.preview_end_visible ? 1 : 0); }
             printf("frame_ms: %.3f\n", E.last_build_ms);
             lint_kick(dd, true);
             if (const LintState *ls_ = lint_state(dd)) for (const Diag &x : ls_->d) printf("diag: %u:%u %s %s %s\n", x.line + 1, x.c0 + 1, lint_sev_name(x.sev), x.code.c_str(), x.msg.c_str());
@@ -8614,7 +8638,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--timed")) g_timed = true;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &win_w, &win_h);
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) cli_theme = argv[++i];
-        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.3.0"); return 0; }
+        else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.3.1"); return 0; }
         else if (argv[i][0] != '-') args.push_back(argv[i]);
         else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
     }
@@ -8772,6 +8796,7 @@ int main(int argc, char **argv) {
             if (E.follow_fleet && fleetwm_stamp() != E.fleet.stamp) follow_fleetwm();
         }
         if (E.side_close_at > 0 && E.now >= E.side_close_at) { E.side_close_at = 0; if (!E.pinned && E.side_open) open_side(false); }
+        if (E.tok.capacity() > TOK_KEEP && E.now - E.last_active > BLINK_FOR) std::vector<uint8_t>().swap(E.tok);   /* grows to the longest line drawn; give it back once idle */
         if (E.now >= E.next_hud) { E.next_hud = E.now + (!E.focused || E.now - E.last_active > BLINK_FOR ? 5 : E.now - E.last_active > 3.0 ? 3 : 1); hud_tick(); }
         if (E.focused && E.now - E.last_active < BLINK_FOR && E.now - E.last_blink > 0.53) { E.last_blink = E.now; E.blink_on = !E.blink_on; redraw(); }
         else if ((!E.focused || E.now - E.last_active >= BLINK_FOR) && !E.blink_on) { E.blink_on = true; redraw(); }
