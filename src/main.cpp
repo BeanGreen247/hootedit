@@ -497,7 +497,7 @@ std::string cache_stats_text(bool all_ops = false) {
 }
 
 void redraw() { E.dirty = true; }
-void touch() { E.last_active = E.now; E.blink_on = true; E.last_blink = E.now; redraw(); }
+void touch() { E.now = now_s(); E.last_active = E.now; E.blink_on = true; E.last_blink = E.now; redraw(); }   /* E.now is only refreshed after the event wait: a stale value made the first key after a pause hide the cursor at once */
 
 std::string fmt_ms(double ms) {
     char b[32];
@@ -8869,7 +8869,7 @@ int main(int argc, char **argv) {
     while (E.running) {
         double due = E.next_hud ? E.next_hud : E.now;
         if (g_job.running || g_rjob.running) due = std::min(due, E.now + 0.2);
-        if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, E.last_blink + 0.53);
+        if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, std::min(E.last_blink + 0.53, E.last_active + BLINK_FOR));   /* the second term wakes the loop when blinking ends: with the cursor in its off phase it stayed hidden until some other timer fired */
         if (E.side_close_at > 0) due = std::min(due, E.side_close_at);
         if (E.tip_at > 0) due = std::min(due, E.tip_at);
         if (E.lint_at > 0) due = std::min(due, E.lint_at);
