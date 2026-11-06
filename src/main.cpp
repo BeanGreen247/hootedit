@@ -497,7 +497,7 @@ std::string cache_stats_text(bool all_ops = false) {
 }
 
 void redraw() { E.dirty = true; }
-void touch() { E.last_active = E.now; E.blink_on = true; E.last_blink = E.now; redraw(); }
+void touch() { E.now = now_s(); E.last_active = E.now; E.blink_on = true; E.last_blink = E.now; redraw(); }   /* E.now is only refreshed after the event wait: a stale value made the first key after a pause hide the cursor at once */
 
 std::string fmt_ms(double ms) {
     char b[32];
@@ -6364,10 +6364,17 @@ void hud_tick() {
 
 /* ---- window ---- */
 
+SDL_Surface *g_soft_surf = nullptr;
+bool g_soft_expose = false;   /* the window needs its whole surface presented again (exposed, restored) */
+bool g_soft_accel = false;   /* second try of the CPU path: some X servers (Xvnc) have no plain framebuffer, so let SDL present the surface through a texture */   /* the window's own pixel surface, the CPU rasterizer's target */
+
 bool gl_init(GlKind kind, int w, int h) {
     if (E.gl) { SDL_GL_DeleteContext(E.gl); E.gl = nullptr; }
     if (E.win) { SDL_DestroyWindow(E.win); E.win = nullptr; }
-    if (kind == GLK_CORE) {
+    g_soft_surf = nullptr;
+    if (kind == GLK_SOFT) { if (g_soft_accel) SDL_ResetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION); else SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0"); }   /* else SDL presents the surface through an OpenGL texture, i.e. software GL again */
+    if (kind == GLK_SOFT) {}
+    else if (kind == GLK_CORE) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -6376,27 +6383,117 @@ bool gl_init(GlKind kind, int w, int h) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     }
-    E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN);   /* shown after the first frame is drawn: no empty window while the editor starts */
+    E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, (kind == GLK_SOFT ? 0 : SDL_WINDOW_OPENGL) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN);   /* shown after the first frame is drawn: no empty window while the editor starts */
     if (E.win) {   /* the owl as the window icon (64x64, embedded) */
         SDL_Surface *ic = SDL_CreateRGBSurfaceWithFormatFrom((void *)APP_ICON_RGBA, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
         if (ic) { SDL_SetWindowIcon(E.win, ic); SDL_FreeSurface(ic); }
     }
-    E.gl = E.win ? SDL_GL_CreateContext(E.win) : nullptr;
-    if (!E.gl || sd_gl_load(kind)) return false;
-    SDL_GL_SetSwapInterval(1);
-    int ww, wh;
-    SDL_GetWindowSize(E.win, &ww, &wh);
-    SDL_GL_GetDrawableSize(E.win, &E.W, &E.H);
+    int ww = 0, wh = 0;
+    if (kind == GLK_SOFT) {
+        if (!E.win || sd_gl_load(kind)) return false;
+        g_soft_surf = SDL_GetWindowSurface(E.win);
+        if (!g_soft_surf) {
+            if (g_soft_accel) { fprintf(stderr, "hootedit: CPU rasterizer: no window surface: %s\n", SDL_GetError()); return false; }
+            g_soft_accel = true;   /* SDL remembers the failure per video device: start the video subsystem again */
+            SDL_DestroyWindow(E.win); E.win = nullptr;
+            SDL_QuitSubSystem(SDL_INIT_VIDEO);
+            if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) return false;
+            return gl_init(kind, w, h);
+        }
+        SDL_GetWindowSize(E.win, &ww, &wh);
+        E.W = g_soft_surf->w; E.H = g_soft_surf->h;
+    } else {
+        E.gl = E.win ? SDL_GL_CreateContext(E.win) : nullptr;
+        if (!E.gl || sd_gl_load(kind)) return false;
+        SDL_GL_SetSwapInterval(1);
+        SDL_GetWindowSize(E.win, &ww, &wh);
+        SDL_GL_GetDrawableSize(E.win, &E.W, &E.H);
+    }
     E.scale = ww ? (float)E.W / (float)ww : 1.f;
     E.atlas = atlas_new(E.scale > 1.5f ? 4096 : 2048);
     E.r = E.atlas ? r_new(E.atlas) : nullptr;
     if (!E.r) return false;
+    if (kind == GLK_SOFT) {
+        const SDL_PixelFormat *pf = g_soft_surf->format;   /* a 32-bit surface with red in bits 16..23 is drawn into as it is, anything else goes through SDL's converting blit */
+        if (pf->BitsPerPixel == 32 && pf->Rmask == 0x00ff0000u && pf->Gmask == 0x0000ff00u && pf->Bmask == 0x000000ffu) r_soft_bgr(E.r, 1);
+        snprintf(E.gl_desc, sizeof E.gl_desc, "CPU rasterizer");
+        return true;
+    }
     const char *ver = (const char *)glGetString(GL_VERSION), *rend = (const char *)glGetString(GL_RENDERER);
     snprintf(E.gl_desc, sizeof E.gl_desc, "%s on %s", ver ? ver : "OpenGL", rend ? rend : "unknown GPU");
     return true;
 }
 
+/* a readable DRM render node or the NVIDIA control device means a real GPU; without one OpenGL is Mesa's software renderer, which the CPU rasterizer beats */
+bool has_gpu() {
+    if (access("/dev/nvidiactl", R_OK) == 0) return true;
+    DIR *d = opendir("/dev/dri");
+    if (!d) return false;
+    bool found = false;
+    while (const dirent *e = readdir(d)) if (!strncmp(e->d_name, "renderD", 7)) { char p[300]; snprintf(p, sizeof p, "/dev/dri/%s", e->d_name); if (access(p, R_OK | W_OK) == 0) found = true; }
+    closedir(d);
+    return found;
+}
+
+bool soft_mode() { return sd_gl_kind == GLK_SOFT; }
+
+/* window size in pixels; on the CPU path the surface is re-fetched, SDL replaces it on every resize */
+void update_drawable() {
+    if (soft_mode()) { g_soft_surf = SDL_GetWindowSurface(E.win); if (g_soft_surf) { E.W = g_soft_surf->w; E.H = g_soft_surf->h; } }
+    else SDL_GL_GetDrawableSize(E.win, &E.W, &E.H);
+}
+
+/* starts a frame; on the CPU path with a surface in the renderer's own byte order the frame is drawn straight into the window's pixels, so presenting needs no copy */
+void begin_frame() {
+    if (soft_mode() && r_soft_is_bgr(E.r)) {
+        SDL_Surface *sf = SDL_GetWindowSurface(E.win);
+        if (sf != g_soft_surf) { g_soft_surf = sf; r_soft_invalidate(E.r); }
+        if (sf && sf->w == E.W && sf->h == E.H && sf->pitch == E.W * 4 && !SDL_MUSTLOCK(sf)) r_soft_target(E.r, (uint32_t *)sf->pixels);
+        else r_soft_target(E.r, nullptr);
+    }
+    r_begin(E.r, E.W, E.H, C_EDITOR);
+}
+
+/* shows the finished frame: a buffer swap on the GPU path, a blit into the window surface on the CPU path (the buffer is RGBA bytes, the surface may be 16 or 24 bit) */
+void present() {
+    if (!soft_mode()) { SDL_GL_SwapWindow(E.win); return; }
+    int w = 0, h = 0, n = 0;
+    const uint32_t *px = r_soft_pixels(E.r, &w, &h);
+    if (!px || !g_soft_surf) return;
+    SDL_Surface *now = SDL_GetWindowSurface(E.win);
+    if (now != g_soft_surf) { g_soft_surf = now; r_soft_invalidate(E.r); }   /* SDL made a new surface (resize, restore): its pixels are empty */
+    if (!g_soft_surf) return;
+    const RSoftRect *dm = r_soft_damage(E.r, &n);
+    if (n == 0 && !g_soft_expose) return;   /* nothing changed: no copy, no round trip to the X server */
+    std::vector<SDL_Rect> rc;
+    if (g_soft_expose || n == 0) { rc.push_back({0, 0, w, h}); g_soft_expose = false; }
+    else for (int i = 0; i < n; i++) rc.push_back({dm[i].x, dm[i].y, dm[i].w, dm[i].h});
+    if (r_soft_is_bgr(E.r) && g_soft_surf->w == w && g_soft_surf->h == h && g_soft_surf->pitch == w * 4 && !SDL_MUSTLOCK(g_soft_surf)) {
+        if ((const uint32_t *)g_soft_surf->pixels != px)
+        for (const SDL_Rect &q : rc)   /* same layout: copy the damaged rows as they are */
+            for (int y = q.y; y < q.y + q.h; y++) memcpy((uint8_t *)g_soft_surf->pixels + (size_t)y * (size_t)g_soft_surf->pitch + (size_t)q.x * 4, px + (size_t)y * (size_t)w + (size_t)q.x, (size_t)q.w * 4);
+        SDL_UpdateWindowSurfaceRects(E.win, rc.data(), (int)rc.size());
+        return;
+    }
+    SDL_Surface *src = SDL_CreateRGBSurfaceWithFormatFrom((void *)px, w, h, 32, w * 4, r_soft_is_bgr(E.r) ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_RGBA32);
+    if (!src) return;
+    for (SDL_Rect &q : rc) { SDL_Rect d = q; SDL_BlitSurface(src, &q, g_soft_surf, &d); }
+    SDL_FreeSurface(src);
+    SDL_UpdateWindowSurfaceRects(E.win, rc.data(), (int)rc.size());
+}
+
 void write_ppm(const char *file) {
+    if (soft_mode()) {
+        int w = 0, h = 0;
+        const uint32_t *fb = r_soft_pixels(E.r, &w, &h);
+        FILE *f = fb ? fopen(file, "wb") : nullptr;
+        if (!f) return;
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        bool bgr = r_soft_is_bgr(E.r);
+        for (size_t i = 0; i < (size_t)w * (size_t)h; i++) { uint32_t p = fb[i]; uint8_t c[3] = {(uint8_t)(bgr ? p >> 16 : p), (uint8_t)(p >> 8), (uint8_t)(bgr ? p : p >> 16)}; fwrite(c, 1, 3, f); }
+        fclose(f);
+        return;
+    }
     std::vector<uint8_t> px((size_t)E.W * (size_t)E.H * 4);
     glReadPixels(0, 0, E.W, E.H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
     FILE *f = fopen(file, "wb");
@@ -8230,7 +8327,7 @@ void handle_event(const SDL_Event &e) {
         if (E.tab_dragging) { E.tab_dragging = false; redraw(); }
         break;
     case SDL_WINDOWEVENT:
-        if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESIZED) { SDL_GL_GetDrawableSize(E.win, &E.W, &E.H); redraw(); }
+        if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESIZED) { update_drawable(); redraw(); }
         else if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
             E.focused = true;
             static double last_git = 0;
@@ -8239,7 +8336,7 @@ void handle_event(const SDL_Event &e) {
         }
         else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) { E.focused = false; E.blink_on = true; redraw(); }
         else if (e.window.event == SDL_WINDOWEVENT_LEAVE) { E.mx = E.my = -1; if (!E.pinned && E.side_open) E.side_close_at = E.now + 0.35; update_hover(); }
-        else if (e.window.event == SDL_WINDOWEVENT_EXPOSED) redraw();
+        else if (e.window.event == SDL_WINDOWEVENT_EXPOSED || e.window.event == SDL_WINDOWEVENT_SHOWN || e.window.event == SDL_WINDOWEVENT_RESTORED) { g_soft_expose = true; redraw(); }
         break;
     default: break;
     }
@@ -8259,7 +8356,7 @@ void run_script(const char *script) {
             if (!g_timed) return;
             for (int attempt = 0; attempt < 2; attempt++) {
                 uint32_t gen0 = atlas_generation(E.atlas);
-                r_begin(E.r, E.W, E.H, C_EDITOR);
+                begin_frame();
                 double b0 = now_s();
                 build_frame();
                 E.last_build_ms = (now_s() - b0) * 1000.0;
@@ -8625,6 +8722,7 @@ int main(int argc, char **argv) {
     std::vector<const char *> args;
     const char *shot = nullptr, *script = nullptr, *cli_theme = nullptr;
     int bench = 0;
+    const char *render_mode = getenv("HOOTEDIT_RENDER");   /* auto (default), cpu or gpu; --render overrides */
     bool stats_at_exit = false;
     double exit_after = 0, shot_after = 0.4;
     int win_w = 1280, win_h = 720;
@@ -8636,11 +8734,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--script") && i + 1 < argc) script = argv[++i];
         else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--timed")) g_timed = true;
+        else if (!strcmp(argv[i], "--render") && i + 1 < argc) render_mode = argv[++i];
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &win_w, &win_h);
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) cli_theme = argv[++i];
         else if (!strcmp(argv[i], "--version")) { puts("hootedit 0.3.1"); return 0; }
         else if (argv[i][0] != '-') args.push_back(argv[i]);
-        else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
+        else { fprintf(stderr, "usage: hootedit [--cache-stats] [--size WxH] [--shot FILE] [--exit-after SEC] [--script STEPS] [--bench N] [--render auto|cpu|gpu] [--theme NAME] [FILE|FOLDER...]\n       hootedit --bench-core FILE [REPS] [DIR]\n"); return 2; }
     }
     startup_mark("args parsed");
     settings_load();
@@ -8679,7 +8778,11 @@ int main(int argc, char **argv) {
     setenv("SDL_VIDEO_WAYLAND_WMCLASS", "hootedit", 1);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) { fprintf(stderr, "hootedit: SDL: %s\n", SDL_GetError()); return 1; }
     bool ok = false;
-    for (GlKind k : {GLK_CORE, GLK_ES3, GLK_ES2}) if ((ok = gl_init(k, win_w, win_h))) break;
+    bool want_cpu = render_mode && !strcmp(render_mode, "cpu");
+    if (!want_cpu && (!render_mode || !strcmp(render_mode, "auto"))) want_cpu = !has_gpu();
+    if (want_cpu) ok = gl_init(GLK_SOFT, win_w, win_h);
+    if (!ok) for (GlKind k : {GLK_CORE, GLK_ES3, GLK_ES2}) if ((ok = gl_init(k, win_w, win_h))) break;
+    if (!ok && !want_cpu) ok = gl_init(GLK_SOFT, win_w, win_h);   /* no OpenGL context at all: draw on the CPU instead of giving up */
     startup_mark("SDL + window + GL context");
     unsetenv("SDL_VIDEO_X11_WMCLASS");
     unsetenv("SDL_VIDEO_WAYLAND_WMCLASS");
@@ -8718,10 +8821,10 @@ int main(int argc, char **argv) {
     E.now = now_s();
     double t0 = E.now;
     E.last_active = E.last_blink = E.now;
-    r_begin(E.r, E.W, E.H, C_EDITOR);
+    begin_frame();
     build_frame();   /* the first frame: it also gives clicks and menus their hit boxes */
     r_end(E.r);
-    SDL_GL_SwapWindow(E.win);
+    present();
     g_startup_s = now_s() - g_t_start;
     startup_mark("first frame drawn");
     SDL_ShowWindow(E.win);   /* only now: the window appears with the editor in it */
@@ -8733,20 +8836,20 @@ int main(int argc, char **argv) {
         Doc &d = D();
         size_t nl = d.buf.lines();
         E.timing = true;
-        SDL_GL_SetSwapInterval(0);   /* with vsync on, the wait for the display lands in build_frame and hides the real cost */
+        if (!soft_mode()) SDL_GL_SetSwapInterval(0);   /* with vsync on, the wait for the display lands in build_frame and hides the real cost */
         for (int pass = 0; pass < 2; pass++) {
             E.t_top = E.t_rows = E.t_gutter = E.t_status = E.t_flush = 0;
             double sum_build = 0, sum_full = 0, worst = 0;
             for (int i = 0; i < bench; i++) {
                 d.top = (size_t)i % (nl > 60 ? nl - 60 : 1);
                 double c0 = now_s();
-                r_begin(E.r, E.W, E.H, C_EDITOR);
+                begin_frame();
                 build_frame();
                 double c1 = now_s();
                 r_end(E.r);
-                SDL_GL_SwapWindow(E.win);
+                present();
                 uint8_t sync[4];
-                glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sync);   /* waits for the GPU, so the frame time is the time to finished pixels */
+                if (!soft_mode()) glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sync);   /* waits for the GPU, so the frame time is the time to finished pixels */
                 double c2 = now_s();
                 sum_build += c1 - c0; sum_full += c2 - c0;
                 if (c1 - c0 > worst) worst = c1 - c0;
@@ -8766,7 +8869,7 @@ int main(int argc, char **argv) {
     while (E.running) {
         double due = E.next_hud ? E.next_hud : E.now;
         if (g_job.running || g_rjob.running) due = std::min(due, E.now + 0.2);
-        if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, E.last_blink + 0.53);
+        if (E.focused && E.now - E.last_active < BLINK_FOR) due = std::min(due, std::min(E.last_blink + 0.53, E.last_active + BLINK_FOR));   /* the second term wakes the loop when blinking ends: with the cursor in its off phase it stayed hidden until some other timer fired */
         if (E.side_close_at > 0) due = std::min(due, E.side_close_at);
         if (E.tip_at > 0) due = std::min(due, E.tip_at);
         if (E.lint_at > 0) due = std::min(due, E.lint_at);
@@ -8805,7 +8908,7 @@ int main(int argc, char **argv) {
             double c0 = now_s();
             for (int attempt = 0; attempt < 2; attempt++) {
                 uint32_t gen0 = atlas_generation(E.atlas);
-                r_begin(E.r, E.W, E.H, C_EDITOR);
+                begin_frame();
                 double b0 = now_s();
                 build_frame();
                 E.last_build_ms = (now_s() - b0) * 1000.0;
@@ -8815,7 +8918,7 @@ int main(int argc, char **argv) {
             end_op_if_pending();
             E.frames++;
             if (shot && E.now - t0 > shot_after) { write_ppm(shot); E.running = false; }
-            SDL_GL_SwapWindow(E.win);
+            present();
             double cost = now_s() - c0;
             E.frame_cost = E.frame_cost == 0 ? cost : E.frame_cost * 0.9 + cost * 0.1;
         }

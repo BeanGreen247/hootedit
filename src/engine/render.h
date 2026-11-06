@@ -12,6 +12,7 @@
 typedef struct { float x, y, w, h; uint16_t u0, v0, u1, v1; uint32_t rgba; uint32_t pad; } RInst;
 
 typedef struct Renderer Renderer;
+typedef struct { int x, y, w, h; } RSoftRect;
 
 Renderer *r_new(Atlas *a);
 void r_free(Renderer *r);
@@ -19,6 +20,13 @@ Atlas *r_atlas(Renderer *r);
 void r_begin(Renderer *r, int w, int h, uint32_t clear_rgba);
 void r_end(Renderer *r);
 void r_flush(Renderer *r);
+void r_soft_bgr(Renderer *r, int on);   /* keep blue in the low byte, the layout of an X11 XRGB8888 surface */
+int r_soft_is_bgr(const Renderer *r);
+/* CPU path: the rectangles that changed in the last r_end (empty: nothing to present); r_soft_invalidate makes the next frame repaint and present everything */
+const RSoftRect *r_soft_damage(const Renderer *r, int *n);
+void r_soft_invalidate(Renderer *r);
+void r_soft_target(Renderer *r, uint32_t *pixels);   /* draw straight into these w*h pixels (the window surface) instead of an own buffer; NULL goes back to the own buffer */
+const uint32_t *r_soft_pixels(const Renderer *r, int *w, int *h);   /* the CPU rasterizer's frame (RGBA bytes), NULL on the GL path */
 void r_clip(Renderer *r, int x, int y, int w, int h);
 void r_clip_off(Renderer *r);
 void r_rect(Renderer *r, float x, float y, float w, float h, uint32_t rgba);

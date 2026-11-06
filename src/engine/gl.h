@@ -8,7 +8,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
 
-typedef enum { GLK_CORE = 0, GLK_ES3 = 1, GLK_ES2 = 2 } GlKind;
+typedef enum { GLK_CORE = 0, GLK_ES3 = 1, GLK_ES2 = 2, GLK_SOFT = 3 } GlKind;   /* GLK_SOFT: no GL at all, the renderer rasterises on the CPU */
 extern GlKind sd_gl_kind;
 
 typedef struct {

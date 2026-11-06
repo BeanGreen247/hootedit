@@ -65,6 +65,9 @@ if gtest_dep.found()
     test(area, unit_tests, args: ['--gtest_filter=' + filter], suite: 'areas', protocol: 'gtest', timeout: 300)
   endforeach
 
+  raster_tests = executable('hootedit-raster-tests', files('tests/test_raster.cpp') + engine, include_directories: inc, dependencies: [gtest_dep] + deps, cpp_args: ['-fexceptions'], override_options: san)
+  test('raster', raster_tests, protocol: 'gtest', suite: 'areas', timeout: 120)
+
   perf_gate = executable('hootedit-perf-gate', files('tests/perf_gate.cpp', 'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp'),
     dependencies: [gtest_dep], cpp_args: ['-fexceptions'])
   test('perf-gate', perf_gate, protocol: 'gtest', suite: 'perf', timeout: 120, is_parallel: false)

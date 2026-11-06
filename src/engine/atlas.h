@@ -26,6 +26,7 @@ int atlas_ascii_filled(const Atlas *a);
 Atlas *atlas_new(int size);
 void atlas_free(Atlas *a);
 unsigned atlas_texture(const Atlas *a);
+const uint8_t *atlas_pixels(const Atlas *a);   /* the coverage bytes, size*size, only in the CPU rasterizer (else NULL) */
 int atlas_size(const Atlas *a);
 uint32_t atlas_generation(const Atlas *a);
 void atlas_white(const Atlas *a, uint16_t *x, uint16_t *y);
