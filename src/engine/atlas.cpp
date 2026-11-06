@@ -17,6 +17,7 @@ static inline GLint atlas_internal(void) { return sd_gl_kind == GLK_ES2 ? GL_LUM
 
 struct Atlas {
     GLuint tex;
+    uint8_t *pix;   /* CPU copy of the atlas, kept only when the CPU rasterizer is in use */
     int size;
     uint32_t generation;
     int shelf_y, shelf_h, pen_x;
@@ -45,16 +46,21 @@ static void atlas_reset(Atlas *a) {
     a->shelf_y = 2; a->shelf_h = 0; a->pen_x = 0;
     a->generation++;
     static const uint8_t white[4] = {255, 255, 255, 255};
-    glBindTexture(GL_TEXTURE_2D, a->tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, atlas_format(), GL_UNSIGNED_BYTE, white);
+    if (a->pix) {
+        for (int y = 0; y < 2; y++) memcpy(a->pix + (size_t)y * (size_t)a->size, white, 2);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, a->tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, atlas_format(), GL_UNSIGNED_BYTE, white);
+    }
     a->pen_x = 4;
     a->shelf_h = 2;
 }
 
 Atlas *atlas_new(int size) {
     GLint maxtex = 0;
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxtex);
+    bool soft = sd_gl_kind == GLK_SOFT;
+    if (!soft) glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxtex);
     if (maxtex > 0 && size > maxtex) size = maxtex;
     Atlas *a = static_cast<Atlas*>(calloc(1, sizeof *a));
     if (!a) return NULL;
@@ -62,14 +68,19 @@ Atlas *atlas_new(int size) {
     a->cap = 16384;
     a->tab = static_cast<Entry*>(calloc(a->cap, sizeof *a->tab));
     if (!a->tab) { free(a); return NULL; }
-    glGenTextures(1, &a->tex);
-    glBindTexture(GL_TEXTURE_2D, a->tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, atlas_internal(), size, size, 0, atlas_format(), GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (soft) {
+        a->pix = static_cast<uint8_t*>(calloc((size_t)size * (size_t)size, 1));
+        if (!a->pix) { free(a->tab); free(a); return NULL; }
+    } else {
+        glGenTextures(1, &a->tex);
+        glBindTexture(GL_TEXTURE_2D, a->tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, atlas_internal(), size, size, 0, atlas_format(), GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     atlas_reset(a);
     a->white_x = 0; a->white_y = 0;
     return a;
@@ -77,12 +88,13 @@ Atlas *atlas_new(int size) {
 
 void atlas_free(Atlas *a) {
     if (!a) return;
-    glDeleteTextures(1, &a->tex);
+    if (a->pix) free(a->pix); else glDeleteTextures(1, &a->tex);
     free(a->tab);
     free(a);
 }
 
 unsigned atlas_texture(const Atlas *a) { return a->tex; }
+const uint8_t *atlas_pixels(const Atlas *a) { return a->pix; }
 int atlas_size(const Atlas *a) { return a->size; }
 uint32_t atlas_generation(const Atlas *a) { return a->generation; }
 void atlas_white(const Atlas *a, uint16_t *x, uint16_t *y) { *x = a->white_x; *y = a->white_y; }
@@ -135,9 +147,13 @@ static const AtlasGlyph *insert(Atlas *a, uint32_t font, uint32_t cp, uint8_t st
     e->used = 1; e->font = font; e->cp = cp; e->style = style;
     e->g = (AtlasGlyph){(uint16_t)ox, (uint16_t)oy, (uint16_t)(blank ? 0 : w), (uint16_t)(blank ? 0 : h), (int16_t)left, (int16_t)top, adv, blank};
     if (!blank) {
-        glBindTexture(GL_TEXTURE_2D, a->tex);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, ox, oy, w, h, atlas_format(), GL_UNSIGNED_BYTE, bits);
+        if (a->pix) {
+            for (int y = 0; y < h; y++) memcpy(a->pix + ((size_t)(oy + y) * (size_t)a->size + (size_t)ox), bits + (size_t)y * (size_t)w, (size_t)w);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, a->tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, ox, oy, w, h, atlas_format(), GL_UNSIGNED_BYTE, bits);
+        }
     }
     return &e->g;
 }
