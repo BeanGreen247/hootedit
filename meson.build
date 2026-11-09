@@ -27,12 +27,12 @@ endforeach
 add_project_arguments(args, language: 'cpp')
 add_project_link_arguments(link_args, language: 'cpp')
 
-deps = [dependency('sdl2'), dependency('freetype2'), dependency('fontconfig'), dependency('threads')]
+deps = [dependency('sdl2'), dependency('freetype2'), dependency('fontconfig'), dependency('threads'), dependency('harfbuzz')]
 
-engine = files('src/engine/atlas.cpp', 'src/engine/font.cpp', 'src/engine/gl.cpp', 'src/engine/render.cpp')
-# Vendored from Lestrix 0289c8e: VT emulator, pty, terminal core and view, themes, fleetwm follow, shared helpers.
+engine = files('src/engine/atlas.cpp', 'src/engine/font.cpp', 'src/engine/gl.cpp', 'src/engine/render.cpp', 'src/engine/soft.cpp')
+# Vendored from Lestrix 1bab551 (0.4.2): VT emulator, pty, terminal core and view, themes, fleetwm follow, shared helpers.
 lestrix = files('src/lestrix/vt.cpp', 'src/lestrix/lz.cpp', 'src/lestrix/pty.cpp', 'src/lestrix/util.cpp',
-                'src/lestrix/ui/tcore.cpp', 'src/lestrix/ui/termview.cpp', 'src/lestrix/ui/workpool.cpp', 'src/lestrix/ui/fleetwm.cpp', 'src/lestrix/ui/uitheme.cpp')
+                'src/lestrix/ui/tcore.cpp', 'src/lestrix/ui/termview.cpp', 'src/lestrix/ui/workpool.cpp', 'src/lestrix/ui/fleetwm.cpp', 'src/lestrix/ui/uitheme.cpp', 'src/lestrix/ui/scan.cpp')
 inc = include_directories('src/engine')
 # Lestrix itself is built with exceptions on (fleetwm.cpp uses try/catch); Hootedit's own code is built without.
 lestrix_lib = static_library('lestrix_vendored', lestrix, include_directories: inc, cpp_args: ['-fexceptions'], dependencies: deps)

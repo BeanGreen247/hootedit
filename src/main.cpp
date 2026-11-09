@@ -6365,16 +6365,20 @@ void hud_tick() {
 
 /* ---- window ---- */
 
-SDL_Surface *g_soft_surf = nullptr;
-bool g_soft_expose = false;   /* the window needs its whole surface presented again (exposed, restored) */
-bool g_soft_accel = false;   /* second try of the CPU path: some X servers (Xvnc) have no plain framebuffer, so let SDL present the surface through a texture */   /* the window's own pixel surface, the CPU rasterizer's target */
+SDL_Surface *g_soft_surf = nullptr;   /* the window's own pixel surface, the CPU rasterizer's target */
+SDL_Surface *g_soft_back = nullptr;   /* 32-bit buffer drawn into when the window surface is not 32 bit (a 16-bit X display); SDL converts on present */
+const GlKind GLK_SOFT = static_cast<GlKind>(3);   /* gl_init's request for the CPU rasterizer: no GL context, sd_soft selects it inside the engine */
+bool g_soft_accel = false;   /* second try of the CPU path: some X servers (Xvnc) have no plain framebuffer, so let SDL present the surface through a texture */
 
 bool gl_init(GlKind kind, int w, int h) {
+    const bool soft = kind == GLK_SOFT;
     if (E.gl) { SDL_GL_DeleteContext(E.gl); E.gl = nullptr; }
     if (E.win) { SDL_DestroyWindow(E.win); E.win = nullptr; }
+    if (g_soft_back) { SDL_FreeSurface(g_soft_back); g_soft_back = nullptr; }
     g_soft_surf = nullptr;
-    if (kind == GLK_SOFT) { if (g_soft_accel) SDL_ResetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION); else SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0"); }   /* else SDL presents the surface through an OpenGL texture, i.e. software GL again */
-    if (kind == GLK_SOFT) {}
+    sd_soft = soft;   /* before the atlas and the renderer exist: both pick their CPU or GL storage from it */
+    if (soft) { if (g_soft_accel) SDL_ResetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION); else SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0"); }   /* else SDL presents the surface through an OpenGL texture, i.e. software GL again */
+    if (soft) {}
     else if (kind == GLK_CORE) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -6384,14 +6388,14 @@ bool gl_init(GlKind kind, int w, int h) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     }
-    E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, (kind == GLK_SOFT ? 0 : SDL_WINDOW_OPENGL) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN);   /* shown after the first frame is drawn: no empty window while the editor starts */
+    E.win = SDL_CreateWindow("Hootedit", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, (soft ? 0 : SDL_WINDOW_OPENGL) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN);   /* shown after the first frame is drawn: no empty window while the editor starts */
     if (E.win) {   /* the owl as the window icon (64x64, embedded) */
         SDL_Surface *ic = SDL_CreateRGBSurfaceWithFormatFrom((void *)APP_ICON_RGBA, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
         if (ic) { SDL_SetWindowIcon(E.win, ic); SDL_FreeSurface(ic); }
     }
     int ww = 0, wh = 0;
-    if (kind == GLK_SOFT) {
-        if (!E.win || sd_gl_load(kind)) return false;
+    if (soft) {
+        if (!E.win) return false;
         g_soft_surf = SDL_GetWindowSurface(E.win);
         if (!g_soft_surf) {
             if (g_soft_accel) { fprintf(stderr, "hootedit: CPU rasterizer: no window surface: %s\n", SDL_GetError()); return false; }
@@ -6414,9 +6418,7 @@ bool gl_init(GlKind kind, int w, int h) {
     E.atlas = atlas_new(E.scale > 1.5f ? 4096 : 2048);
     E.r = E.atlas ? r_new(E.atlas) : nullptr;
     if (!E.r) return false;
-    if (kind == GLK_SOFT) {
-        const SDL_PixelFormat *pf = g_soft_surf->format;   /* a 32-bit surface with red in bits 16..23 is drawn into as it is, anything else goes through SDL's converting blit */
-        if (pf->BitsPerPixel == 32 && pf->Rmask == 0x00ff0000u && pf->Gmask == 0x0000ff00u && pf->Bmask == 0x000000ffu) r_soft_bgr(E.r, 1);
+    if (soft) {
         snprintf(E.gl_desc, sizeof E.gl_desc, "CPU rasterizer");
         return true;
     }
@@ -6436,62 +6438,63 @@ bool has_gpu() {
     return found;
 }
 
-bool soft_mode() { return sd_gl_kind == GLK_SOFT; }
+bool soft_mode() { return sd_soft; }
 
 /* window size in pixels; on the CPU path the surface is re-fetched, SDL replaces it on every resize */
 void update_drawable() {
-    if (soft_mode()) { g_soft_surf = SDL_GetWindowSurface(E.win); if (g_soft_surf) { E.W = g_soft_surf->w; E.H = g_soft_surf->h; } }
+    if (soft_mode()) {
+        g_soft_surf = SDL_GetWindowSurface(E.win);
+        if (g_soft_surf) { E.W = g_soft_surf->w; E.H = g_soft_surf->h; }
+        if (E.r) r_soft_invalidate(E.r);   /* a resize hands out a new, empty surface (possibly at the same address and size as before): never trust the old pixels */
+    }
     else SDL_GL_GetDrawableSize(E.win, &E.W, &E.H);
 }
 
-/* starts a frame; on the CPU path with a surface in the renderer's own byte order the frame is drawn straight into the window's pixels, so presenting needs no copy */
+/* starts a frame; on the CPU path the renderer is pointed at the window's pixels (the surface changes on every resize), so presenting needs no copy */
 void begin_frame() {
-    if (soft_mode() && r_soft_is_bgr(E.r)) {
-        SDL_Surface *sf = SDL_GetWindowSurface(E.win);
-        if (sf != g_soft_surf) { g_soft_surf = sf; r_soft_invalidate(E.r); }
-        if (sf && sf->w == E.W && sf->h == E.H && sf->pitch == E.W * 4 && !SDL_MUSTLOCK(sf)) r_soft_target(E.r, (uint32_t *)sf->pixels);
-        else r_soft_target(E.r, nullptr);
+    if (soft_mode()) {
+        SDL_Surface *s = SDL_GetWindowSurface(E.win);
+        if (s) {
+            if (s != g_soft_surf) { g_soft_surf = s; r_soft_invalidate(E.r); }   /* SDL made a new surface (resize, restore): its pixels are empty */
+            E.W = s->w; E.H = s->h;
+            if (s->format->BytesPerPixel != 4 || SDL_MUSTLOCK(s)) {   /* e.g. a 16-bit X display: draw into a 32-bit buffer and let SDL convert on present */
+                if (g_soft_back && (g_soft_back->w != s->w || g_soft_back->h != s->h)) { SDL_FreeSurface(g_soft_back); g_soft_back = nullptr; }
+                if (!g_soft_back) { g_soft_back = SDL_CreateRGBSurfaceWithFormat(0, s->w, s->h, 32, SDL_PIXELFORMAT_RGB888); r_soft_invalidate(E.r); }
+                if (g_soft_back) s = g_soft_back;
+            } else if (g_soft_back) { SDL_FreeSurface(g_soft_back); g_soft_back = nullptr; r_soft_invalidate(E.r); }
+            const uint32_t amask = ~(s->format->Rmask | s->format->Gmask | s->format->Bmask);
+            r_set_target(E.r, static_cast<uint32_t *>(s->pixels), s->w, s->h, s->pitch / 4, __builtin_ctz(s->format->Rmask), __builtin_ctz(s->format->Gmask), __builtin_ctz(s->format->Bmask), amask);
+        }
     }
     r_begin(E.r, E.W, E.H, C_EDITOR);
 }
 
-/* shows the finished frame: a buffer swap on the GPU path, a blit into the window surface on the CPU path (the buffer is RGBA bytes, the surface may be 16 or 24 bit) */
+/* shows the finished frame: a buffer swap on the GPU path, only the rectangles the renderer repainted on the CPU path */
 void present() {
     if (!soft_mode()) { SDL_GL_SwapWindow(E.win); return; }
-    int w = 0, h = 0, n = 0;
-    const uint32_t *px = r_soft_pixels(E.r, &w, &h);
-    if (!px || !g_soft_surf) return;
-    SDL_Surface *now = SDL_GetWindowSurface(E.win);
-    if (now != g_soft_surf) { g_soft_surf = now; r_soft_invalidate(E.r); }   /* SDL made a new surface (resize, restore): its pixels are empty */
-    if (!g_soft_surf) return;
-    const RSoftRect *dm = r_soft_damage(E.r, &n);
-    if (n == 0 && !g_soft_expose) return;   /* nothing changed: no copy, no round trip to the X server */
-    std::vector<SDL_Rect> rc;
-    if (g_soft_expose || n == 0) { rc.push_back({0, 0, w, h}); g_soft_expose = false; }
-    else for (int i = 0; i < n; i++) rc.push_back({dm[i].x, dm[i].y, dm[i].w, dm[i].h});
-    if (r_soft_is_bgr(E.r) && g_soft_surf->w == w && g_soft_surf->h == h && g_soft_surf->pitch == w * 4 && !SDL_MUSTLOCK(g_soft_surf)) {
-        if ((const uint32_t *)g_soft_surf->pixels != px)
-        for (const SDL_Rect &q : rc)   /* same layout: copy the damaged rows as they are */
-            for (int y = q.y; y < q.y + q.h; y++) memcpy((uint8_t *)g_soft_surf->pixels + (size_t)y * (size_t)g_soft_surf->pitch + (size_t)q.x * 4, px + (size_t)y * (size_t)w + (size_t)q.x, (size_t)q.w * 4);
-        SDL_UpdateWindowSurfaceRects(E.win, rc.data(), (int)rc.size());
-        return;
+    size_t nd = 0;
+    const RDamage *dm = r_damage(E.r, &nd);
+    if (!nd) return;   /* nothing changed: no copy, no round trip to the X server */
+    std::vector<SDL_Rect> rc(nd);
+    for (size_t i = 0; i < nd; i++) rc[i] = SDL_Rect{dm[i].x, dm[i].y, dm[i].w, dm[i].h};
+    if (g_soft_back) {
+        SDL_Surface *ws = SDL_GetWindowSurface(E.win);
+        if (ws) for (const SDL_Rect &q : rc) { SDL_Rect s = q, d = q; SDL_BlitSurface(g_soft_back, &s, ws, &d); }
     }
-    SDL_Surface *src = SDL_CreateRGBSurfaceWithFormatFrom((void *)px, w, h, 32, w * 4, r_soft_is_bgr(E.r) ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_RGBA32);
-    if (!src) return;
-    for (SDL_Rect &q : rc) { SDL_Rect d = q; SDL_BlitSurface(src, &q, g_soft_surf, &d); }
-    SDL_FreeSurface(src);
-    SDL_UpdateWindowSurfaceRects(E.win, rc.data(), (int)rc.size());
+    SDL_UpdateWindowSurfaceRects(E.win, rc.data(), (int)nd);
 }
 
 void write_ppm(const char *file) {
     if (soft_mode()) {
-        int w = 0, h = 0;
-        const uint32_t *fb = r_soft_pixels(E.r, &w, &h);
-        FILE *f = fb ? fopen(file, "wb") : nullptr;
+        SDL_Surface *s = g_soft_back ? g_soft_back : g_soft_surf;
+        FILE *f = s ? fopen(file, "wb") : nullptr;
         if (!f) return;
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        bool bgr = r_soft_is_bgr(E.r);
-        for (size_t i = 0; i < (size_t)w * (size_t)h; i++) { uint32_t p = fb[i]; uint8_t c[3] = {(uint8_t)(bgr ? p >> 16 : p), (uint8_t)(p >> 8), (uint8_t)(bgr ? p : p >> 16)}; fwrite(c, 1, 3, f); }
+        fprintf(f, "P6\n%d %d\n255\n", s->w, s->h);
+        const int rs = __builtin_ctz(s->format->Rmask), gs = __builtin_ctz(s->format->Gmask), bs = __builtin_ctz(s->format->Bmask);
+        for (int y = 0; y < s->h; y++) {
+            const uint32_t *row = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(s->pixels) + (size_t)y * (size_t)s->pitch);
+            for (int x = 0; x < s->w; x++) { uint8_t c[3] = {(uint8_t)(row[x] >> rs), (uint8_t)(row[x] >> gs), (uint8_t)(row[x] >> bs)}; fwrite(c, 1, 3, f); }
+        }
         fclose(f);
         return;
     }
@@ -8367,7 +8370,7 @@ void handle_event(const SDL_Event &e) {
         }
         else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) { E.focused = false; E.blink_on = true; redraw(); }
         else if (e.window.event == SDL_WINDOWEVENT_LEAVE) { E.mx = E.my = -1; if (!E.pinned && E.side_open) E.side_close_at = E.now + 0.35; update_hover(); }
-        else if (e.window.event == SDL_WINDOWEVENT_EXPOSED || e.window.event == SDL_WINDOWEVENT_SHOWN || e.window.event == SDL_WINDOWEVENT_RESTORED) { g_soft_expose = true; redraw(); }
+        else if (e.window.event == SDL_WINDOWEVENT_EXPOSED || e.window.event == SDL_WINDOWEVENT_SHOWN || e.window.event == SDL_WINDOWEVENT_RESTORED) { if (soft_mode() && E.r) r_soft_invalidate(E.r); redraw(); }   /* CPU path: the window surface may be blank now, so the frame about to be drawn repaints and presents everything */
         break;
     default: break;
     }
@@ -8442,6 +8445,12 @@ void run_script(const char *script) {
         }
         if (step == "frame") { begin_op("empty frame (nothing changed, full redraw)"); frame_if_timed(); continue; }
         if (step.compare(0, 5, "open:") == 0) { open_path(step.substr(5)); frame_if_timed(); continue; }
+        if (step.compare(0, 5, "diff:") == 0) {   /* diff:PATH,REV_A,REV_B opens the compare tab of one file between two revisions (test hook) */
+            std::string a = step.substr(5);
+            size_t c1 = a.find(','), c2 = c1 == std::string::npos ? c1 : a.find(',', c1 + 1);
+            if (c2 != std::string::npos) open_compare_diff(a.substr(0, c1), a.substr(c1 + 1, c2 - c1 - 1), a.substr(c2 + 1));
+            build_frame(); frame_if_timed(); continue;
+        }
         if (step.compare(0, 5, "text:") == 0) { text_input(step.c_str() + 5); frame_if_timed(); continue; }
         if (step.compare(0, 5, "menu:") == 0) { open_menu(atoi(step.c_str() + 5)); frame_if_timed(); continue; }
         if (step.compare(0, 4, "mod:") == 0) {   /* mod:ctrl, mod:shift or mod:none holds a modifier for the following clicks (test hook) */
@@ -8870,7 +8879,7 @@ int main(int argc, char **argv) {
         if (!soft_mode()) SDL_GL_SetSwapInterval(0);   /* with vsync on, the wait for the display lands in build_frame and hides the real cost */
         for (int pass = 0; pass < 2; pass++) {
             E.t_top = E.t_rows = E.t_gutter = E.t_status = E.t_flush = 0;
-            double sum_build = 0, sum_full = 0, worst = 0;
+            double sum_build = 0, sum_full = 0, worst = 0, sum_end = 0;
             for (int i = 0; i < bench; i++) {
                 d.top = (size_t)i % (nl > 60 ? nl - 60 : 1);
                 double c0 = now_s();
@@ -8878,15 +8887,17 @@ int main(int argc, char **argv) {
                 build_frame();
                 double c1 = now_s();
                 r_end(E.r);
+                double c15 = now_s();
                 present();
                 uint8_t sync[4];
                 if (!soft_mode()) glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sync);   /* waits for the GPU, so the frame time is the time to finished pixels */
                 double c2 = now_s();
-                sum_build += c1 - c0; sum_full += c2 - c0;
+                sum_build += c1 - c0; sum_full += c2 - c0; sum_end += c15 - c1;
                 if (c1 - c0 > worst) worst = c1 - c0;
             }
             printf("bench pass %d (%s): build_frame %.1f us avg, worst %.1f us; with GL submit+swap+finish %.1f us (%s)\n", pass + 1,
                    pass == 0 ? "cold caches" : "warm row cache", sum_build / bench * 1e6, worst * 1e6, sum_full / bench * 1e6, E.gl_desc);
+            printf("  r_end (%s) %.1f us avg, present %.1f us avg\n", soft_mode() ? "rasterize" : "GL submit", sum_end / bench * 1e6, (sum_full - sum_end - sum_build) / bench * 1e6);
             printf("  per frame: tab row %.1f us, text rows (hash+lookup+push, no GL) %.1f us, clip flush (GL) %.1f us, editor area incl. rows %.1f us, status bar %.1f us\n",
                    E.t_top / bench * 1e6, E.t_rows / bench * 1e6, E.t_flush / bench * 1e6, E.t_gutter / bench * 1e6, E.t_status / bench * 1e6);
         }

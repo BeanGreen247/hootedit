@@ -7,50 +7,111 @@
 
 #include <math.h>
 #include <unistd.h>
-#include <vector>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "gl.h"
+#include "soft.h"
+
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 typedef struct { float x, y, u, v; uint32_t rgba; float lx, ly, sw, sh, ar, ab; } V2;
-struct SClip { int x, y, w, h; };
-#define TILE 32
-struct SoftState {
-    std::vector<RInst> insts;          /* the whole frame, in draw order */
-    std::vector<int> inst_clip;        /* per instance: index into clips, -1 = none */
-    std::vector<SClip> clips;
-    int cur_clip = -1;
-    std::vector<int> bbox;             /* per instance x0,y0,x1,y1 in pixels, clipped; empty when it draws nothing */
-    std::vector<uint32_t> bin_start, bin_item;
-    std::vector<uint64_t> hash, prev_hash;
-    std::vector<uint8_t> dirty;
-    std::vector<uint32_t> ref;         /* verifier: the same frame painted from scratch */
-    int tw = 0, th = 0, pw = 0, ph = 0;   /* tile grid, size of the frame the hashes belong to */
-    uint32_t clear_px = 0, gen = ~0u;
-    int force_full = 1, verify = 0;
-    std::vector<RSoftRect> rects;
-};
 #define MAXQ 16384
 
 struct Renderer {
     Atlas *atlas;
     GLuint prog, vao, vbo, ibo;
     V2 *v2;
-    GLint u_res, u_atlas;
+    GLint u_res, u_atlas, u_color;
     RInst *buf;
     size_t n, cap;
     size_t vbo_cap;
     int w, h;
     int clip_on, cx, cy, cw, ch;
-    struct SoftState *ss;   /* CPU path: deferred frame, tile hashes, damage */
-    int swap_rb;        /* soft: the target keeps blue in the low byte (X11 XRGB8888): colours are swapped on the way in so the frame can be copied as it is */
-    int soft;           /* 1: the CPU rasterizer draws into fb, no GL object exists */
-    uint32_t *ext_fb;   /* soft: caller-owned pixels used as fb for this frame, or NULL */
-    uint32_t *fb;       /* w*h pixels, RGBA byte order (R in the low byte), alpha stays 255 */
-    size_t fb_cap;
+    SoftTarget st;   /* software rendering target, set by r_set_target before each frame */
+    SoftClip sclip;
+    struct SoftState *ss;
+    struct GlImages *gi;   /* texture cache and program for inline images, created on first use */
 };
+
+/* Software rendering keeps the pixels of the previous frame and repaints only what changed. The window is cut into
+ * tiles; every instance mixes a hash of itself (and its clip) into the tiles it touches, in draw order, so a tile whose
+ * hash is the same as last frame would be painted identically and is skipped. Painted tiles of a row are merged into
+ * runs, cleared to the background and redrawn from the instances that touch that row. */
+enum { TILE = 32 };
+struct SoftState {
+    std::vector<RInst> inst;
+    std::vector<uint16_t> clipid;
+    std::vector<SoftClip> clips;
+    uint16_t cur_clip = 0;
+    std::vector<uint64_t> prev, cur;
+    std::vector<uint8_t> dirty;
+    std::vector<std::vector<uint32_t>> bins;
+    std::vector<RDamage> damage;
+    uint32_t bg = 0, prev_bg = 0, prev_gen = 0;
+    SoftTarget prev_t{};
+    bool invalid = true;
+    struct SImg { const uint32_t *px; int w, h; void *owner; void (*release)(void *); };
+    std::unordered_map<uint32_t, SImg> imgs;   /* images of the frame being built, each holding its pixels alive */
+    SoftImage found{};
+    void drop_images() { for (auto &kv : imgs) if (kv.second.release) kv.second.release(kv.second.owner); imgs.clear(); }
+};
+
+static const SoftImage *soft_find_image(void *ctx, uint32_t serial) {
+    SoftState *s = static_cast<SoftState *>(ctx);
+    auto it = s->imgs.find(serial);
+    if (it == s->imgs.end()) return nullptr;
+    static thread_local SoftImage found;   /* painted from several threads: no shared scratch */
+    found = SoftImage{it->second.px, it->second.w, it->second.h};
+    return &found;
+}
+
+struct GlTex { GLuint tex; int w, h; uint64_t last; };
+struct GlImages {
+    std::unordered_map<uint32_t, GlTex> tex;
+    GLuint prog = 0, vao = 0, vbo = 0;   /* vbo: the ES2 corner buffer */
+    GLint u_res = -1, u_pos = -1, u_size = -1, u_uv0 = -1, u_uv1 = -1, u_img = -1;
+    uint64_t frame = 0;
+    bool failed = false;
+    GLint max_tex = 0;
+};
+
+static const char *IMG_VS =
+    "uniform vec2 u_res; uniform vec2 u_pos; uniform vec2 u_size; uniform vec2 u_uv0; uniform vec2 u_uv1;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "  vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+    "  vec2 p = u_pos + c * u_size;\n"
+    "  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, 0.0, 1.0);\n"
+    "  v_uv = mix(u_uv0, u_uv1, c);\n"
+    "}\n";
+static const char *IMG_FS =
+    "in vec2 v_uv; uniform sampler2D u_img; out vec4 o;\n"
+    "void main() { o = texture(u_img, v_uv); }\n";
+
+/* OpenGL ES 2 has no gl_VertexID and no instancing: the image quad comes from four fixed corners in a small buffer. */
+static const char *IMG_VS2 =
+    "#version 100\n"
+    "attribute vec2 a_c;\n"
+    "uniform vec2 u_res; uniform vec2 u_pos; uniform vec2 u_size; uniform vec2 u_uv0; uniform vec2 u_uv1;\n"
+    "varying vec2 v_uv;\n"
+    "void main() {\n"
+    "  vec2 p = u_pos + a_c * u_size;\n"
+    "  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, 0.0, 1.0);\n"
+    "  v_uv = mix(u_uv0, u_uv1, a_c);\n"
+    "}\n";
+static const char *IMG_FS2 =
+    "#version 100\n"
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
+    "varying vec2 v_uv; uniform sampler2D u_img;\n"
+    "void main() { gl_FragColor = texture2D(u_img, v_uv); }\n";
 
 #define SDF_BODY \
     "  float a = TEX(u_atlas, v_uv).r;\n" \
@@ -70,22 +131,24 @@ static const char *VS3 =
     "layout(location=2) in vec4 a_col;\n"
     "layout(location=3) in vec4 a_aux;\n"
     "uniform vec2 u_res;\n"
-    "out vec2 v_uv; out vec4 v_col; out vec2 v_local; out vec2 v_size; out vec2 v_aux;\n"
+    "out vec2 v_uv; out vec4 v_col; out vec2 v_local; out vec2 v_size; out vec2 v_aux; flat out float v_clr;\n"
     "void main() {\n"
     "  vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
     "  vec2 p = a_rect.xy + c * a_rect.zw;\n"
     "  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, 0.0, 1.0);\n"
     "  v_uv = mix(a_uv.xy, a_uv.zw, c);\n"
     "  v_col = a_col;\n"
-    "  v_local = c * a_rect.zw; v_size = a_rect.zw; v_aux = a_aux.xy * 255.0;\n"
+    "  v_local = c * a_rect.zw; v_size = a_rect.zw; v_aux = a_aux.xy * 255.0; v_clr = a_aux.z;\n"
     "}\n";
 
 static const char *FS3 =
-    "in vec2 v_uv; in vec4 v_col; in vec2 v_local; in vec2 v_size; in vec2 v_aux;\n"
+    "in vec2 v_uv; in vec4 v_col; in vec2 v_local; in vec2 v_size; in vec2 v_aux; flat in float v_clr;\n"
     "uniform sampler2D u_atlas;\n"
+    "uniform sampler2D u_color;\n"
     "out vec4 o;\n"
     "#define TEX texture\n"
     "void main() {\n"
+    "  if (v_clr > 0.5) { vec4 t = texture(u_color, v_uv); o = vec4(t.rgb, t.a * v_col.a); return; }\n"
     SDF_BODY
     "  o = vec4(v_col.rgb, v_col.a * a);\n"
     "}\n";
@@ -110,280 +173,6 @@ static const char *FS2 =
     SDF_BODY
     "  gl_FragColor = vec4(v_col.rgb, v_col.a * a);\n"
     "}\n";
-
-
-/* ---- CPU rasterizer: the same instruction stream as the GL path, drawn into a pixel buffer ----
-   Pixel rule: a pixel belongs to a quad when its centre is inside (ceil(x - 0.5)), like the GPU. Blend: integer
-   t = s*a + d*(255-a) + 128, (t + (t >> 8)) >> 8, which is exact division by 255 with rounding. */
-
-static inline uint32_t blend_px(uint32_t d, uint32_t src, uint32_t a) {   /* src RGB in the low 24 bits, a in 0..255; two 16-bit lanes per multiply */
-    uint32_t ia = 255 - a;
-    uint32_t rb = (src & 0x00ff00ffu) * a + (d & 0x00ff00ffu) * ia + 0x00800080u;
-    uint32_t g = (src & 0x0000ff00u) * a + (d & 0x0000ff00u) * ia + 0x00008000u;
-    rb = ((rb + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
-    g = ((g + ((g >> 8) & 0x0000ff00u)) >> 8) & 0x0000ff00u;
-    return rb | g | 0xff000000u;
-}
-
-static inline int ceil_i(float v) { int i = (int)v; return (float)i < v ? i + 1 : i; }
-
-/* draws one instance inside [cx0,cx1) x [cy0,cy1), which the caller has already cut down to the frame and the instance's clip */
-static void soft_inst(Renderer *r, const RInst *s, int cx0, int cy0, int cx1, int cy1) {
-    int x0 = ceil_i(s->x - 0.5f), x1 = ceil_i(s->x + s->w - 0.5f), y0 = ceil_i(s->y - 0.5f), y1 = ceil_i(s->y + s->h - 0.5f);
-    if (x0 < cx0) x0 = cx0;
-    if (y0 < cy0) y0 = cy0;
-    if (x1 > cx1) x1 = cx1;
-    if (y1 > cy1) y1 = cy1;
-    if (x0 >= x1 || y0 >= y1) return;
-    uint32_t ca = s->rgba >> 24, src = s->rgba & 0xffffffu;
-    if (!ca) return;
-    if (r->swap_rb) src = ((src & 255) << 16) | (src & 0xff00u) | (src >> 16);
-    const uint8_t *pix = atlas_pixels(r->atlas);
-    const int asz = atlas_size(r->atlas);
-    const float tscale = (float)asz / 65535.f;
-    const int sdf = (s->pad & 0xffff) != 0;
-    const int solid = s->u0 == s->u1 && s->v0 == s->v1;
-    if (solid && !sdf) {   /* a flat rectangle: every texel it could sample is the white 2x2 block */
-        if (ca == 255) {
-            uint32_t px = src | 0xff000000u;
-            for (int y = y0; y < y1; y++) {
-                uint32_t *row = r->fb + (size_t)y * (size_t)r->w;
-                for (int x = x0; x < x1; x++) row[x] = px;
-            }
-        } else {
-            for (int y = y0; y < y1; y++) {
-                uint32_t *row = r->fb + (size_t)y * (size_t)r->w;
-                for (int x = x0; x < x1; x++) row[x] = blend_px(row[x], src, ca);
-            }
-        }
-        return;
-    }
-    /* texel position of pixel centre (px+0.5, py+0.5): the quad maps linearly onto [u0,u1] x [v0,v1] */
-    const float fu0 = (float)s->u0 * tscale, fv0 = (float)s->v0 * tscale, fu1 = (float)s->u1 * tscale, fv1 = (float)s->v1 * tscale;
-    const float du = s->w > 0 ? (fu1 - fu0) / s->w : 0.f, dv = s->h > 0 ? (fv1 - fv0) / s->h : 0.f;
-    if (!sdf && du == 1.f && dv == 1.f) {   /* a glyph copied 1:1: with integer pixels the texel is x + k, no per-pixel float */
-        int kx = (int)floorf(fu0 - s->x + 0.5f), ky = (int)floorf(fv0 - s->y + 0.5f);
-        if (x0 + kx < 0) x0 = -kx;
-        if (x1 + kx > asz) x1 = asz - kx;
-        if (y0 + ky < 0) y0 = -ky;
-        if (y1 + ky > asz) y1 = asz - ky;
-        for (int y = y0; y < y1; y++) {
-            uint32_t *row = r->fb + (size_t)y * (size_t)r->w;
-            const uint8_t *trow = pix + (size_t)(y + ky) * (size_t)asz + kx;
-            if (ca == 255) {
-                uint32_t full = src | 0xff000000u;
-                for (int x = x0; x < x1; x++) {
-                    uint32_t cov = trow[x];
-                    if (cov) row[x] = cov == 255 ? full : blend_px(row[x], src, cov);
-                }
-            } else {
-                for (int x = x0; x < x1; x++) {
-                    uint32_t cov = trow[x];
-                    if (cov) row[x] = blend_px(row[x], src, (ca * cov + 127) / 255);
-                }
-            }
-        }
-        return;
-    }
-    const float rad_in = (float)(s->pad & 255), bw = (float)((s->pad >> 8) & 255);
-    const float hx = 0.5f * s->w, hy = 0.5f * s->h;
-    const float rad = rad_in < hx ? (rad_in < hy ? rad_in : hy) : (hx < hy ? hx : hy);
-    for (int y = y0; y < y1; y++) {
-        uint32_t *row = r->fb + (size_t)y * (size_t)r->w;
-        float ly = (float)y + 0.5f - s->y;
-        int ty = (int)(fv0 + ly * dv);
-        if (ty < 0) ty = 0;
-        if (ty >= asz) ty = asz - 1;
-        const uint8_t *trow = pix + (size_t)ty * (size_t)asz;
-        for (int x = x0; x < x1; x++) {
-            float lx = (float)x + 0.5f - s->x;
-            int tx = (int)(fu0 + lx * du);
-            if (tx < 0) tx = 0;
-            if (tx >= asz) tx = asz - 1;
-            uint32_t cov = trow[tx];
-            if (!cov) continue;
-            if (sdf) {
-                float qx = (lx > hx ? lx - hx : hx - lx) - (hx - rad), qy = (ly > hy ? ly - hy : hy - ly) - (hy - rad);
-                float mx = qx > 0 ? qx : 0, my = qy > 0 ? qy : 0;
-                float d = sqrtf(mx * mx + my * my) + (qx > qy ? (qx < 0 ? qx : 0) : (qy < 0 ? qy : 0)) - rad;
-                float c = 0.5f - d;
-                c = c < 0 ? 0 : c > 1 ? 1 : c;
-                if (bw > 0) {
-                    float c2 = 0.5f - (d + bw);
-                    c2 = c2 < 0 ? 0 : c2 > 1 ? 1 : c2;
-                    c = c - c2 > 0 ? c - c2 : 0;
-                }
-                cov = (uint32_t)((float)cov * c + 0.5f);
-                if (!cov) continue;
-            }
-            uint32_t a = ca == 255 ? cov : (ca * cov + 127) / 255;
-            if (!a) continue;
-            row[x] = a == 255 ? (src | 0xff000000u) : blend_px(row[x], src, a);
-        }
-    }
-}
-
-static inline uint64_t mix64(uint64_t h, uint64_t v) { h = (h ^ v) * 0x9E3779B97F4A7C15ull; return h ^ (h >> 29); }
-
-static inline void clip_of(const Renderer *r, int ci, int *x0, int *y0, int *x1, int *y1) {
-    *x0 = 0; *y0 = 0; *x1 = r->w; *y1 = r->h;
-    if (ci < 0) return;
-    const SClip &c = r->ss->clips[(size_t)ci];
-    if (c.x > *x0) *x0 = c.x;
-    if (c.y > *y0) *y0 = c.y;
-    if (c.x + c.w < *x1) *x1 = c.x + c.w;
-    if (c.y + c.h < *y1) *y1 = c.y + c.h;
-}
-
-static void soft_flush(Renderer *r) {   /* the frame is only collected here; r_end hashes it per tile and paints what changed */
-    SoftState *ss = r->ss;
-    ss->insts.insert(ss->insts.end(), r->buf, r->buf + r->n);
-    ss->inst_clip.insert(ss->inst_clip.end(), r->n, ss->cur_clip);
-    r->n = 0;
-}
-
-static void soft_paint_all(Renderer *r, uint32_t *fb) {
-    SoftState *ss = r->ss;
-    uint32_t *keep = r->fb;
-    r->fb = fb;
-    size_t total = (size_t)r->w * (size_t)r->h;
-    for (size_t i = 0; i < total; i++) fb[i] = ss->clear_px;
-    for (size_t i = 0; i < ss->insts.size(); i++) {
-        int x0, y0, x1, y1;
-        clip_of(r, ss->inst_clip[i], &x0, &y0, &x1, &y1);
-        soft_inst(r, &ss->insts[i], x0, y0, x1, y1);
-    }
-    r->fb = keep;
-}
-
-static void soft_bin(Renderer *r, int tw, int th) {   /* pixel box of every instance, then the instances listed per tile in draw order */
-    SoftState *ss = r->ss;
-    const size_t n = ss->insts.size(), ntiles = (size_t)tw * (size_t)th;
-    ss->bbox.resize(n * 4);
-    ss->bin_start.assign(ntiles + 1, 0);
-    for (size_t i = 0; i < n; i++) {
-        const RInst *s = &ss->insts[i];
-        int cx0, cy0, cx1, cy1;
-        clip_of(r, ss->inst_clip[i], &cx0, &cy0, &cx1, &cy1);
-        int x0 = ceil_i(s->x - 0.5f), x1 = ceil_i(s->x + s->w - 0.5f), y0 = ceil_i(s->y - 0.5f), y1 = ceil_i(s->y + s->h - 0.5f);
-        if (x0 < cx0) x0 = cx0;
-        if (y0 < cy0) y0 = cy0;
-        if (x1 > cx1) x1 = cx1;
-        if (y1 > cy1) y1 = cy1;
-        if (x0 >= x1 || y0 >= y1 || !(s->rgba >> 24)) x1 = x0;
-        int *b = &ss->bbox[i * 4];
-        b[0] = x0; b[1] = y0; b[2] = x1; b[3] = y1;
-        if (x0 >= x1) continue;
-        for (int ty = y0 / TILE; ty <= (y1 - 1) / TILE; ty++)
-            for (int tx = x0 / TILE; tx <= (x1 - 1) / TILE; tx++) ss->bin_start[(size_t)ty * (size_t)tw + (size_t)tx + 1]++;
-    }
-    for (size_t t = 0; t < ntiles; t++) ss->bin_start[t + 1] += ss->bin_start[t];
-    ss->bin_item.resize(ss->bin_start[ntiles]);
-    std::vector<uint32_t> fill(ss->bin_start.begin(), ss->bin_start.end() - 1);
-    for (size_t i = 0; i < n; i++) {
-        const int *b = &ss->bbox[i * 4];
-        if (b[0] >= b[2]) continue;
-        for (int ty = b[1] / TILE; ty <= (b[3] - 1) / TILE; ty++)
-            for (int tx = b[0] / TILE; tx <= (b[2] - 1) / TILE; tx++) ss->bin_item[fill[(size_t)ty * (size_t)tw + (size_t)tx]++] = (uint32_t)i;
-    }
-}
-
-static void soft_end(Renderer *r) {
-    SoftState *ss = r->ss;
-    soft_flush(r);
-    const int w = r->w, h = r->h;
-    ss->rects.clear();
-    if (w > 0 && h > 0 && r->fb) {
-        const uint32_t gen = atlas_generation(r->atlas);
-        if (ss->pw != w || ss->ph != h || ss->gen != gen) ss->force_full = 1;   /* a recycled atlas reuses texel positions for other glyphs */
-        const int tw = (w + TILE - 1) / TILE, th = (h + TILE - 1) / TILE;
-        const size_t ntiles = (size_t)tw * (size_t)th;
-        soft_bin(r, tw, th);
-        ss->hash.assign(ntiles, 0);
-        ss->dirty.assign(ntiles, 0);
-        size_t ndirty = 0;
-        for (size_t t = 0; t < ntiles; t++) {   /* one hash per tile over everything that can reach it, in draw order */
-            uint64_t hv = mix64(0x1234567ull, ss->clear_px);
-            for (uint32_t k = ss->bin_start[t]; k < ss->bin_start[t + 1]; k++) {
-                uint32_t i = ss->bin_item[k];
-                uint64_t words[4];
-                memcpy(words, &ss->insts[i], sizeof words);   /* RInst is 32 bytes */
-                for (int q = 0; q < 4; q++) hv = mix64(hv, words[q]);
-                int ci = ss->inst_clip[i];
-                if (ci >= 0) { const SClip &c = ss->clips[(size_t)ci]; hv = mix64(hv, (uint64_t)(uint16_t)c.x | (uint64_t)(uint16_t)c.y << 16 | (uint64_t)(uint16_t)c.w << 32 | (uint64_t)(uint16_t)c.h << 48); }
-            }
-            ss->hash[t] = hv;
-            if (t >= ss->prev_hash.size() || ss->prev_hash[t] != hv) { ss->dirty[t] = 1; ndirty++; }
-        }
-        if (ss->force_full || ndirty * 10 > ntiles * 6) {   /* most of the frame changes: one pass over the instances beats per tile setup */
-            soft_paint_all(r, r->fb);
-            ss->rects.push_back({0, 0, w, h});
-        } else if (ndirty) {
-            for (int ty = 0; ty < th; ty++)
-                for (int tx = 0; tx < tw; tx++) {
-                    size_t t = (size_t)ty * (size_t)tw + (size_t)tx;
-                    if (!ss->dirty[t]) continue;
-                    int bx0 = tx * TILE, by0 = ty * TILE, bx1 = bx0 + TILE < w ? bx0 + TILE : w, by1 = by0 + TILE < h ? by0 + TILE : h;
-                    for (int y = by0; y < by1; y++) { uint32_t *row = r->fb + (size_t)y * (size_t)w; for (int x = bx0; x < bx1; x++) row[x] = ss->clear_px; }
-                    for (uint32_t k = ss->bin_start[t]; k < ss->bin_start[t + 1]; k++) {
-                        uint32_t i = ss->bin_item[k];
-                        const int *b = &ss->bbox[(size_t)i * 4];
-                        soft_inst(r, &ss->insts[i], b[0] > bx0 ? b[0] : bx0, b[1] > by0 ? b[1] : by0, b[2] < bx1 ? b[2] : bx1, b[3] < by1 ? b[3] : by1);
-                    }
-                }
-            for (int ty = 0; ty < th; ty++) {   /* damage rectangles: runs of dirty tiles in a row, equal runs of consecutive rows joined */
-                int tx = 0;
-                while (tx < tw) {
-                    if (!ss->dirty[(size_t)ty * (size_t)tw + (size_t)tx]) { tx++; continue; }
-                    int e = tx;
-                    while (e < tw && ss->dirty[(size_t)ty * (size_t)tw + (size_t)e]) e++;
-                    RSoftRect rc = {tx * TILE, ty * TILE, (e < tw ? e * TILE : w) - tx * TILE, (ty + 1) * TILE < h ? TILE : h - ty * TILE};
-                    bool merged = false;
-                    for (RSoftRect &o : ss->rects)
-                        if (o.x == rc.x && o.w == rc.w && o.y + o.h == rc.y) { o.h += rc.h; merged = true; break; }
-                    if (!merged) ss->rects.push_back(rc);
-                    tx = e;
-                }
-            }
-        }
-        ss->prev_hash.swap(ss->hash);
-        ss->pw = w; ss->ph = h; ss->gen = gen; ss->force_full = 0;
-        if (ss->verify) {   /* the incremental frame must equal one painted from scratch; a mismatch is a bug in the damage tracking */
-            ss->ref.resize((size_t)w * (size_t)h);
-            soft_paint_all(r, ss->ref.data());
-            if (memcmp(ss->ref.data(), r->fb, (size_t)w * (size_t)h * 4) != 0) {
-                size_t bad = 0, first = 0;
-                for (size_t i = 0; i < (size_t)w * (size_t)h; i++) if (ss->ref[i] != r->fb[i]) { if (!bad) first = i; bad++; }
-                fprintf(stderr, "hootedit: CPU rasterizer verify: %zu pixels differ, first at %zu,%zu\n", bad, first % (size_t)w, first / (size_t)w);
-                _exit(3);
-            }
-        }
-    }
-    ss->insts.clear(); ss->inst_clip.clear(); ss->clips.clear(); ss->cur_clip = -1;
-}
-
-const RSoftRect *r_soft_damage(const Renderer *r, int *n) {
-    if (!r->soft || !r->ss) { *n = 0; return NULL; }
-    *n = (int)r->ss->rects.size();
-    return r->ss->rects.data();
-}
-
-void r_soft_target(Renderer *r, uint32_t *pixels) {
-    if (!r->soft) return;
-    if (!pixels && r->ext_fb) { r->fb = NULL; r->fb_cap = 0; r->ss->force_full = 1; }   /* the own buffer has to be allocated again */
-    r->ext_fb = pixels;
-}
-
-void r_soft_invalidate(Renderer *r) { if (r->soft && r->ss) r->ss->force_full = 1; }
-
-void r_soft_bgr(Renderer *r, int on) { r->swap_rb = on ? 1 : 0; }
-int r_soft_is_bgr(const Renderer *r) { return r->swap_rb; }
-
-const uint32_t *r_soft_pixels(const Renderer *r, int *w, int *h) {
-    if (!r->soft) return NULL;
-    *w = r->w; *h = r->h;
-    return r->fb;
-}
 
 static GLuint compile(GLenum kind, const char *src) {
     GLuint s = gl.CreateShader(kind);
@@ -424,7 +213,7 @@ Renderer *r_new(Atlas *a) {
     Renderer *r = static_cast<Renderer*>(calloc(1, sizeof *r));
     if (!r) return NULL;
     r->atlas = a;
-    if (sd_gl_kind == GLK_SOFT) { r->soft = 1; r->ss = new SoftState(); r->ss->verify = getenv("HOOTEDIT_SOFT_VERIFY") != NULL; return r; }
+    if (sd_soft) { r->ss = new SoftState(); return r; }
     GLuint vs, fs;
     if (sd_gl_kind == GLK_ES2) { vs = compile_src(GL_VERTEX_SHADER, "", VS2); fs = compile_src(GL_FRAGMENT_SHADER, "", FS2); }
     else { vs = compile_src(GL_VERTEX_SHADER, glsl_head(), VS3); fs = compile_src(GL_FRAGMENT_SHADER, glsl_head(), FS3); }
@@ -444,6 +233,7 @@ Renderer *r_new(Atlas *a) {
     if (!ok) { free(r); return NULL; }
     r->u_res = gl.GetUniformLocation(r->prog, "u_res");
     r->u_atlas = gl.GetUniformLocation(r->prog, "u_atlas");
+    r->u_color = gl.GetUniformLocation(r->prog, "u_color");
     gl.GenBuffers(1, &r->vbo);
     if (sd_gl_kind == GLK_ES2) {
         uint16_t *idx = static_cast<uint16_t*>(malloc((size_t)MAXQ * 6 * sizeof *idx));
@@ -481,10 +271,14 @@ Renderer *r_new(Atlas *a) {
 
 void r_free(Renderer *r) {
     if (!r) return;
+    if (r->ss) r->ss->drop_images();
+    delete r->ss;
+    if (r->gi) {
+        for (auto &kv : r->gi->tex) glDeleteTextures(1, &kv.second.tex);
+        delete r->gi;
+    }
     free(r->buf);
     free(r->v2);
-    if (r->fb != r->ext_fb) free(r->fb);
-    delete r->ss;
     free(r);
 }
 
@@ -492,28 +286,21 @@ Atlas *r_atlas(Renderer *r) { return r->atlas; }
 
 void r_begin(Renderer *r, int w, int h, uint32_t clear_rgba) {
     r->w = w; r->h = h; r->n = 0; r->clip_on = 0;
-    if (r->soft) {
-        size_t need = (size_t)w * (size_t)h;
-        if (r->ext_fb) {
-            if (r->fb != r->ext_fb) r->ss->force_full = 1;   /* new target: it holds nothing of ours */
-            if (r->fb && r->fb_cap) { free(r->fb); r->fb_cap = 0; }
-            r->fb = r->ext_fb;
-            if (w != r->ss->pw || h != r->ss->ph) r->ss->force_full = 1;
-        } else if (need > r->fb_cap || w != r->ss->pw || h != r->ss->ph) {   /* a new size: the old pixels and hashes mean nothing */
-            if (need > r->fb_cap) {
-                free(r->fb);
-                r->fb = static_cast<uint32_t*>(malloc(need * sizeof *r->fb));
-                r->fb_cap = r->fb ? need : 0;
-            }
-            r->ss->force_full = 1;
-        }
-        if (!r->fb) { r->w = r->h = 0; return; }
-        uint32_t px = clear_rgba & 0xffffffu;
-        if (r->swap_rb) px = ((px & 255) << 16) | (px & 0xff00u) | (px >> 16);
-        px |= 0xff000000u;
-        if (px != r->ss->clear_px) { r->ss->clear_px = px; r->ss->force_full = 1; }
-        r->ss->insts.clear(); r->ss->inst_clip.clear(); r->ss->clips.clear(); r->ss->cur_clip = -1;
+    if (sd_soft) {
+        SoftState *s = r->ss;
+        r->sclip.on = 0;
+        s->inst.clear(); s->clipid.clear(); s->clips.assign(1, SoftClip{0, 0, 0, 0, 0}); s->cur_clip = 0;
+        s->bg = clear_rgba;
+        s->drop_images();
         return;
+    }
+    if (r->gi) {   /* textures not used for a while go: a scrolled-away or deleted image gives its video memory back */
+        GlImages *g = r->gi;
+        g->frame++;
+        for (auto it = g->tex.begin(); it != g->tex.end();) {
+            if (it->second.last + 30 < g->frame) { glDeleteTextures(1, &it->second.tex); it = g->tex.erase(it); }
+            else ++it;
+        }
     }
     glViewport(0, 0, w, h);
     glDisable(GL_SCISSOR_TEST);
@@ -554,14 +341,30 @@ static void flush_es2(Renderer *r) {
     }
 }
 
+void r_set_target(Renderer *r, uint32_t *px, int w, int h, int pitch_px, int rs, int gs, int bs, uint32_t amask) {
+    r->st = SoftTarget{px, w, h, pitch_px, rs, gs, bs, amask};
+}
+
 void r_flush(Renderer *r) {
     if (!r->n) return;
-    if (r->soft) { soft_flush(r); return; }
+    if (sd_soft) {   /* drawing is deferred to r_end, where the whole frame is known */
+        SoftState *s = r->ss;
+        s->inst.insert(s->inst.end(), r->buf, r->buf + r->n);
+        s->clipid.insert(s->clipid.end(), r->n, s->cur_clip);
+        r->n = 0;
+        return;
+    }
     gl.UseProgram(r->prog);
     gl.Uniform2f(r->u_res, (float)r->w, (float)r->h);
     gl.ActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, atlas_texture(r->atlas));
     gl.Uniform1i(r->u_atlas, 0);
+    if (sd_gl_kind != GLK_ES2 && atlas_color_texture(r->atlas)) {
+        gl.ActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, atlas_color_texture(r->atlas));
+        gl.Uniform1i(r->u_color, 1);
+        gl.ActiveTexture(GL_TEXTURE0);
+    }
     if (sd_gl_kind == GLK_ES2) { flush_es2(r); r->n = 0; return; }
     gl.BindVertexArray(r->vao);
     gl.BindBuffer(GL_ARRAY_BUFFER, r->vbo);
@@ -573,17 +376,203 @@ void r_flush(Renderer *r) {
     r->n = 0;
 }
 
-void r_end(Renderer *r) { if (r->soft) { soft_end(r); return; } r_flush(r); }
+
+/* A few helper threads for painting the dirty runs of one frame in parallel: runs never share a pixel, so no locking beyond the hand-out counter.
+ * Persistent (a thread per frame costs more than a small frame's whole paint) and never joined: they sleep on a condition variable at exit. */
+struct SoftPool {
+    std::mutex m;
+    std::condition_variable cv, done;
+    uint64_t gen = 0;
+    int pending = 0, workers = 0;
+    const std::function<void()> *job = nullptr;
+    void worker() {
+        uint64_t seen = 0;
+        for (;;) {
+            const std::function<void()> *j = nullptr;
+            { std::unique_lock<std::mutex> l(m); cv.wait(l, [&] { return gen != seen; }); seen = gen; j = job; }
+            (*j)();
+            { std::lock_guard<std::mutex> l(m); if (--pending == 0) done.notify_one(); }
+        }
+    }
+    SoftPool() {
+        const char *e = getenv("HOOTEDIT_RASTER_THREADS");
+        int n = e ? atoi(e) : (int)std::thread::hardware_concurrency() - 1;
+        workers = n < 0 ? 0 : n > 3 ? 3 : n;
+        for (int i = 0; i < workers; i++) std::thread([this] { worker(); }).detach();
+    }
+    void run(const std::function<void()> &f) {
+        { std::lock_guard<std::mutex> l(m); job = &f; pending = workers; gen++; }
+        cv.notify_all();
+        f();
+        std::unique_lock<std::mutex> l(m);
+        done.wait(l, [&] { return pending == 0; });
+    }
+};
+static long g_par_min_area = 120000;   /* dirty pixels from which a frame is painted by several threads */
+void r_soft_parallel_min_area(long px) { g_par_min_area = px; }
+static SoftPool &soft_pool() { static SoftPool *p = new SoftPool(); return *p; }
+
+static inline uint64_t mix64(uint64_t h, uint64_t v) { h ^= v; h *= 0x9E3779B97F4A7C15ull; return h ^ (h >> 29); }
+
+static uint64_t inst_hash(const RInst &q, const SoftClip &c) {
+    uint64_t w[4];
+    memcpy(w, &q, sizeof w);   /* RInst is 32 bytes */
+    uint64_t h = 0x243F6A8885A308D3ull;
+    for (int i = 0; i < 4; i++) h = mix64(h, w[i]);
+    if (c.on) h = mix64(mix64(h, (uint64_t)(uint32_t)c.x << 32 | (uint32_t)c.y), (uint64_t)(uint32_t)c.w << 32 | (uint32_t)c.h);
+    return h;
+}
+
+static void soft_finish(Renderer *r) {
+    SoftState *s = r->ss;
+    const SoftTarget &t = r->st;
+    s->damage.clear();
+    if (!t.px || t.w <= 0 || t.h <= 0) return;
+    const int tw = (t.w + TILE - 1) / TILE, th = (t.h + TILE - 1) / TILE;
+    const uint32_t gen = atlas_generation(r->atlas);
+    const SoftImages simgs{soft_find_image, s};
+    bool full = s->invalid || s->prev.size() != (size_t)tw * th || s->prev_t.px != t.px || s->prev_t.w != t.w || s->prev_t.h != t.h ||
+                s->prev_t.pitch != t.pitch || s->prev_t.rs != t.rs || s->prev_t.gs != t.gs || s->prev_t.bs != t.bs || s->bg != s->prev_bg || gen != s->prev_gen;
+    const uint64_t seed = mix64(0x13198A2E03707344ull, s->bg);
+    s->cur.assign((size_t)tw * th, seed);
+    const size_t n = s->inst.size();
+    for (size_t i = 0; i < n; i++) {   /* pass 1: hash every tile */
+        const RInst &q = s->inst[i];
+        const SoftClip &c = s->clips[s->clipid[i]];
+        float fx0 = q.x, fy0 = q.y, fx1 = q.x + q.w, fy1 = q.y + q.h;
+        if (c.on) { if (fx0 < c.x) fx0 = (float)c.x; if (fy0 < c.y) fy0 = (float)c.y; if (fx1 > c.x + c.w) fx1 = (float)(c.x + c.w); if (fy1 > c.y + c.h) fy1 = (float)(c.y + c.h); }
+        if (fx0 < 0) fx0 = 0;
+        if (fy0 < 0) fy0 = 0;
+        if (fx1 > (float)t.w) fx1 = (float)t.w;
+        if (fy1 > (float)t.h) fy1 = (float)t.h;
+        if (!(fx1 > fx0) || !(fy1 > fy0)) continue;
+        int tx0 = (int)fx0 / TILE, ty0 = (int)fy0 / TILE, tx1 = ((int)ceilf(fx1) - 1) / TILE, ty1 = ((int)ceilf(fy1) - 1) / TILE;
+        if (tx1 >= tw) tx1 = tw - 1;
+        if (ty1 >= th) ty1 = th - 1;
+        uint64_t ih = inst_hash(q, c);
+        for (int ty = ty0; ty <= ty1; ty++) {
+            uint64_t *row = &s->cur[(size_t)ty * tw];
+            for (int tx = tx0; tx <= tx1; tx++) row[tx] = mix64(row[tx], ih);
+        }
+    }
+    s->dirty.assign((size_t)tw * th, 1);
+    size_t ndirty = (size_t)tw * th;
+    if (!full) {
+        ndirty = 0;
+        for (size_t k = 0; k < s->dirty.size(); k++) { s->dirty[k] = s->cur[k] != s->prev[k]; ndirty += s->dirty[k]; }
+    }
+    if (ndirty) {
+        const uint8_t *amono = atlas_cpu(r->atlas);
+        const int asz = atlas_size(r->atlas), csz = atlas_color_size(r->atlas);
+        const uint32_t *acol = atlas_color_cpu(r->atlas);
+        s->bins.resize((size_t)th);
+        for (int ty = 0; ty < th; ty++) s->bins[ty].clear();
+        std::vector<char> rowdirty((size_t)th, 0);
+        for (int ty = 0; ty < th; ty++) for (int tx = 0; tx < tw; tx++) if (s->dirty[(size_t)ty * tw + tx]) { rowdirty[ty] = 1; break; }
+        for (size_t i = 0; i < n; i++) {   /* pass 2: instances per tile row, in draw order, only rows that repaint */
+            const RInst &q = s->inst[i];
+            int ty0 = (int)floorf(q.y) / TILE, ty1 = (int)ceilf(q.y + q.h) / TILE;
+            if (q.y < 0) ty0 = 0;
+            if (ty0 < 0) ty0 = 0;
+            if (ty1 >= th) ty1 = th - 1;
+            for (int ty = ty0; ty <= ty1; ty++) if (rowdirty[ty]) s->bins[ty].push_back((uint32_t)i);
+        }
+        struct Run { int x0, y0, x1, y1, ty; };
+        std::vector<Run> runs;
+        long area = 0;
+        for (int ty = 0; ty < th; ty++) {
+            if (!rowdirty[ty]) continue;
+            for (int tx = 0; tx < tw;) {
+                if (!s->dirty[(size_t)ty * tw + tx]) { tx++; continue; }
+                int tx1 = tx;
+                while (tx1 + 1 < tw && s->dirty[(size_t)ty * tw + tx1 + 1]) tx1++;
+                Run rn{tx * TILE, ty * TILE, (tx1 + 1) * TILE < t.w ? (tx1 + 1) * TILE : t.w, (ty + 1) * TILE < t.h ? (ty + 1) * TILE : t.h, ty};
+                runs.push_back(rn);
+                area += (long)(rn.x1 - rn.x0) * (rn.y1 - rn.y0);
+                s->damage.push_back(RDamage{rn.x0, rn.y0, rn.x1 - rn.x0, rn.y1 - rn.y0});
+                tx = tx1 + 1;
+            }
+        }
+        auto paint_run = [&](const Run &rn) {
+            const int x0 = rn.x0, y0 = rn.y0, x1 = rn.x1, y1 = rn.y1;
+            /* an opaque plain rectangle that covers the whole run hides everything before it: start there and skip the clear */
+            const std::vector<uint32_t> &bin = s->bins[rn.ty];
+            size_t first = 0;
+            bool hidden = false;
+            for (size_t k = bin.size(); k-- > 0;) {
+                const RInst &o = s->inst[bin[k]];
+                if ((o.rgba >> 24) != 255 || (o.pad & (SOFT_IMAGE_BIT | 0xffffu)) || o.u0 != o.u1 || o.v0 != o.v1) continue;
+                if (ceilf(o.x - 0.5f) > (float)x0 || ceilf(o.y - 0.5f) > (float)y0 || ceilf(o.x + o.w - 0.5f) < (float)x1 || ceilf(o.y + o.h - 0.5f) < (float)y1) continue;
+                const SoftClip &oc = s->clips[s->clipid[bin[k]]];
+                if (oc.on && (oc.x > x0 || oc.y > y0 || oc.x + oc.w < x1 || oc.y + oc.h < y1)) continue;
+                first = k; hidden = true;
+                break;
+            }
+            if (!hidden) soft_clear_rect(&t, x0, y0, x1, y1, s->bg);
+            for (size_t bk = first; bk < bin.size(); bk++) {
+                const uint32_t i = bin[bk];
+                const RInst &qi = s->inst[i];
+                if (qi.x >= (float)x1 || qi.x + qi.w <= (float)x0) continue;   /* misses this run horizontally */
+                SoftClip c = s->clips[s->clipid[i]];
+                int cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
+                if (c.on) { if (c.x > cx0) cx0 = c.x; if (c.y > cy0) cy0 = c.y; if (c.x + c.w < cx1) cx1 = c.x + c.w; if (c.y + c.h < cy1) cy1 = c.y + c.h; }
+                if (cx1 <= cx0 || cy1 <= cy0) continue;
+                SoftClip run{1, cx0, cy0, cx1 - cx0, cy1 - cy0};
+                soft_draw(&t, &run, &s->inst[i], 1, amono, asz, acol, csz, &simgs);
+            }
+        };
+        SoftPool &pool = soft_pool();
+        if (pool.workers > 0 && runs.size() > 1 && area >= g_par_min_area) {   /* a big repaint (scrolling, a resize): split the runs over the cores */
+            std::atomic<size_t> next{0};
+            const std::function<void()> work = [&] { for (size_t k; (k = next.fetch_add(1)) < runs.size();) paint_run(runs[k]); };
+            pool.run(work);
+        } else for (const Run &rn : runs) paint_run(rn);
+    }
+    static const bool verify = getenv("LESTRIX_SOFT_VERIFY") != NULL;
+    if (verify) {   /* test aid: paint the whole frame from scratch and compare with the incrementally painted one */
+        std::vector<uint32_t> ref((size_t)t.w * t.h);
+        SoftTarget rt = t;
+        rt.px = ref.data(); rt.pitch = t.w;
+        soft_clear(&rt, s->bg);
+        for (size_t i = 0; i < n; i++) soft_draw(&rt, &s->clips[s->clipid[i]], &s->inst[i], 1, atlas_cpu(r->atlas), atlas_size(r->atlas), atlas_color_cpu(r->atlas), atlas_color_size(r->atlas), &simgs);
+        for (int y = 0; y < t.h; y++)
+            if (memcmp(ref.data() + (size_t)y * t.w, t.px + (size_t)y * t.pitch, (size_t)t.w * 4)) {
+                int x = 0;
+                while (ref[(size_t)y * t.w + x] == t.px[(size_t)y * t.pitch + x]) x++;
+                fprintf(stderr, "soft damage mismatch: frame differs from a full repaint at %d,%d (full=%d dirty tiles=%zu)\n", x, y, (int)full, ndirty);
+                if (!strcmp(getenv("LESTRIX_SOFT_VERIFY"), "fatal")) _exit(3);   /* make test-gui fails on a mismatch */
+                break;
+            }
+    }
+    s->prev.swap(s->cur);
+    s->prev_t = t; s->prev_bg = s->bg; s->prev_gen = gen; s->invalid = false;
+}
+
+const RDamage *r_damage(const Renderer *r, size_t *n) {
+    *n = r->ss ? r->ss->damage.size() : 0;
+    return r->ss && !r->ss->damage.empty() ? r->ss->damage.data() : NULL;
+}
+
+void r_soft_invalidate(Renderer *r) { if (r->ss) r->ss->invalid = true; }
+
+void r_end(Renderer *r) {
+    r_flush(r);
+    if (sd_soft) soft_finish(r);
+}
 
 void r_clip(Renderer *r, int x, int y, int w, int h) {
     r_flush(r);
-    if (r->soft) { r->ss->clips.push_back({x, y, w < 0 ? 0 : w, h < 0 ? 0 : h}); r->ss->cur_clip = (int)r->ss->clips.size() - 1; r->clip_on = 1; return; }
+    r->clip_on = 1;
+    if (sd_soft) { r->sclip = SoftClip{1, x, y, w < 0 ? 0 : w, h < 0 ? 0 : h}; r->ss->clips.push_back(r->sclip); r->ss->cur_clip = (uint16_t)(r->ss->clips.size() - 1); return; }
     glEnable(GL_SCISSOR_TEST);
     glScissor(x, r->h - (y + h), w < 0 ? 0 : w, h < 0 ? 0 : h);
-    r->clip_on = 1;
 }
 
-void r_clip_off(Renderer *r) { r_flush(r); if (r->soft) r->ss->cur_clip = -1; else glDisable(GL_SCISSOR_TEST); r->clip_on = 0; }
+void r_clip_off(Renderer *r) {
+    r_flush(r);
+    if (sd_soft) { r->sclip.on = 0; r->ss->cur_clip = 0; } else glDisable(GL_SCISSOR_TEST);
+    r->clip_on = 0;
+}
 
 static void grow(Renderer *r, size_t extra) {
     if (r->n + extra <= r->cap) return;
@@ -621,10 +610,10 @@ void r_make_rect(Renderer *r, RInst *o, float x, float y, float w, float h, uint
 }
 
 void r_make_glyph(Renderer *r, RInst *o, const AtlasGlyph *g, float pen_x, float baseline_y, uint32_t rgba) {
-    float inv = 65535.f / (float)atlas_size(r->atlas);
+    float inv = 65535.f / (float)(g->color ? atlas_color_size(r->atlas) : atlas_size(r->atlas));
     *o = (RInst){pen_x + g->left, baseline_y - g->top, (float)g->w, (float)g->h,
                  (uint16_t)(g->x * inv + 0.5f), (uint16_t)(g->y * inv + 0.5f),
-                 (uint16_t)((g->x + g->w) * inv + 0.5f), (uint16_t)((g->y + g->h) * inv + 0.5f), rgba, 0};
+                 (uint16_t)((g->x + g->w) * inv + 0.5f), (uint16_t)((g->y + g->h) * inv + 0.5f), rgba, g->color ? 255u << 16 : 0u};
 }
 
 void r_rrect(Renderer *r, float x, float y, float w, float h, uint32_t rgba, int radius, int border) {
@@ -638,4 +627,96 @@ void r_rect(Renderer *r, float x, float y, float w, float h, uint32_t rgba) {
     RInst i;
     r_make_rect(r, &i, x, y, w, h, rgba);
     r_push(r, &i, 1);
+}
+
+static bool gl_images_init(Renderer *r) {
+    if (!r->gi) r->gi = new GlImages();
+    GlImages *g = r->gi;
+    if (g->prog) return true;
+    if (g->failed) return false;
+    const bool es2 = sd_gl_kind == GLK_ES2;
+    GLuint vs = es2 ? compile_src(GL_VERTEX_SHADER, "", IMG_VS2) : compile_src(GL_VERTEX_SHADER, glsl_head(), IMG_VS);
+    GLuint fs = es2 ? compile_src(GL_FRAGMENT_SHADER, "", IMG_FS2) : compile_src(GL_FRAGMENT_SHADER, glsl_head(), IMG_FS);
+    if (!vs || !fs) { g->failed = true; return false; }
+    g->prog = gl.CreateProgram();
+    gl.AttachShader(g->prog, vs);
+    gl.AttachShader(g->prog, fs);
+    if (es2) gl.BindAttribLocation(g->prog, 0, "a_c");
+    gl.LinkProgram(g->prog);
+    GLint ok = 0;
+    gl.GetProgramiv(g->prog, GL_LINK_STATUS, &ok);
+    gl.DeleteShader(vs);
+    gl.DeleteShader(fs);
+    if (!ok) { g->prog = 0; g->failed = true; return false; }
+    g->u_res = gl.GetUniformLocation(g->prog, "u_res");
+    g->u_pos = gl.GetUniformLocation(g->prog, "u_pos");
+    g->u_size = gl.GetUniformLocation(g->prog, "u_size");
+    g->u_uv0 = gl.GetUniformLocation(g->prog, "u_uv0");
+    g->u_uv1 = gl.GetUniformLocation(g->prog, "u_uv1");
+    g->u_img = gl.GetUniformLocation(g->prog, "u_img");
+    if (es2) {
+        static const float corners[8] = {0.f, 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f};
+        gl.GenBuffers(1, &g->vbo);
+        gl.BindBuffer(GL_ARRAY_BUFFER, g->vbo);
+        gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof corners, corners, GL_STATIC_DRAW);
+    } else gl.GenVertexArrays(1, &g->vao);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &g->max_tex);
+    if (g->max_tex < 1024) g->max_tex = 4096;
+    return true;
+}
+
+void r_image(Renderer *r, uint32_t serial, const uint32_t *px, int iw, int ih, void *owner, void (*release)(void *), float x, float y, float w, float h,
+             float u0, float v0, float u1, float v1) {
+    auto done = [&]() { if (release) release(owner); };
+    if (!px || iw <= 0 || ih <= 0 || w <= 0.f || h <= 0.f) { done(); return; }
+    auto u16 = [](float v) { v = v < 0.f ? 0.f : v > 1.f ? 1.f : v; return (uint16_t)(v * 65535.f + 0.5f); };
+    if (sd_soft) {
+        SoftState *s = r->ss;
+        auto it = s->imgs.find(serial);
+        if (it == s->imgs.end()) s->imgs.emplace(serial, SoftState::SImg{px, iw, ih, owner, release});
+        else done();
+        RInst in{x, y, w, h, u16(u0), u16(v0), u16(u1), u16(v1), 0xffffffffu, SOFT_IMAGE_BIT | (serial & 0x7fffffffu)};
+        r_push(r, &in, 1);
+        return;
+    }
+    if (!gl_images_init(r)) { done(); return; }
+    GlImages *g = r->gi;
+    if (iw > g->max_tex || ih > g->max_tex) { done(); return; }
+    r_flush(r);   /* everything queued so far is drawn first: images keep their place in the paint order */
+    auto it = g->tex.find(serial);
+    if (it == g->tex.end()) {
+        GlTex t{0, iw, ih, g->frame};
+        glGenTextures(1, &t.tex);
+        gl.ActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, t.tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        it = g->tex.emplace(serial, t).first;
+    }
+    done();   /* the texture has the pixels now */
+    it->second.last = g->frame;
+    gl.UseProgram(g->prog);
+    gl.Uniform2f(g->u_res, (float)r->w, (float)r->h);
+    gl.Uniform2f(g->u_pos, x, y);
+    gl.Uniform2f(g->u_size, w, h);
+    gl.Uniform2f(g->u_uv0, u0, v0);
+    gl.Uniform2f(g->u_uv1, u1, v1);
+    gl.ActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, it->second.tex);
+    gl.Uniform1i(g->u_img, 0);
+    if (sd_gl_kind == GLK_ES2) {
+        gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        gl.BindBuffer(GL_ARRAY_BUFFER, g->vbo);
+        for (GLuint a = 1; a <= 5; a++) gl.DisableVertexAttribArray(a);   /* flush_es2 enables them again on its next run */
+        gl.EnableVertexAttribArray(0);
+        gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
+        gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        return;
+    }
+    gl.BindVertexArray(g->vao);
+    gl.DrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
 }

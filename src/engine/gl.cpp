@@ -6,16 +6,16 @@
 #include "gl.h"
 
 GlKind sd_gl_kind = GLK_CORE;
+bool sd_soft = false;
 SdGL gl;
 
 int sd_gl_load(GlKind kind) {
     int bad = 0;
     sd_gl_kind = kind;
-    if (kind == GLK_SOFT) return 0;
 #define LOAD(n) do { gl.n = reinterpret_cast<decltype(gl.n)>(SDL_GL_GetProcAddress("gl" #n)); if (!gl.n) bad++; } while (0)
     LOAD(Viewport); LOAD(Scissor); LOAD(Enable); LOAD(Disable); LOAD(BlendFunc); LOAD(ClearColor); LOAD(Clear);
     LOAD(GenTextures); LOAD(DeleteTextures); LOAD(BindTexture); LOAD(TexImage2D); LOAD(TexSubImage2D); LOAD(TexParameteri);
-    LOAD(PixelStorei); LOAD(ReadPixels); LOAD(GetIntegerv); LOAD(GetString); LOAD(DrawElements); LOAD(DeleteBuffers);
+    LOAD(PixelStorei); LOAD(ReadPixels); LOAD(GetIntegerv); LOAD(GetString); LOAD(DrawElements); LOAD(DrawArrays); LOAD(DeleteBuffers);
     LOAD(DisableVertexAttribArray);
     LOAD(BindAttribLocation);
     LOAD(CreateShader); LOAD(ShaderSource); LOAD(CompileShader); LOAD(GetShaderiv); LOAD(GetShaderInfoLog);
