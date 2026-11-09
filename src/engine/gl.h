@@ -8,8 +8,9 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
 
-typedef enum { GLK_CORE = 0, GLK_ES3 = 1, GLK_ES2 = 2, GLK_SOFT = 3 } GlKind;   /* GLK_SOFT: no GL at all, the renderer rasterises on the CPU */
+typedef enum { GLK_CORE = 0, GLK_ES3 = 1, GLK_ES2 = 2 } GlKind;
 extern GlKind sd_gl_kind;
+extern bool sd_soft;   /* CPU rendering: no GL context, the atlas lives in memory and soft.cpp rasterises */
 
 typedef struct {
     void (APIENTRY *Viewport)(GLint, GLint, GLsizei, GLsizei);
@@ -30,6 +31,7 @@ typedef struct {
     void (APIENTRY *GetIntegerv)(GLenum, GLint *);
     const GLubyte *(APIENTRY *GetString)(GLenum);
     void (APIENTRY *DrawElements)(GLenum, GLsizei, GLenum, const void *);
+    void (APIENTRY *DrawArrays)(GLenum, GLint, GLsizei);
     void (APIENTRY *DeleteBuffers)(GLsizei, const GLuint *);
     void (APIENTRY *DisableVertexAttribArray)(GLuint);
     void (APIENTRY *BindAttribLocation)(GLuint, GLuint, const GLchar *);

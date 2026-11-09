@@ -17,19 +17,20 @@ struct Frame {
     Atlas *a = nullptr;
     Renderer *r = nullptr;
     bool ended = false;
-    Frame(int w, int h, uint32_t clear) {
-        sd_gl_load(GLK_SOFT);
+    std::vector<uint32_t> buf;   // the frame, RGBA bytes: red in the low byte
+    int bw = 0, bh = 0;
+    Frame(int w, int h, uint32_t clear) : buf((size_t)w * (size_t)h, 0u), bw(w), bh(h) {
+        sd_soft = true;
         a = atlas_new(256);
         r = r_new(a);
+        r_set_target(r, buf.data(), w, h, w, 0, 8, 16, 0xff000000u);
         r_begin(r, w, h, clear);
     }
     ~Frame() { r_free(r); atlas_free(a); }
     uint32_t px(int x, int y) {   // call after all drawing
         if (!ended) r_end(r);   // the frame is painted by r_end, once
         ended = true;
-        int w = 0, h = 0;
-        const uint32_t *p = r_soft_pixels(r, &w, &h);
-        return p[(size_t)y * (size_t)w + (size_t)x];
+        return buf[(size_t)y * (size_t)bw + (size_t)x];
     }
 };
 
@@ -138,38 +139,111 @@ void scene(Renderer *r, float cursor_x, int clipped) {
 }  // namespace
 
 TEST(Raster, UnchangedFrameHasNoDamageAndChangedTilesMatchAFullRepaint) {
-    sd_gl_load(GLK_SOFT);
+    sd_soft = true;
     Atlas *a = atlas_new(256);
     Renderer *r = r_new(a);
     const int W = 256, H = 128;
-    int n = 0;
+    std::vector<uint32_t> fb((size_t)W * H, 0u), fb2((size_t)W * H, 0u);
+    r_set_target(r, fb.data(), W, H, W, 0, 8, 16, 0xff000000u);
+    size_t n = 0;
     r_begin(r, W, H, RGBA(0, 0, 0, 255));
     scene(r, 30.f, 1);
     r_end(r);
-    r_soft_damage(r, &n);
+    r_damage(r, &n);
     EXPECT_GE(n, 1);   // first frame: everything
     r_begin(r, W, H, RGBA(0, 0, 0, 255));
     scene(r, 30.f, 1);
     r_end(r);
-    r_soft_damage(r, &n);
+    r_damage(r, &n);
     EXPECT_EQ(n, 0);
     r_begin(r, W, H, RGBA(0, 0, 0, 255));
     scene(r, 60.f, 1);   // only the cursor moved
     r_end(r);
-    const RSoftRect *d = r_soft_damage(r, &n);
+    const RDamage *d = r_damage(r, &n);
     ASSERT_GE(n, 1);
     long area = 0;
-    for (int i = 0; i < n; i++) area += (long)d[i].w * d[i].h;
+    for (size_t i = 0; i < n; i++) area += (long)d[i].w * d[i].h;
     EXPECT_LT(area, (long)W * H / 4);
-    int w = 0, h = 0;
-    std::vector<uint32_t> inc(r_soft_pixels(r, &w, &h), r_soft_pixels(r, &w, &h) + (size_t)W * H);
+    std::vector<uint32_t> inc(fb);
     Renderer *r2 = r_new(a);   // the same frame from scratch
+    r_set_target(r2, fb2.data(), W, H, W, 0, 8, 16, 0xff000000u);
     r_begin(r2, W, H, RGBA(0, 0, 0, 255));
     scene(r2, 60.f, 1);
     r_end(r2);
-    const uint32_t *ref = r_soft_pixels(r2, &w, &h);
-    EXPECT_EQ(memcmp(inc.data(), ref, inc.size() * 4), 0);
+    EXPECT_EQ(memcmp(inc.data(), fb2.data(), inc.size() * 4), 0);
     r_free(r2);
+    r_free(r);
+    atlas_free(a);
+}
+
+// Random scenes over many frames, window sizes that change, one pixel buffer reused at the same address: every incrementally painted frame
+// must equal the same frame painted from scratch. This is the damage tracking (tile hashes, run merging, clips) under a stress test.
+namespace {
+struct Rng {
+    uint64_t s;
+    uint32_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)(s >> 11); }
+    int range(int n) { return (int)(next() % (uint32_t)n); }
+    float f(float lo, float hi) { return lo + (hi - lo) * (float)(next() % 10000) / 10000.f; }
+};
+
+struct Item { int kind; float x, y, w, h; uint32_t color; int radius, border; int clip; int cx, cy, cw, ch; };
+
+void paint(Renderer *r, const std::vector<Item> &items, const AtlasGlyph *g) {
+    for (const Item &it : items) {
+        if (it.clip) r_clip(r, it.cx, it.cy, it.cw, it.ch); else r_clip_off(r);
+        if (it.kind == 0) r_rect(r, it.x, it.y, it.w, it.h, it.color);
+        else if (it.kind == 1) r_rrect(r, it.x, it.y, it.w, it.h, it.color, it.radius, it.border);
+        else if (g) { RInst q; r_make_glyph(r, &q, g, it.x, it.y, it.color); r_push(r, &q, 1); }
+    }
+    r_clip_off(r);
+}
+}  // namespace
+
+TEST(Raster, RandomScenesIncrementalEqualsFromScratch) {
+    sd_soft = true;
+    r_soft_parallel_min_area(1);   // every multi-run repaint goes through the worker threads
+    struct Restore { ~Restore() { r_soft_parallel_min_area(120000); } } restore;
+    Atlas *a = atlas_new(256);
+    static const uint8_t bits[12] = {0, 255, 128, 0, 255, 255, 64, 255, 0, 200, 255, 90};
+    const AtlasGlyph *g = atlas_custom(a, 11, 1, bits, 4, 3);
+    Rng rng{0x9E3779B97F4A7C15ull};
+    Renderer *r = r_new(a);
+    std::vector<uint32_t> buf((size_t)400 * 300), ref((size_t)400 * 300);   // one allocation: every size reuses the same address
+    std::vector<Item> items;
+    int W = 200, H = 150;
+    for (int frame = 0; frame < 300; frame++) {
+        if (frame % 7 == 0) { W = 40 + rng.range(300); H = 40 + rng.range(200); }
+        if (frame % 5 == 0 || items.empty()) {   // a new scene
+            items.clear();
+            const int n = 5 + rng.range(60);
+            for (int i = 0; i < n; i++) {
+                Item it{};
+                it.kind = rng.range(3);
+                it.x = rng.f(-20.f, (float)W); it.y = rng.f(-20.f, (float)H); it.w = rng.f(1.f, 120.f); it.h = rng.f(1.f, 60.f);
+                it.color = RGBA(rng.range(256), rng.range(256), rng.range(256), rng.range(4) == 0 ? 80 + rng.range(150) : 255);
+                it.radius = rng.range(12); it.border = rng.range(3) == 0 ? 1 + rng.range(2) : 0;
+                if ((it.clip = rng.range(4) == 0)) { it.cx = rng.range(W); it.cy = rng.range(H); it.cw = 1 + rng.range(150); it.ch = 1 + rng.range(100); }
+                items.push_back(it);
+            }
+        } else {   // small edits: move or recolour a few items, as typing and scrolling do
+            for (int k = 0; k < 1 + rng.range(4); k++) {
+                Item &it = items[(size_t)rng.range((int)items.size())];
+                if (rng.range(2)) { it.x += rng.f(-6.f, 6.f); it.y += rng.f(-6.f, 6.f); } else it.color = RGBA(rng.range(256), rng.range(256), rng.range(256), 255);
+            }
+        }
+        const uint32_t bg = RGBA(20, 20, 20, 255);
+        r_set_target(r, buf.data(), W, H, W, 0, 8, 16, 0xff000000u);
+        r_begin(r, W, H, bg);
+        paint(r, items, g);
+        r_end(r);
+        Renderer *r2 = r_new(a);
+        r_set_target(r2, ref.data(), W, H, W, 0, 8, 16, 0xff000000u);
+        r_begin(r2, W, H, bg);
+        paint(r2, items, g);
+        r_end(r2);
+        r_free(r2);
+        ASSERT_EQ(memcmp(buf.data(), ref.data(), (size_t)W * H * 4), 0) << "frame " << frame << " size " << W << "x" << H;
+    }
     r_free(r);
     atlas_free(a);
 }

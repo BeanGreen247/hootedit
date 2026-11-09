@@ -3,6 +3,7 @@
 | Keys | Action |
 |---|---|
 | Ctrl+N, or double click the empty tab strip | New empty tab |
+| Ctrl+click on an address | Open an http, https, ftp, file or mailto link with xdg-open |
 | Ctrl+W | Close tab (asks Save / Don't save / Cancel if it has unsaved edits) |
 | Ctrl+O | Open a file (file browser) |
 | Ctrl+P | Quick open (fuzzy) |

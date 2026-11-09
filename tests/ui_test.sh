@@ -281,8 +281,8 @@ has "a hidden sidebar opens when the pointer is within 10 px of the left edge" "
 run "act:settings;mouse:5,5;click:340,130;mouse:5,5;click:976,170;mouse:5,5;wait:200;dump" typo.yaml
 has "clicking a toggle on the Settings page changes it (vim keys)" "vim: -- NORMAL --"
 
-# the CPU rasterizer: every frame of a scripted session is checked against a from-scratch repaint (HOOTEDIT_SOFT_VERIFY exits 3 on a mismatch)
-OUT="$(cd "$T/ws" && HOOTEDIT_RENDER=cpu HOOTEDIT_SOFT_VERIFY=1 timeout 60 "$BIN" --size 1024x768 --timed --render cpu --shot "$T/shot.ppm" --script "wait:100;text:hello;ctrl+end;pageup;ctrl+f;text:a;return;escape;mouse:20,300;click:100,306;ctrl+b;ctrl+b;ctrl+home;text:x;wait:100;dump" typo.yaml 2>&1; echo "rc=$?")"
+# the CPU rasterizer: every frame of a scripted session is checked against a from-scratch repaint (LESTRIX_SOFT_VERIFY=fatal exits 3 on a mismatch)
+OUT="$(cd "$T/ws" && HOOTEDIT_RENDER=cpu LESTRIX_SOFT_VERIFY=fatal timeout 60 "$BIN" --size 1024x768 --timed --render cpu --shot "$T/shot.ppm" --script "wait:100;text:hello;ctrl+end;pageup;ctrl+f;text:a;return;escape;mouse:20,300;click:100,306;ctrl+b;ctrl+b;ctrl+home;text:x;wait:100;dump" typo.yaml 2>&1; echo "rc=$?")"
 has "the CPU rasterizer draws a scripted session without a mismatch against a full repaint" "rc=0"
 
 echo "ui scenarios: $((total - fails))/$total passed"

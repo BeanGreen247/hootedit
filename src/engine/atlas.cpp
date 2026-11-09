@@ -17,13 +17,16 @@ static inline GLint atlas_internal(void) { return sd_gl_kind == GLK_ES2 ? GL_LUM
 
 struct Atlas {
     GLuint tex;
-    uint8_t *pix;   /* CPU copy of the atlas, kept only when the CPU rasterizer is in use */
     int size;
     uint32_t generation;
     int shelf_y, shelf_h, pen_x;
     Entry *tab;
     uint32_t cap, count;
     uint16_t white_x, white_y;
+    GLuint ctex;            /* RGBA colour glyphs (emoji), created on first use; not on ES2 */
+    int csize, cshelf_y, cshelf_h, cpen_x;
+    uint8_t *cpu;           /* software rendering: atlas pixels in memory instead of a GL texture */
+    uint32_t *ccpu;
     struct { const AtlasGlyph *g; uint32_t gen, font; } ascii[4][128];
 };
 
@@ -45,9 +48,10 @@ static void atlas_reset(Atlas *a) {
     a->count = 0;
     a->shelf_y = 2; a->shelf_h = 0; a->pen_x = 0;
     a->generation++;
+    a->cshelf_y = a->cshelf_h = a->cpen_x = 0;
     static const uint8_t white[4] = {255, 255, 255, 255};
-    if (a->pix) {
-        for (int y = 0; y < 2; y++) memcpy(a->pix + (size_t)y * (size_t)a->size, white, 2);
+    if (sd_soft) {
+        for (int y = 0; y < 2; y++) memset(a->cpu + (size_t)y * a->size, 255, 2);
     } else {
         glBindTexture(GL_TEXTURE_2D, a->tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -59,8 +63,7 @@ static void atlas_reset(Atlas *a) {
 
 Atlas *atlas_new(int size) {
     GLint maxtex = 0;
-    bool soft = sd_gl_kind == GLK_SOFT;
-    if (!soft) glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxtex);
+    if (!sd_soft) glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxtex);
     if (maxtex > 0 && size > maxtex) size = maxtex;
     Atlas *a = static_cast<Atlas*>(calloc(1, sizeof *a));
     if (!a) return NULL;
@@ -68,9 +71,9 @@ Atlas *atlas_new(int size) {
     a->cap = 16384;
     a->tab = static_cast<Entry*>(calloc(a->cap, sizeof *a->tab));
     if (!a->tab) { free(a); return NULL; }
-    if (soft) {
-        a->pix = static_cast<uint8_t*>(calloc((size_t)size * (size_t)size, 1));
-        if (!a->pix) { free(a->tab); free(a); return NULL; }
+    if (sd_soft) {
+        a->cpu = static_cast<uint8_t*>(calloc((size_t)size * size, 1));   /* untouched pages cost no memory */
+        if (!a->cpu) { free(a->tab); free(a); return NULL; }
     } else {
         glGenTextures(1, &a->tex);
         glBindTexture(GL_TEXTURE_2D, a->tex);
@@ -88,13 +91,18 @@ Atlas *atlas_new(int size) {
 
 void atlas_free(Atlas *a) {
     if (!a) return;
-    if (a->pix) free(a->pix); else glDeleteTextures(1, &a->tex);
+    if (!sd_soft) { glDeleteTextures(1, &a->tex); if (a->ctex) glDeleteTextures(1, &a->ctex); }
+    free(a->cpu);
+    free(a->ccpu);
     free(a->tab);
     free(a);
 }
 
 unsigned atlas_texture(const Atlas *a) { return a->tex; }
-const uint8_t *atlas_pixels(const Atlas *a) { return a->pix; }
+unsigned atlas_color_texture(const Atlas *a) { return a->ctex; }
+const uint8_t *atlas_cpu(const Atlas *a) { return a->cpu; }
+const uint32_t *atlas_color_cpu(const Atlas *a) { return a->ccpu; }
+int atlas_color_size(const Atlas *a) { return a->csize; }
 int atlas_size(const Atlas *a) { return a->size; }
 uint32_t atlas_generation(const Atlas *a) { return a->generation; }
 void atlas_white(const Atlas *a, uint16_t *x, uint16_t *y) { *x = a->white_x; *y = a->white_y; }
@@ -128,7 +136,8 @@ static bool place(Atlas *a, int w, int h, int *ox, int *oy) {
 }
 
 static bool valid(const Atlas *a, const AtlasGlyph *g) {
-    return (int)g->x + g->w <= a->size && (int)g->y + g->h <= a->size;
+    int s = g->color ? a->csize : a->size;
+    return (int)g->x + g->w <= s && (int)g->y + g->h <= s;
 }
 
 static const AtlasGlyph *insert(Atlas *a, uint32_t font, uint32_t cp, uint8_t style, const uint8_t *bits, int w, int h,
@@ -145,16 +154,75 @@ static const AtlasGlyph *insert(Atlas *a, uint32_t font, uint32_t cp, uint8_t st
     if (!e) return NULL;
     if (!found) a->count++;
     e->used = 1; e->font = font; e->cp = cp; e->style = style;
-    e->g = (AtlasGlyph){(uint16_t)ox, (uint16_t)oy, (uint16_t)(blank ? 0 : w), (uint16_t)(blank ? 0 : h), (int16_t)left, (int16_t)top, adv, blank};
+    e->g = (AtlasGlyph){(uint16_t)ox, (uint16_t)oy, (uint16_t)(blank ? 0 : w), (uint16_t)(blank ? 0 : h), (int16_t)left, (int16_t)top, adv, blank, false};
     if (!blank) {
-        if (a->pix) {
-            for (int y = 0; y < h; y++) memcpy(a->pix + ((size_t)(oy + y) * (size_t)a->size + (size_t)ox), bits + (size_t)y * (size_t)w, (size_t)w);
+        if (sd_soft) {
+            for (int y = 0; y < h; y++) memcpy(a->cpu + (size_t)(oy + y) * a->size + ox, bits + (size_t)y * w, (size_t)w);
         } else {
             glBindTexture(GL_TEXTURE_2D, a->tex);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
             glTexSubImage2D(GL_TEXTURE_2D, 0, ox, oy, w, h, atlas_format(), GL_UNSIGNED_BYTE, bits);
         }
     }
+    return &e->g;
+}
+
+static bool color_ready(Atlas *a) {
+    if (sd_soft) {
+        if (a->ccpu) return true;
+        int sz = a->size < 1024 ? a->size : 1024;
+        a->ccpu = static_cast<uint32_t*>(calloc((size_t)sz * sz, 4));
+        if (!a->ccpu) return false;
+        a->csize = sz;
+        return true;
+    }
+    if (a->ctex) return true;
+    if (sd_gl_kind == GLK_ES2) return false;
+    int size = a->size < 1024 ? a->size : 1024;
+    glGenTextures(1, &a->ctex);
+    glBindTexture(GL_TEXTURE_2D, a->ctex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    a->csize = size;
+    return true;
+}
+
+static bool place_color(Atlas *a, int w, int h, int *ox, int *oy) {
+    int pw = w + 1, ph = h + 1;
+    if (pw > a->csize || ph > a->csize) return false;
+    if (a->cpen_x + pw > a->csize) { a->cshelf_y += a->cshelf_h; a->cpen_x = 0; a->cshelf_h = 0; }
+    if (a->cshelf_y + ph > a->csize) return false;
+    *ox = a->cpen_x; *oy = a->cshelf_y;
+    a->cpen_x += pw;
+    if (ph > a->cshelf_h) a->cshelf_h = ph;
+    return true;
+}
+
+static const AtlasGlyph *insert_color(Atlas *a, uint32_t font, uint32_t cp, uint8_t style, const uint8_t *rgba, int w, int h,
+                                      int left, int top, float adv) {
+    if (a->count * 10 > a->cap * 7) atlas_reset(a);
+    int ox = 0, oy = 0;
+    if (!place_color(a, w, h, &ox, &oy)) {
+        atlas_reset(a);
+        if (!place_color(a, w, h, &ox, &oy)) return NULL;
+    }
+    bool found;
+    Entry *e = lookup(a, font, cp, style, &found);
+    if (!e) return NULL;
+    if (!found) a->count++;
+    e->used = 1; e->font = font; e->cp = cp; e->style = style;
+    e->g = (AtlasGlyph){(uint16_t)ox, (uint16_t)oy, (uint16_t)w, (uint16_t)h, (int16_t)left, (int16_t)top, adv, false, true};
+    if (sd_soft) {
+        for (int y = 0; y < h; y++) memcpy(a->ccpu + (size_t)(oy + y) * a->csize + ox, rgba + (size_t)y * w * 4, (size_t)w * 4);
+        return &e->g;
+    }
+    glBindTexture(GL_TEXTURE_2D, a->ctex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, ox, oy, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     return &e->g;
 }
 
@@ -178,7 +246,9 @@ static const AtlasGlyph *atlas_glyph_slow(Atlas *a, Font *f, uint32_t fid, uint3
     if (found && valid(a, &e->g)) { sd_cache.glyph_hit++; return &e->g; }
     sd_cache.glyph_miss++;
     GlyphBmp b;
-    font_glyph(f, cp, style, &b);
+    bool can_color = cp >= 0x1F000 && color_ready(a);
+    font_glyph_color(f, cp, style, &b, can_color);
+    if (b.color && b.buf) return insert_color(a, fid, cp, (uint8_t)style, b.buf, b.w, b.h, b.left, b.top, b.adv);
     return insert(a, fid, cp, (uint8_t)style, b.buf, b.w, b.h, b.left, b.top, b.adv);
 }
 
@@ -202,4 +272,24 @@ const AtlasGlyph *atlas_custom(Atlas *a, uint32_t font_id, uint32_t key, const u
     const AtlasGlyph *g = atlas_find_custom(a, font_id, key);
     if (g) return g;
     return insert(a, font_id, key, CUSTOM_STYLE, bits, w, h, 0, 0, (float)w);
+}
+
+/* Ligature glyphs are addressed by glyph index; the key space above the last codepoint keeps them apart from character glyphs. */
+#define GID_KEY(g) (0x40000000u | (uint32_t)(g))
+
+const AtlasGlyph *atlas_glyph_gid(Atlas *a, Font *f, uint32_t gid, int style) {
+    uint32_t fid = font_id(f);
+    bool found;
+    Entry *e = lookup(a, fid, GID_KEY(gid), (uint8_t)style, &found);
+    if (found && valid(a, &e->g)) { sd_cache.glyph_hit++; return &e->g; }
+    sd_cache.glyph_miss++;
+    GlyphBmp b;
+    font_glyph_gid(f, gid, style, &b);
+    return insert(a, fid, GID_KEY(gid), (uint8_t)style, b.buf, b.w, b.h, b.left, b.top, b.adv);
+}
+
+const AtlasGlyph *atlas_peek_gid(const Atlas *a, uint32_t fid, uint32_t gid, int style) {
+    bool found;
+    Entry *e = lookup((Atlas *)a, fid, GID_KEY(gid), (uint8_t)style, &found);
+    return found && valid(a, &e->g) ? &e->g : NULL;
 }

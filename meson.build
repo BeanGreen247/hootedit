@@ -1,5 +1,5 @@
 project('hootedit', 'cpp',
-  version: '0.3.1',
+  version: '0.4.0',
   license: 'MIT',
   default_options: ['cpp_std=gnu++20', 'buildtype=release', 'optimization=3', 'b_ndebug=true', 'warning_level=2'])
 
@@ -27,12 +27,12 @@ endforeach
 add_project_arguments(args, language: 'cpp')
 add_project_link_arguments(link_args, language: 'cpp')
 
-deps = [dependency('sdl2'), dependency('freetype2'), dependency('fontconfig'), dependency('threads')]
+deps = [dependency('sdl2'), dependency('freetype2'), dependency('fontconfig'), dependency('threads'), dependency('harfbuzz')]
 
-engine = files('src/engine/atlas.cpp', 'src/engine/font.cpp', 'src/engine/gl.cpp', 'src/engine/render.cpp')
-# Vendored from Lestrix 0289c8e: VT emulator, pty, terminal core and view, themes, fleetwm follow, shared helpers.
+engine = files('src/engine/atlas.cpp', 'src/engine/font.cpp', 'src/engine/gl.cpp', 'src/engine/render.cpp', 'src/engine/soft.cpp')
+# Vendored from Lestrix 1bab551 (0.4.2): VT emulator, pty, terminal core and view, themes, fleetwm follow, shared helpers.
 lestrix = files('src/lestrix/vt.cpp', 'src/lestrix/lz.cpp', 'src/lestrix/pty.cpp', 'src/lestrix/util.cpp',
-                'src/lestrix/ui/tcore.cpp', 'src/lestrix/ui/termview.cpp', 'src/lestrix/ui/workpool.cpp', 'src/lestrix/ui/fleetwm.cpp', 'src/lestrix/ui/uitheme.cpp')
+                'src/lestrix/ui/tcore.cpp', 'src/lestrix/ui/termview.cpp', 'src/lestrix/ui/workpool.cpp', 'src/lestrix/ui/fleetwm.cpp', 'src/lestrix/ui/uitheme.cpp', 'src/lestrix/ui/scan.cpp')
 inc = include_directories('src/engine')
 # Lestrix itself is built with exceptions on (fleetwm.cpp uses try/catch); Hootedit's own code is built without.
 lestrix_lib = static_library('lestrix_vendored', lestrix, include_directories: inc, cpp_args: ['-fexceptions'], dependencies: deps)
@@ -50,7 +50,7 @@ if gtest_dep.found()
 
   unit_sources = files(
     'tests/test_buffer.cpp', 'tests/test_doc.cpp', 'tests/test_syntax.cpp', 'tests/test_fuzzy.cpp', 'tests/test_diff.cpp', 'tests/test_merge.cpp', 'tests/test_regex.cpp',
-    'tests/test_vim.cpp', 'tests/test_outline.cpp', 'tests/test_tree.cpp', 'tests/test_lint.cpp', 'tests/test_preview.cpp',
+    'tests/test_vim.cpp', 'tests/test_outline.cpp', 'tests/test_tree.cpp', 'tests/test_lint.cpp', 'tests/test_preview.cpp', 'tests/test_link.cpp',
     'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/tree.cpp',
     'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp', 'src/preview.cpp')
   unit_tests = executable('hootedit-unit-tests', unit_sources, dependencies: [gtest_dep], cpp_args: ['-fexceptions'], override_options: san)
@@ -59,7 +59,7 @@ if gtest_dep.found()
   # one meson test per area, so `meson test lint` runs just that slice (the same slices scripts/test.sh offers)
   test_areas = {
     'buffer': 'Buffer.*', 'doc': 'Doc.*', 'syntax': 'Syntax.*', 'fuzzy': 'Fuzzy.*', 'diff': 'Diff.*', 'merge': 'Merge.*', 'regex': 'Regex.*',
-    'vim': 'Vim.*', 'outline': 'Outline.*', 'tree': 'Tree.*', 'lint': 'Lint.*', 'preview': 'Preview.*',
+    'vim': 'Vim.*', 'outline': 'Outline.*', 'tree': 'Tree.*', 'lint': 'Lint.*', 'preview': 'Preview.*', 'link': 'Link.*',
   }
   foreach area, filter : test_areas
     test(area, unit_tests, args: ['--gtest_filter=' + filter], suite: 'areas', protocol: 'gtest', timeout: 300)
