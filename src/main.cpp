@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include "link.h"
 
 #include <algorithm>
 #include <atomic>
@@ -6520,6 +6521,28 @@ size_t pos_from_xy(int mx, int my) {
     return d.buf.line_start((size_t)line) + byte_of(t, col);
 }
 
+/* ---- links: Ctrl+click opens the http/https/ftp/file/mailto address under the pointer with xdg-open (no shell) ---- */
+
+void open_link(const std::string &url) {
+    std::string a = url;
+    for (char &c : a) if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+    bool ok = false;
+    for (const char *sc : {"https://", "http://", "ftp://", "file://", "mailto:"}) if (a.compare(0, strlen(sc), sc) == 0) ok = true;
+    if (!ok || url.find_first_of("\r\n") != std::string::npos || url[0] == '-') return;
+    pid_t pid = fork();
+    if (pid == 0) {   /* double fork like the terminal launcher: nothing to reap */
+        if (fork() != 0) _exit(0);
+        setsid();
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
+        execlp("xdg-open", "xdg-open", url.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    if (pid > 0) waitpid(pid, nullptr, 0);
+    E.status_msg = "opened " + url;
+    redraw();
+}
+
 void move_line(long delta, bool extend) {
     Doc &d = D();
     size_t l = d.buf.line_of(d.cur);
@@ -8256,6 +8279,14 @@ void handle_event(const SDL_Event &e) {
             if (splash() && g_clicks >= 2 && my >= (float)L.tab_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x) { do_action(A_NEW); return; }   /* double click on the start screen */
             if (my >= (float)L.text_y && my < (float)L.ed_bottom && mx >= (float)L.ed_x && mx < (float)L.split_x) {
                 Doc &d = D();
+                if (SDL_GetModState() & KMOD_CTRL) {   /* Ctrl+click on a link opens it */
+                    size_t p = pos_from_xy((int)mx, (int)my);
+                    size_t ln = d.buf.line_of(p);
+                    std::string lt;
+                    d.buf.line_text(ln, lt);
+                    std::string url = link_at(lt, p - d.buf.line_start(ln));
+                    if (!url.empty()) { open_link(url); return; }
+                }
                 d.break_group();
                 d.move_to(pos_from_xy((int)mx, (int)my), (SDL_GetModState() & KMOD_SHIFT) != 0, false);
                 E.dragging = true;

@@ -50,7 +50,7 @@ if gtest_dep.found()
 
   unit_sources = files(
     'tests/test_buffer.cpp', 'tests/test_doc.cpp', 'tests/test_syntax.cpp', 'tests/test_fuzzy.cpp', 'tests/test_diff.cpp', 'tests/test_merge.cpp', 'tests/test_regex.cpp',
-    'tests/test_vim.cpp', 'tests/test_outline.cpp', 'tests/test_tree.cpp', 'tests/test_lint.cpp', 'tests/test_preview.cpp',
+    'tests/test_vim.cpp', 'tests/test_outline.cpp', 'tests/test_tree.cpp', 'tests/test_lint.cpp', 'tests/test_preview.cpp', 'tests/test_link.cpp',
     'src/buffer.cpp', 'src/doc.cpp', 'src/syntax.cpp', 'src/regex.cpp', 'src/fuzzy.cpp', 'src/diff.cpp', 'src/merge.cpp', 'src/vim.cpp', 'src/outline.cpp', 'src/tree.cpp',
     'src/lint.cpp', 'src/lint_k8s.cpp', 'src/lint_formats.cpp', 'src/preview.cpp')
   unit_tests = executable('hootedit-unit-tests', unit_sources, dependencies: [gtest_dep], cpp_args: ['-fexceptions'], override_options: san)
@@ -59,7 +59,7 @@ if gtest_dep.found()
   # one meson test per area, so `meson test lint` runs just that slice (the same slices scripts/test.sh offers)
   test_areas = {
     'buffer': 'Buffer.*', 'doc': 'Doc.*', 'syntax': 'Syntax.*', 'fuzzy': 'Fuzzy.*', 'diff': 'Diff.*', 'merge': 'Merge.*', 'regex': 'Regex.*',
-    'vim': 'Vim.*', 'outline': 'Outline.*', 'tree': 'Tree.*', 'lint': 'Lint.*', 'preview': 'Preview.*',
+    'vim': 'Vim.*', 'outline': 'Outline.*', 'tree': 'Tree.*', 'lint': 'Lint.*', 'preview': 'Preview.*', 'link': 'Link.*',
   }
   foreach area, filter : test_areas
     test(area, unit_tests, args: ['--gtest_filter=' + filter], suite: 'areas', protocol: 'gtest', timeout: 300)

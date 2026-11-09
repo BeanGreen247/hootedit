@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Ctrl+click on an http, https, ftp, file or mailto address in the text opens it with `xdg-open` (no shell, scheme checked, double fork like the terminal launcher). Detection is `link_at` in `src/link.h`, covered by `Link.*` in `tests/test_link.cpp`.
+- Terminal panel: vendored Lestrix engine brought up to Lestrix 944dee3 (`vt.cpp`: a full-screen scroll slides a window over the row order instead of moving it; `tcore.cpp`: default read delay 200 -> 400 us). The newer Lestrix features (OSC 133, kitty keyboard, images, links) are not in the vendored copy yet.
 - CPU rasterizer: `--render auto|cpu|gpu` (or `HOOTEDIT_RENDER`). The same draw instructions as the GL path are painted into the window surface, with the glyph atlas kept in memory; no OpenGL context is created. `auto` picks it when no readable DRM render node or NVIDIA device exists, and when no OpenGL context can start. Only the 32x32 tiles whose content hash changed are repainted and presented (an unchanged frame is not presented at all); with an XRGB8888 surface the frame is drawn straight into the window's pixels. `HOOTEDIT_SOFT_VERIFY=1` repaints every frame from scratch and exits 3 if the incremental frame differs. Pixel tests in `tests/test_raster.cpp`, a verified scripted session in `tests/ui_test.sh`.
 - Fix: the text cursor could stay hidden. The first key or click after a pause started the blink with a stale clock and hid the cursor at once, and when blinking ended after 10 s of idle in the off phase nothing woke the loop to show it again (up to several seconds hidden).
 
