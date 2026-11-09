@@ -1,10 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-11-09)
 - Ctrl+click on an http, https, ftp, file or mailto address in the text opens it with `xdg-open` (no shell, scheme checked, double fork like the terminal launcher). Detection is `link_at` in `src/link.h`, covered by `Link.*` in `tests/test_link.cpp`.
 - Terminal panel: vendored Lestrix engine brought up to Lestrix 944dee3 (`vt.cpp`: a full-screen scroll slides a window over the row order instead of moving it; `tcore.cpp`: default read delay 200 -> 400 us). The newer Lestrix features (OSC 133, kitty keyboard, images, links) are not in the vendored copy yet.
 - CPU rasterizer: `--render auto|cpu|gpu` (or `HOOTEDIT_RENDER`). The same draw instructions as the GL path are painted into the window surface, with the glyph atlas kept in memory; no OpenGL context is created. `auto` picks it when no readable DRM render node or NVIDIA device exists, and when no OpenGL context can start. Only the 32x32 tiles whose content hash changed are repainted and presented (an unchanged frame is not presented at all); with an XRGB8888 surface the frame is drawn straight into the window's pixels. `HOOTEDIT_SOFT_VERIFY=1` repaints every frame from scratch and exits 3 if the incremental frame differs. Pixel tests in `tests/test_raster.cpp`, a verified scripted session in `tests/ui_test.sh`.
 - Fix: the text cursor could stay hidden. The first key or click after a pause started the blink with a stale clock and hid the cursor at once, and when blinking ended after 10 s of idle in the off phase nothing woke the loop to show it again (up to several seconds hidden).
+- Vendored Lestrix engine synced to 1bab551 (0.4.2): ligatures (HarfBuzz is a new build dependency), sixel and kitty images, colour emoji, shell integration and the colour/SGR and AVX2 scrollback speedups in the terminal panel. Lestrix's CPU renderer (`src/engine/soft.cpp`) replaces the one written for Hootedit; `main.cpp` presents its damage rectangles.
+- CPU renderer: rasterize time per scrolled 1024x768 frame 472 -> 311 us on a 2-core machine (the whole frame on the Xvnc test display fell from 11-12 ms with the previous CPU path to about 0.9 ms with the Lestrix renderer and these changes): two-lane blend and a hoisted 1:1 glyph path, an opaque rectangle that covers a repaint skips the clear and everything under it, large repaints are split over the cores (`HOOTEDIT_RASTER_THREADS=0` turns it off). Rounded-rect tables and merged damage rectangles were measured and dropped. Numbers in `docs/performance.md`.
+- Fix (CPU renderer): filled areas had alpha 0, so on a compositing desktop the sidebar and top bar were see-through. Fills now write opaque alpha.
+- Fix (CPU renderer): a resize hands out a new, empty window surface, which could leave stale or blank tiles; every resize now repaints everything. The window is also repainted in full when it is exposed or first shown.
+- Tests: a randomized differential test of the CPU renderer (incremental frames against a from-scratch paint, changing sizes, clips, threads), `diff:PATH,REV_A,REV_B` script step, `--bench` prints rasterize and present time separately.
 
 ## 0.3.1 (2026-10-27)
 - The syntax-token scratch buffer is released after 10 s without input once it has grown past 1 MB (a 16 MB single-line file: 198 MB -> 149 MB resident when idle; massif and numbers in `docs/performance.md`).
